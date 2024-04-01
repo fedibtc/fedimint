@@ -1,5 +1,6 @@
 pub mod db;
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
@@ -49,6 +50,7 @@ use fedimint_ln_common::{
     LightningInputError, LightningModuleTypes, LightningOutput, LightningOutputError,
     LightningOutputOutcome, LightningOutputOutcomeV0, LightningOutputV0, RemoveGatewayRequest,
 };
+use fedimint_metrics::lazy_static;
 use fedimint_server::config::distributedgen::PeerHandleOps;
 use futures::StreamExt;
 use metrics::{LN_CANCEL_OUTGOING_CONTRACTS, LN_FUNDED_CONTRACT_SATS, LN_INCOMING_OFFER};
@@ -67,6 +69,29 @@ use crate::db::{
 };
 
 mod metrics;
+
+lazy_static! {
+    static ref FEDIMINT_VETTED_GATEWAYS: std::collections::HashSet<secp256k1::PublicKey> = {
+        let mut ids = std::collections::HashSet::new();
+        for id in std::env::var("FEDIMINT_VETTED_GATEWAYS")
+            .unwrap_or_default()
+            .split(',')
+        {
+            let id = id.trim();
+            if !id.is_empty() {
+                match secp256k1::PublicKey::from_str(id) {
+                    Ok(id) => {
+                        ids.insert(id);
+                    }
+                    Err(e) => {
+                        panic!("Gateway id {id} must be valid: {e:?}");
+                    }
+                }
+            }
+        }
+        ids
+    };
+}
 
 #[derive(Debug, Clone)]
 pub struct LightningInit;
@@ -1126,6 +1151,18 @@ impl Lightning {
         dbtx: &mut DatabaseTransaction<'_>,
         gateway: LightningGatewayAnnouncement,
     ) {
+        let gateway_id = gateway.info.gateway_id;
+        if !FEDIMINT_VETTED_GATEWAYS.is_empty() {
+            debug!(
+                "Checking registration against {} vetted gateways",
+                FEDIMINT_VETTED_GATEWAYS.len()
+            );
+            if !FEDIMINT_VETTED_GATEWAYS.contains(&gateway_id) {
+                info!("Ignoring gateway {gateway_id} because it's not on vetted list");
+                return;
+            }
+        }
+
         // Garbage collect expired gateways (since we're already writing to the DB)
         // Note: A "gotcha" of doing this here is that if two gateways are registered
         // at the same time, they will both attempt to delete the same expired gateways
@@ -1133,11 +1170,8 @@ impl Lightning {
         // succeed and the failed one will just try again.
         self.delete_expired_gateways(dbtx).await;
 
-        dbtx.insert_entry(
-            &LightningGatewayKey(gateway.info.gateway_id),
-            &gateway.anchor(),
-        )
-        .await;
+        dbtx.insert_entry(&LightningGatewayKey(gateway_id), &gateway.anchor())
+            .await;
     }
 
     async fn delete_expired_gateways(&self, dbtx: &mut DatabaseTransaction<'_>) {
