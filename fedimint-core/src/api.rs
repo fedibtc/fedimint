@@ -1360,7 +1360,7 @@ impl WsFederationApi<WsClient> {
     }
 }
 
-impl<C> WsFederationApi<C> {
+impl<C: JsonRpcClient> WsFederationApi<C> {
     pub fn peers(&self) -> Vec<PeerId> {
         self.peers.iter().map(|peer| peer.peer_id).collect()
     }
@@ -1379,11 +1379,7 @@ impl<C> WsFederationApi<C> {
                         );
                         assert!(url.host().is_some(), "API client requires a target host");
 
-                        FederationPeer {
-                            peer_id,
-                            url,
-                            client: RwLock::new(None),
-                        }
+                        FederationPeer::new(peer_id, url)
                     })
                     .collect(),
             ),
@@ -1399,6 +1395,40 @@ pub struct PeerResponse<R> {
 }
 
 impl<C: JsonRpcClient> FederationPeer<C> {
+    fn new(peer_id: PeerId, url: SafeUrl) -> Self {
+        const API_REPLACEMENT_LIST: &[(&str, &str)] = &[
+            (
+                "wss://fedimintd.fedimint.freedommint.xyz/",
+                "wss://fedimintd.fedimint.tigerboat21.com/",
+            ),
+            ("wss://api.bitcoinprinciples.xyz/", "wss://api.d6o.org/"),
+        ];
+
+        let url = API_REPLACEMENT_LIST
+            .iter()
+            .find_map(|(search_url, replacement_url)| {
+                if *search_url == url.as_str() {
+                    debug!(
+                        "Replacing API URL '{}' with '{}', quick-fix for fedimint/fedimint#5482",
+                        search_url, replacement_url
+                    );
+                    Some(
+                        SafeUrl::parse(replacement_url)
+                            .expect("hardcoded replacement url is valid"),
+                    )
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(url);
+
+        Self {
+            url,
+            peer_id,
+            client: RwLock::default(),
+        }
+    }
+
     #[instrument(level = "trace", fields(peer = %self.peer_id, %method), skip_all)]
     pub async fn request(&self, method: &str, params: &[Value]) -> JsonRpcResult<Value> {
         let rclient = self.client.read().await;
