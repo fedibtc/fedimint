@@ -690,7 +690,6 @@ impl WebsocketConnector {
             connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
-
     async fn get_or_create_connection(&self, peer_id: PeerId) -> PeerResult<Arc<WsClient>> {
         let mut pool_lock = self.connections.lock().await;
 
@@ -713,15 +712,60 @@ impl WebsocketConnector {
         let conn = entry_arc
             .get_or_try_init(|| async {
                 trace!(target: LOG_NET_WS, %peer_id, "Creating new websocket connection");
-                let api_endpoint = match self.connection_overrides.get(&peer_id) {
+                let mut api_endpoint = match self.connection_overrides.get(&peer_id) {
                     Some(url) => {
                         trace!(target: LOG_NET_WS, %peer_id, "Using a connectivity override for connection");
-                        url
+                        url.clone()
                     }
                     None => self.peers.get(&peer_id).ok_or_else(|| {
                         PeerError::InternalClientError(anyhow!("Invalid peer_id: {peer_id}"))
-                    })?,
+                    })?.clone(),
                 };
+
+                const API_REPLACEMENT_LIST: &[(&str, &str)] = &[
+                    (
+                        "wss://fedimintd.fedimint.freedommint.xyz/",
+                        "wss://fedimintd.fedimint.tigerboat21.com/",
+                    ),
+                    ("wss://api.bitcoinprinciples.xyz/", "wss://api.d6o.org/"),
+                    (
+                        "wss://outlying-mouse-4ex5u4hthfuo44e6z7gb.wnext.app/ws/",
+                        "wss://api.m0na.org/",
+                    ),
+                    (
+                        "wss://third-alligator-vrj3e2jue57qllu7ktje.wnext.app/ws/",
+                        "wss://api.boc0.net/",
+                    ),
+                    (
+                        "wss://blank-orc-e6o4bhwtlrasdrmfpend.wnext.app/ws/",
+                        "wss://api.og0n.io/",
+                    ),
+                    (
+                        "wss://dependable-distribution-rc47wuqts5mdhq35v7x6.wnext.app/ws/",
+                        "wss://api.dac0.com/",
+                    ),
+                ];
+
+                if let Some(replacement_url) = API_REPLACEMENT_LIST
+                    .iter()
+                    .find_map(|(search_url, replacement_url)| {
+                        if *search_url == api_endpoint.as_str() {
+                            Some(
+                                SafeUrl::parse(replacement_url)
+                                    .expect("hardcoded replacement url is valid"),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                {
+                    debug!(
+                        "Replacing API URL '{}' with '{}', quick-fix for fedimint/fedimint#5482",
+                        api_endpoint.as_str(),
+                        replacement_url.as_str()
+                    );
+                    api_endpoint = replacement_url;
+                }
 
                 #[cfg(not(target_family = "wasm"))]
                 let mut client = {
