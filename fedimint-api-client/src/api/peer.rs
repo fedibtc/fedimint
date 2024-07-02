@@ -32,6 +32,48 @@ where
         peer_id: PeerId,
         api_secret: Option<String>,
     ) -> Self {
+        const API_REPLACEMENT_LIST: &[(&str, &str)] = &[
+            (
+                "wss://fedimintd.fedimint.freedommint.xyz/",
+                "wss://fedimintd.fedimint.tigerboat21.com/",
+            ),
+            ("wss://api.bitcoinprinciples.xyz/", "wss://api.d6o.org/"),
+            (
+                "wss://alpha.mainnet-23-wlc.dev.fedibtc.com/",
+                "wss://api.m0na.org/",
+            ),
+            (
+                "wss://bravo.mainnet-23-wlc.dev.fedibtc.com/",
+                "wss://api.boc0.net/",
+            ),
+            (
+                "wss://charlie.mainnet-23-wlc.dev.fedibtc.com/",
+                "wss://api.og0n.io/",
+            ),
+            (
+                "wss://delta.mainnet-23-wlc.dev.fedibtc.com/",
+                "wss://api.dac0.com/",
+            ),
+        ];
+
+        let url = API_REPLACEMENT_LIST
+            .iter()
+            .find_map(|(search_url, replacement_url)| {
+                if *search_url == url.as_str() {
+                    debug!(
+                        "Replacing API URL '{}' with '{}', quick-fix for fedimint/fedimint#5482",
+                        search_url, replacement_url
+                    );
+                    Some(
+                        SafeUrl::parse(replacement_url)
+                            .expect("hardcoded replacement url is valid"),
+                    )
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(url);
+
         let client = RwLock::new(FederationPeerClient::new(
             connector,
             peer_id,
