@@ -209,9 +209,15 @@ impl ClientModuleInit for WalletClientInit {
     }
 
     async fn init(&self, args: &ClientModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
+        // TODO: remove this when turning backups back on
+        let random_root_secret = {
+            let (key, salt): ([u8; 32], [u8; 32]) = thread_rng().gen();
+            DerivableSecret::new_root(&key, &salt)
+        };
+
         let data = WalletClientModuleData {
             cfg: args.cfg().clone(),
-            module_root_secret: args.module_root_secret().clone(),
+            module_root_secret: random_root_secret, // args.module_root_secret().clone()
         };
 
         let rpc_config = self
@@ -251,101 +257,10 @@ impl ClientModuleInit for WalletClientInit {
     /// because it is not expected that it would take long enough to bother.
     async fn recover(
         &self,
-        args: &ClientModuleRecoverArgs<Self>,
-        snapshot: Option<&<Self::Module as ClientModule>::Backup>,
+        _args: &ClientModuleRecoverArgs<Self>,
+        _snapshot: Option<&<Self::Module as ClientModule>::Backup>,
     ) -> anyhow::Result<()> {
-        let db = args.db().clone();
-        if db
-            .begin_transaction_nc()
-            .await
-            .get_value(&RecoveryFinalizedKey)
-            .await
-            .unwrap_or_default()
-        {
-            debug!(target: LOG_CLIENT_MODULE_WALLET, max_gap=RECOVER_MAX_GAP, "Recovery already complete before");
-            return Ok(());
-        }
-
-        #[allow(clippy::single_match_else)]
-        let previous_next_unused_idx = match snapshot {
-            Some(WalletModuleBackup::V0(backup)) => {
-                debug!(target: LOG_CLIENT_MODULE_WALLET, "Restoring starting from an existing backup");
-
-                backup.next_tweak_idx
-            }
-            _ => {
-                debug!(target: LOG_CLIENT_MODULE_WALLET, "Restoring without an existing backup");
-                TweakIdx(0)
-            }
-        };
-
-        let rpc_config = self
-            .0
-            .clone()
-            .unwrap_or(WalletClientModule::get_rpc_config(args.cfg()));
-
-        let btc_rpc = create_bitcoind(&rpc_config, TaskGroup::new().make_handle())?;
-        let btc_rpc = &btc_rpc;
-
-        let data = WalletClientModuleData {
-            cfg: args.cfg().clone(),
-            module_root_secret: args.module_root_secret().clone(),
-        };
-        let data = &data;
-
-        let RecoverScanOutcome { last_used_idx, new_start_idx, tweak_idxes_with_pegins} = recover_scan_idxes_for_activity(previous_next_unused_idx, move |cur_tweak_idx: TweakIdx| async move {
-            args.update_recovery_progress(RecoveryProgress {
-                complete: u32::try_from(cur_tweak_idx.0).unwrap_or(u32::MAX),
-                total: u32::try_from(cur_tweak_idx.0.saturating_add(RECOVER_MAX_GAP)).unwrap_or(u32::MAX),
-            });
-
-        let (script, address, _tweak_key, _operation_id) =
-            data.derive_peg_in_script(cur_tweak_idx);
-
-            btc_rpc.watch_script_history(&script).await?;
-            let history = btc_rpc.get_script_history(&script).await?;
-
-            debug!(target: LOG_CLIENT_MODULE_WALLET, %cur_tweak_idx, %address, history_len=history.len(), "Checked address");
-
-            Ok(history)
-        }).await?;
-
-        let now = fedimint_core::time::now();
-        let mut dbtx = db.begin_transaction().await;
-
-        let mut tweak_idx = TweakIdx(0);
-
-        while tweak_idx < new_start_idx {
-            let (_script, _address, _tweak_key, operation_id) =
-                data.derive_peg_in_script(tweak_idx);
-            dbtx.insert_new_entry(
-                &PegInTweakIndexKey(tweak_idx),
-                &PegInTweakIndexData {
-                    creation_time: now,
-                    next_check_time: if tweak_idxes_with_pegins.contains(&tweak_idx) {
-                        // The addresses that were already used before, or didn't seem to contain
-                        // anything don't need automatic peg-in attempt, and can be re-attempted
-                        // manually if needed.
-                        Some(now)
-                    } else {
-                        None
-                    },
-                    last_check_time: None,
-                    operation_id,
-                    claimed: vec![],
-                },
-            )
-            .await;
-            tweak_idx = tweak_idx.next();
-        }
-
-        dbtx.insert_new_entry(&NextPegInTweakIndexKey, &new_start_idx)
-            .await;
-        dbtx.insert_entry(&RecoveryFinalizedKey, &true).await;
-
-        dbtx.commit_tx().await;
-
-        debug!(target: LOG_CLIENT_MODULE_WALLET, %new_start_idx, ?last_used_idx, "Recovery complete");
+        // TODO: turn recovery back on
         Ok(())
     }
 }
