@@ -1078,7 +1078,12 @@ impl FedimintCli {
                 let source = MetaModuleMetaSourceWithFallback::<LegacyMetaSource>::default();
 
                 let meta_fields = source
-                    .fetch(&client, FetchKind::Initial, None)
+                    .fetch(
+                        &client.config().await,
+                        &client.api_clone(),
+                        FetchKind::Initial,
+                        None,
+                    )
                     .await
                     .map_err_cli()?;
 
