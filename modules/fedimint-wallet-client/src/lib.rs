@@ -691,6 +691,7 @@ impl WalletClientModule {
     /// Returns an error for old deposit operations created prior to the 0.4
     /// release and not driven to completion yet. This should be rare enough
     /// that an indeterminate state is ok here.
+    #[allow(clippy::too_many_lines)]
     pub async fn subscribe_deposit(
         &self,
         operation_id: OperationId,

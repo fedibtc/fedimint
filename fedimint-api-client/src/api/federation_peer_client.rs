@@ -8,7 +8,7 @@ use fedimint_core::util::{backon, SafeUrl};
 use fedimint_core::PeerId;
 use fedimint_logging::LOG_CLIENT_NET_API;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::JsonRpcClient;
 

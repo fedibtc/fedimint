@@ -535,6 +535,10 @@ async fn get_user_client(
         invite_code.clone()
     };
     let (client, invite_code) = build_client(user_invite_code, user_db.as_ref()).await?;
+    let _ = client
+        .get_first_module::<LightningClientModule>()
+        .update_gateway_cache()
+        .await;
     Ok((client, invite_code))
 }
 
