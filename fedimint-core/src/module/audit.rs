@@ -146,7 +146,7 @@ fn generate_module_summaries<'a>(
 fn calculate_net_assets<'a>(items: impl Iterator<Item = &'a AuditItem>) -> Option<i64> {
     items
         .map(|item| item.milli_sat)
-        .try_fold(0i64, |acc, value| acc.checked_add(value))
+        .try_fold(0i64, i64::checked_add)
 }
 
 // Adding a placeholder ensures that a ModuleSummary exists even if the module

@@ -36,7 +36,9 @@ use async_stream::{stream, try_stream};
 use backup::recovery::MintRecovery;
 use base64::Engine as _;
 use bitcoin_hashes::{sha256, sha256t, Hash, HashEngine as BitcoinHashEngine};
-use client_db::{migrate_to_v1, DbKeyPrefix, NoteKeyPrefix, RecoveryFinalizedKey};
+use client_db::{
+    migrate_to_v1, DbKeyPrefix, NoteKeyPrefix, RecoveryFinalizedKey, ReusedNoteIndices,
+};
 use fedimint_client::db::ClientMigrationFn;
 use fedimint_client::module::init::{
     ClientModuleInit, ClientModuleInitArgs, ClientModuleRecoverArgs,
@@ -565,7 +567,7 @@ impl ModuleInit for MintClientInit {
                         mint_client_items.insert("RecoveryFinalized".to_string(), Box::new(val));
                     }
                 }
-                DbKeyPrefix::RecoveryState => {}
+                DbKeyPrefix::RecoveryState | DbKeyPrefix::ReusedNoteIndices => {}
             }
         }
 
@@ -1737,6 +1739,25 @@ impl MintClientModule {
         })
         .await
         .expect("Must deleted existing spendable note");
+    }
+    /// Returns secrets for the note indices that were reused by previous
+    /// clients with same client secret.
+    pub async fn reused_note_secrets(&self) -> Vec<(Amount, NoteIssuanceRequest, BlindNonce)> {
+        self.client_ctx
+            .module_db()
+            .begin_transaction_nc()
+            .await
+            .get_value(&ReusedNoteIndices)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(amount, note_idx)| {
+                let secret = Self::new_note_secret_static(&self.secret, amount, note_idx);
+                let (request, blind_nonce) =
+                    NoteIssuanceRequest::new(fedimint_core::secp256k1::SECP256K1, &secret);
+                (amount, request, blind_nonce)
+            })
+            .collect()
     }
 }
 

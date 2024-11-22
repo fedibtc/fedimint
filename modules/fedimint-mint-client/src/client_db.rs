@@ -9,6 +9,7 @@ use strum_macros::EnumIter;
 
 use crate::backup::recovery::MintRecoveryState;
 use crate::SpendableNoteUndecoded;
+use crate::NoteIndex;
 
 #[repr(u8)]
 #[derive(Clone, EnumIter, Debug)]
@@ -18,6 +19,7 @@ pub enum DbKeyPrefix {
     CancelledOOBSpend = 0x2b,
     RecoveryState = 0x2c,
     RecoveryFinalized = 0x2d,
+    ReusedNoteIndices = 0x2e,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -80,6 +82,15 @@ impl_db_record!(
     key = RecoveryFinalizedKey,
     value = bool,
     db_prefix = DbKeyPrefix::RecoveryFinalized,
+);
+
+#[derive(Debug, Clone, Encodable, Decodable, Serialize)]
+pub struct ReusedNoteIndices;
+
+impl_db_record!(
+    key = ReusedNoteIndices,
+    value = Vec<(Amount, NoteIndex)>,
+    db_prefix = DbKeyPrefix::ReusedNoteIndices,
 );
 
 #[derive(Debug, Clone, Encodable, Decodable, Serialize)]
