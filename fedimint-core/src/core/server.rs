@@ -16,12 +16,12 @@ use crate::core::{
     DynOutputOutcome,
 };
 use crate::db::DatabaseTransaction;
-use crate::dyn_newtype_define;
 use crate::module::registry::ModuleInstanceId;
 use crate::module::{
     ApiEndpoint, ApiEndpointContext, ApiRequestErased, InputMeta, ModuleCommon, ServerModule,
     TransactionItemAmount,
 };
+use crate::{dyn_newtype_define, InPoint};
 
 /// Backend side module interface
 ///
@@ -65,6 +65,7 @@ pub trait IServerModule: Debug {
         &'a self,
         dbtx: &mut DatabaseTransaction<'c>,
         input: &'b DynInput,
+        in_point: InPoint,
     ) -> Result<InputMeta, DynInputError>;
 
     /// Try to create an output (e.g. issue notes, peg-out BTC, …). On success
@@ -191,6 +192,7 @@ where
         &'a self,
         dbtx: &mut DatabaseTransaction<'c>,
         input: &'b DynInput,
+        in_point: InPoint,
     ) -> Result<InputMeta, DynInputError> {
         <Self as ServerModule>::process_input(
             self,
@@ -199,6 +201,7 @@ where
                 .as_any()
                 .downcast_ref::<<<Self as ServerModule>::Common as ModuleCommon>::Input>()
                 .expect("incorrect input type passed to module plugin"),
+            in_point,
         )
         .await
         .map(Into::into)
