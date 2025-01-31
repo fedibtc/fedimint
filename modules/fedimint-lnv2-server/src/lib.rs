@@ -28,7 +28,8 @@ use fedimint_core::task::{timeout, TaskGroup};
 use fedimint_core::time::duration_since_epoch;
 use fedimint_core::util::SafeUrl;
 use fedimint_core::{
-    apply, async_trait_maybe_send, push_db_pair_items, NumPeersExt, OutPoint, PeerId, ServerModule,
+    apply, async_trait_maybe_send, push_db_pair_items, InPoint, NumPeersExt, OutPoint, PeerId,
+    ServerModule,
 };
 use fedimint_lnv2_common::config::{
     LightningClientConfig, LightningConfig, LightningConfigConsensus, LightningConfigLocal,
@@ -384,6 +385,7 @@ impl ServerModule for Lightning {
         &'a self,
         dbtx: &mut DatabaseTransaction<'c>,
         input: &'b LightningInput,
+        _in_point: InPoint,
     ) -> Result<InputMeta, LightningInputError> {
         let input = input.ensure_v0_ref()?;
 

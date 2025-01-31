@@ -27,7 +27,7 @@ use fedimint_core::module::{
     SupportedModuleApiVersions, TransactionItemAmount, CORE_CONSENSUS_VERSION,
 };
 use fedimint_core::server::DynServerModule;
-use fedimint_core::{push_db_pair_items, NumPeers, OutPoint, PeerId, ServerModule};
+use fedimint_core::{push_db_pair_items, InPoint, NumPeers, OutPoint, PeerId, ServerModule};
 use fedimint_logging::LOG_MODULE_META;
 use fedimint_meta_common::config::{
     MetaClientConfig, MetaConfig, MetaConfigConsensus, MetaConfigLocal, MetaConfigPrivate,
@@ -386,6 +386,7 @@ impl ServerModule for Meta {
         &'a self,
         _dbtx: &mut DatabaseTransaction<'c>,
         _input: &'b MetaInput,
+        _in_point: InPoint,
     ) -> Result<InputMeta, MetaInputError> {
         Err(MetaInputError::NotSupported)
     }

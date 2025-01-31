@@ -19,7 +19,7 @@ use fedimint_core::module::{
     CORE_CONSENSUS_VERSION,
 };
 use fedimint_core::server::DynServerModule;
-use fedimint_core::{push_db_pair_items, OutPoint, PeerId, ServerModule};
+use fedimint_core::{push_db_pair_items, InPoint, OutPoint, PeerId, ServerModule};
 use fedimint_empty_common::config::{
     EmptyClientConfig, EmptyConfig, EmptyConfigConsensus, EmptyConfigLocal, EmptyConfigPrivate,
     EmptyGenParams,
@@ -198,6 +198,7 @@ impl ServerModule for Empty {
         &'a self,
         _dbtx: &mut DatabaseTransaction<'c>,
         _input: &'b EmptyInput,
+        _in_point: InPoint,
     ) -> Result<InputMeta, EmptyInputError> {
         Err(EmptyInputError::NotSupported)
     }
