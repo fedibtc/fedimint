@@ -13,7 +13,9 @@ use fedimint_core::envs::BitcoinRpcConfig;
 use fedimint_core::module::serde_json;
 use fedimint_core::task::sleep_in_test;
 use fedimint_core::util::{BoxStream, NextOrPending};
-use fedimint_core::{sats, Amount, Feerate, PeerId, ServerModule};
+use fedimint_core::{
+    sats, Amount, BitcoinHash, Feerate, InPoint, PeerId, ServerModule, TransactionId,
+};
 use fedimint_dummy_client::DummyClientInit;
 use fedimint_dummy_common::config::DummyGenParams;
 use fedimint_dummy_server::DummyInit;
@@ -687,6 +689,10 @@ async fn peg_ins_that_are_unconfirmed_are_rejected() -> anyhow::Result<()> {
                 .0
                 .into_nc(),
             &input,
+            InPoint {
+                txid: TransactionId::all_zeros(),
+                in_idx: 0,
+            },
         )
         .await
     {
@@ -720,6 +726,10 @@ async fn peg_ins_that_are_unconfirmed_are_rejected() -> anyhow::Result<()> {
                     .0
                     .into_nc(),
                 &input,
+                InPoint {
+                    txid: TransactionId::all_zeros(),
+                    in_idx: 0,
+                },
             )
             .await,
         Ok(_)

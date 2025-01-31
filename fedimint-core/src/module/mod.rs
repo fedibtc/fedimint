@@ -50,8 +50,8 @@ use crate::net::peers::MuxPeerConnections;
 use crate::server::DynServerModule;
 use crate::task::{MaybeSend, TaskGroup};
 use crate::{
-    apply, async_trait_maybe_send, maybe_add_send, maybe_add_send_sync, Amount, NumPeers, OutPoint,
-    PeerId,
+    apply, async_trait_maybe_send, maybe_add_send, maybe_add_send_sync, Amount, InPoint, NumPeers,
+    OutPoint, PeerId,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -855,6 +855,7 @@ pub trait ServerModule: Debug + Sized {
         &'a self,
         dbtx: &mut DatabaseTransaction<'c>,
         input: &'b <Self::Common as ModuleCommon>::Input,
+        in_point: InPoint,
     ) -> Result<InputMeta, <Self::Common as ModuleCommon>::InputError>;
 
     /// Try to create an output (e.g. issue notes, peg-out BTC, …). On success

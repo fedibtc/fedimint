@@ -29,7 +29,7 @@ use fedimint_core::server::DynServerModule;
 use fedimint_core::util::BoxFuture;
 use fedimint_core::{
     apply, async_trait_maybe_send, push_db_key_items, push_db_pair_items, secp256k1, Amount,
-    NumPeersExt, OutPoint, PeerId, ServerModule, Tiered, TieredMulti,
+    InPoint, NumPeersExt, OutPoint, PeerId, ServerModule, Tiered, TieredMulti,
 };
 use fedimint_logging::LOG_MODULE_MINT;
 pub use fedimint_mint_common as common;
@@ -455,6 +455,7 @@ impl ServerModule for Mint {
         &'a self,
         dbtx: &mut DatabaseTransaction<'c>,
         input: &'b MintInput,
+        _in_point: InPoint,
     ) -> Result<InputMeta, MintInputError> {
         let input = input.ensure_v0_ref()?;
 
@@ -781,7 +782,9 @@ mod test {
     use fedimint_core::db::Database;
     use fedimint_core::module::registry::ModuleRegistry;
     use fedimint_core::module::{ModuleConsensusVersion, ServerModuleInit};
-    use fedimint_core::{secp256k1, Amount, PeerId, ServerModule};
+    use fedimint_core::{
+        secp256k1, Amount, BitcoinHash, InPoint, PeerId, ServerModule, TransactionId,
+    };
     use fedimint_mint_common::config::FeeConsensus;
     use fedimint_mint_common::{MintInput, Nonce, Note};
     use tbs::blind_message;
@@ -899,6 +902,10 @@ mod test {
         mint.process_input(
             &mut dbtx.to_ref_with_prefix_module_id(42).0.into_nc(),
             &input,
+            InPoint {
+                txid: TransactionId::all_zeros(),
+                in_idx: 0,
+            },
         )
         .await
         .expect("Spend of valid e-cash works");
@@ -906,6 +913,10 @@ mod test {
             mint.process_input(
                 &mut dbtx.to_ref_with_prefix_module_id(42).0.into_nc(),
                 &input,
+                InPoint {
+                    txid: TransactionId::all_zeros(),
+                    in_idx: 0
+                },
             )
             .await,
             Err(_)
