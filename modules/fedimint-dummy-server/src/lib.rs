@@ -23,7 +23,7 @@ use fedimint_core::module::{
     CORE_CONSENSUS_VERSION,
 };
 use fedimint_core::server::DynServerModule;
-use fedimint_core::{push_db_pair_items, Amount, OutPoint, PeerId, ServerModule};
+use fedimint_core::{push_db_pair_items, Amount, InPoint, OutPoint, PeerId, ServerModule};
 use fedimint_dummy_common::config::{
     DummyClientConfig, DummyConfig, DummyConfigConsensus, DummyConfigLocal, DummyConfigPrivate,
     DummyGenParams,
@@ -224,6 +224,7 @@ impl ServerModule for Dummy {
         &'a self,
         dbtx: &mut DatabaseTransaction<'c>,
         input: &'b DummyInput,
+        _in_point: InPoint,
     ) -> Result<InputMeta, DummyInputError> {
         let current_funds = dbtx
             .get_value(&DummyFundsKeyV1(input.account))
