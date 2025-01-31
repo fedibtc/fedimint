@@ -2,7 +2,7 @@ use fedimint_core::db::DatabaseTransaction;
 use fedimint_core::module::registry::ServerModuleRegistry;
 use fedimint_core::module::TransactionItemAmount;
 use fedimint_core::transaction::{Transaction, TransactionError, TRANSACTION_OVERFLOW_ERROR};
-use fedimint_core::{Amount, OutPoint};
+use fedimint_core::{Amount, InPoint, OutPoint};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::metrics::{CONSENSUS_TX_PROCESSED_INPUTS, CONSENSUS_TX_PROCESSED_OUTPUTS};
@@ -38,7 +38,9 @@ pub async fn process_transaction_with_dbtx(
     let mut funding_verifier = FundingVerifier::default();
     let mut public_keys = Vec::new();
 
-    for input in &transaction.inputs {
+    let txid = transaction.tx_hash();
+
+    for (input, in_idx) in transaction.inputs.iter().zip(0u64..) {
         let meta = modules
             .get_expect(input.module_instance_id())
             .process_input(
@@ -46,6 +48,7 @@ pub async fn process_transaction_with_dbtx(
                     .to_ref_with_prefix_module_id(input.module_instance_id())
                     .0,
                 input,
+                InPoint { txid, in_idx },
             )
             .await
             .map_err(TransactionError::Input)?;
@@ -55,8 +58,6 @@ pub async fn process_transaction_with_dbtx(
     }
 
     transaction.validate_signatures(&public_keys)?;
-
-    let txid = transaction.tx_hash();
 
     for (output, out_idx) in transaction.outputs.iter().zip(0u64..) {
         let amount = modules

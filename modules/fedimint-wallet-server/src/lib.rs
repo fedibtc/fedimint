@@ -58,7 +58,7 @@ use fedimint_core::time::now;
 use fedimint_core::util::{backoff_util, retry};
 use fedimint_core::{
     apply, async_trait_maybe_send, get_network_for_address, push_db_key_items, push_db_pair_items,
-    Feerate, NumPeersExt, OutPoint, PeerId, ServerModule,
+    Feerate, InPoint, NumPeersExt, OutPoint, PeerId, ServerModule,
 };
 use fedimint_logging::LOG_MODULE_WALLET;
 use fedimint_server::config::distributedgen::PeerHandleOps;
@@ -524,6 +524,7 @@ impl ServerModule for Wallet {
         &'a self,
         dbtx: &mut DatabaseTransaction<'c>,
         input: &'b WalletInput,
+        _in_point: InPoint,
     ) -> Result<InputMeta, WalletInputError> {
         let input = input.ensure_v0_ref()?;
 
