@@ -84,7 +84,7 @@ pub async fn run(
 
     let db = db.with_decoders(decoders);
 
-    initialize_gauge_metrics(&db).await;
+    initialize_gauge_metrics(&task_group, &db).await;
 
     start_api_announcement_service(&db, &task_group, &cfg, force_api_secrets.get_active()).await;
 
@@ -141,7 +141,7 @@ pub async fn run_config_gen(
 ) -> anyhow::Result<ServerConfig> {
     info!(target: LOG_CONSENSUS, "Starting config gen");
 
-    initialize_gauge_metrics(&db).await;
+    initialize_gauge_metrics(task_group, &db).await;
 
     let (cfg_sender, mut cfg_receiver) = tokio::sync::mpsc::channel(1);
 
