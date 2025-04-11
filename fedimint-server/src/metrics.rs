@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use fedimint_core::backup::ClientBackupKeyPrefix;
 use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped};
-use fedimint_core::task::{TaskGroup, sleep};
+use fedimint_core::task::{sleep, TaskGroup};
 use fedimint_metrics::prometheus::{
     register_histogram_vec_with_registry, register_int_gauge_vec_with_registry,
     register_int_gauge_with_registry, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
