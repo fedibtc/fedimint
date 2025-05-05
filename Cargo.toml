@@ -190,8 +190,11 @@ iroh-base = { version = "0.34.0", default-features = false }
 itertools = "0.13.0"
 jaq-core = "2.1.1"
 jaq-json = { version = "1.1.1", features = ["serde_json"] }
-lightning = "0.0.125"
-lightning-invoice = { version = "0.32.0", features = ["std"] }
+lightning-invoice = { version = "0.33.2", features = ["std"] }
+arti-client = { version = "0.21.0", default-features = false }
+ldk-node = "0.5.0"
+lightning = "0.1.3"
+lightning-types = "0.2.0"
 lnurl-rs = { version = "0.9.0", default-features = false }
 miniscript = "12.3.0"
 rand = "0.8.5"

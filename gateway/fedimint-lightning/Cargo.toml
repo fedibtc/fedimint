@@ -24,7 +24,7 @@ fedimint-ln-common = { workspace = true }
 fedimint-logging = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
-ldk-node = "0.4.3"
+ldk-node = { workspace = true }
 lightning = { workspace = true }
 lightning-invoice = { workspace = true }
 lockable = "0.1.1"

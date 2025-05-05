@@ -505,7 +505,7 @@ impl ClientModule for LightningClientModule {
                         .create_bolt11_invoice(
                             req.amount,
                             lightning_invoice::Bolt11InvoiceDescription::Direct(
-                                &lightning_invoice::Description::new(req.description)?,
+                                lightning_invoice::Description::new(req.description)?,
                             ),
                             req.expiry_time,
                             req.extra_meta,
@@ -543,7 +543,7 @@ impl ClientModule for LightningClientModule {
                         .create_bolt11_invoice_for_user_tweaked(
                             req.amount,
                             lightning_invoice::Bolt11InvoiceDescription::Direct(
-                                &lightning_invoice::Description::new(req.description)?,
+                                lightning_invoice::Description::new(req.description)?,
                             ),
                             req.expiry_time,
                             req.user_key,
@@ -943,7 +943,7 @@ impl LightningClientModule {
     fn create_lightning_receive_output<'a>(
         &'a self,
         amount: Amount,
-        description: lightning_invoice::Bolt11InvoiceDescription<'a>,
+        description: lightning_invoice::Bolt11InvoiceDescription,
         receiving_key: ReceivingKey,
         mut rng: impl RngCore + CryptoRng + 'a,
         expiry_time: Option<u64>,
@@ -1605,7 +1605,7 @@ impl LightningClientModule {
     pub async fn create_bolt11_invoice<M: Serialize + Send + Sync>(
         &self,
         amount: Amount,
-        description: lightning_invoice::Bolt11InvoiceDescription<'_>,
+        description: lightning_invoice::Bolt11InvoiceDescription,
         expiry_time: Option<u64>,
         extra_meta: M,
         gateway: Option<LightningGateway>,
@@ -1629,7 +1629,7 @@ impl LightningClientModule {
     pub async fn create_bolt11_invoice_for_user_tweaked<M: Serialize + Send + Sync>(
         &self,
         amount: Amount,
-        description: lightning_invoice::Bolt11InvoiceDescription<'_>,
+        description: lightning_invoice::Bolt11InvoiceDescription,
         expiry_time: Option<u64>,
         user_key: PublicKey,
         index: u64,
@@ -1652,7 +1652,7 @@ impl LightningClientModule {
     pub async fn create_bolt11_invoice_for_user<M: Serialize + Send + Sync>(
         &self,
         amount: Amount,
-        description: lightning_invoice::Bolt11InvoiceDescription<'_>,
+        description: lightning_invoice::Bolt11InvoiceDescription,
         expiry_time: Option<u64>,
         user_key: PublicKey,
         extra_meta: M,
@@ -1674,7 +1674,7 @@ impl LightningClientModule {
     async fn create_bolt11_invoice_internal<M: Serialize + Send + Sync>(
         &self,
         amount: Amount,
-        description: lightning_invoice::Bolt11InvoiceDescription<'_>,
+        description: lightning_invoice::Bolt11InvoiceDescription,
         expiry_time: Option<u64>,
         receiving_key: ReceivingKey,
         extra_meta: M,
