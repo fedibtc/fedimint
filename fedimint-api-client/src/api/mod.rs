@@ -77,17 +77,9 @@ pub type SerdeOutputOutcome = SerdeModuleEncoding<DynOutputOutcome>;
 
 pub type OutputOutcomeResult<O> = result::Result<O, OutputOutcomeError>;
 
-static INSTALL_CRYPTO: OnceCell<()> = OnceCell::const_new();
-
 #[cfg(not(target_family = "wasm"))]
-async fn install_crypto_provider() {
-    INSTALL_CRYPTO
-        .get_or_init(|| async {
-            tokio_rustls::rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("Failed to install crypto");
-        })
-        .await;
+fn install_crypto_provider() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Set of api versions for each component (core + modules)
@@ -722,7 +714,7 @@ impl IClientConnector for WebsocketConnector {
 
         #[cfg(not(target_family = "wasm"))]
         let mut client = {
-            install_crypto_provider().await;
+            install_crypto_provider();
             let webpki_roots = webpki_roots::TLS_SERVER_ROOTS.iter().cloned();
             let mut root_certs = RootCertStore::empty();
             root_certs.extend(webpki_roots);
@@ -812,7 +804,7 @@ impl IClientConnector for TorConnector {
             .get(&peer_id)
             .ok_or_else(|| PeerError::InternalClientError(anyhow!("Invalid peer_id: {peer_id}")))?;
 
-        install_crypto_provider().await;
+        install_crypto_provider();
 
         let tor_config = TorClientConfig::default();
         let tor_client = TorClient::create_bootstrapped(tor_config)
