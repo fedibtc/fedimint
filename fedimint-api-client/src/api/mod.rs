@@ -53,7 +53,6 @@ use jsonrpsee_ws_client::{CustomCertStore, HeaderMap, HeaderValue};
 use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::OnceCell;
 #[cfg(not(target_family = "wasm"))]
 use tokio_rustls::rustls::RootCertStore;
 #[cfg(all(feature = "tor", not(target_family = "wasm")))]
@@ -77,17 +76,9 @@ pub type SerdeOutputOutcome = SerdeModuleEncoding<DynOutputOutcome>;
 
 pub type OutputOutcomeResult<O> = result::Result<O, OutputOutcomeError>;
 
-static INSTALL_CRYPTO: OnceCell<()> = OnceCell::const_new();
-
 #[cfg(not(target_family = "wasm"))]
-async fn install_crypto_provider() {
-    INSTALL_CRYPTO
-        .get_or_init(|| async {
-            tokio_rustls::rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("Failed to install crypto");
-        })
-        .await;
+fn install_crypto_provider() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Set of api versions for each component (core + modules)
@@ -701,28 +692,27 @@ impl IClientConnector for WebsocketConnector {
             ),
         ];
 
-        let replacement_url =
-            API_REPLACEMENT_LIST
-                .iter()
-                .find_map(|(search_url, replacement_url)| {
-                    if *search_url == api_endpoint.as_str() {
-                        debug!(
+        let replacement_url = API_REPLACEMENT_LIST.iter().find_map(
+            |(search_url, replacement_url)| {
+                if *search_url == api_endpoint.as_str() {
+                    debug!(
                         "Replacing API URL '{}' with '{}', quick-fix for fedimint/fedimint#5482",
                         search_url, replacement_url
                     );
-                        Some(
-                            SafeUrl::parse(replacement_url)
-                                .expect("hardcoded replacement url is valid"),
-                        )
-                    } else {
-                        None
-                    }
-                });
+                    Some(
+                        SafeUrl::parse(replacement_url)
+                            .expect("hardcoded replacement url is valid"),
+                    )
+                } else {
+                    None
+                }
+            },
+        );
         let api_endpoint = replacement_url.as_ref().unwrap_or(api_endpoint);
 
         #[cfg(not(target_family = "wasm"))]
         let mut client = {
-            install_crypto_provider().await;
+            install_crypto_provider();
             let webpki_roots = webpki_roots::TLS_SERVER_ROOTS.iter().cloned();
             let mut root_certs = RootCertStore::empty();
             root_certs.extend(webpki_roots);
@@ -812,7 +802,7 @@ impl IClientConnector for TorConnector {
             .get(&peer_id)
             .ok_or_else(|| PeerError::InternalClientError(anyhow!("Invalid peer_id: {peer_id}")))?;
 
-        install_crypto_provider().await;
+        install_crypto_provider();
 
         let tor_config = TorClientConfig::default();
         let tor_client = TorClient::create_bootstrapped(tor_config)
