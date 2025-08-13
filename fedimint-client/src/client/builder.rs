@@ -1358,7 +1358,6 @@ impl ClientPreview {
 
         Ok(client)
     }
-
     /// Download most recent valid backup found from the Federation
     pub async fn download_backup_from_federation(
         &self,
