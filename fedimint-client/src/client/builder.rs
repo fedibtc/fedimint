@@ -1067,7 +1067,7 @@ impl ClientPreview {
 
         Client::download_backup_from_federation_static(
             &api,
-            &pre_root_secret,
+            &ClientBuilder::federation_root_secret(&pre_root_secret, &self.config),
             &self.inner.decoders(&self.config),
         )
         .await
