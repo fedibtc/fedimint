@@ -210,8 +210,8 @@ pub async fn run(
     )
     .await;
 
-    if let Some(iroh_api_sk) = cfg.private.iroh_api_sk.clone()
-        && let Err(e) = Box::pin(start_iroh_api(
+    if let Some(iroh_api_sk) = cfg.private.iroh_api_sk.clone() {
+        if let Err(e) = Box::pin(start_iroh_api(
             iroh_api_sk,
             api_bind,
             iroh_dns,
@@ -221,11 +221,12 @@ pub async fn run(
             iroh_api_limits,
         ))
         .await
-    {
-        // clean up ws api before propagating error
-        api_handler.stop().expect("Just started");
-        api_handler.stopped().await;
-        return Err(e);
+        {
+            // clean up ws api before propagating error
+            api_handler.stop().expect("Just started");
+            api_handler.stopped().await;
+            return Err(e);
+        }
     }
 
     info!(target: LOG_CONSENSUS, "Starting Submission of Module CI proposals...");
