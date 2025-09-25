@@ -10,7 +10,7 @@ use fedimint_api_client::api::global_api::with_request_hook::{
     ApiRequestHook, RawFederationApiWithRequestHookExt as _,
 };
 use fedimint_api_client::api::net::Connector;
-use fedimint_api_client::api::{ApiVersionSet, DynGlobalApi, ReconnectFederationApi};
+use fedimint_api_client::api::{ApiVersionSet, DynGlobalApi, ReconnectFederationApi, DynClientConnector, make_admin_connector, make_connector, };
 use fedimint_client_module::api::ClientRawFederationApiExt as _;
 use fedimint_client_module::meta::LegacyMetaSource;
 use fedimint_client_module::module::init::ClientModuleInit;
@@ -116,6 +116,7 @@ pub struct ClientBuilder {
     stopped: bool,
     log_event_added_transient_tx: broadcast::Sender<EventLogEntry>,
     request_hook: ApiRequestHook,
+    reuse_connector: Option<DynClientConnector>,
 }
 
 impl ClientBuilder {
@@ -134,6 +135,7 @@ impl ClientBuilder {
             meta_service,
             log_event_added_transient_tx,
             request_hook: Arc::new(|api| api),
+            reuse_connector: None,
         }
     }
 
@@ -150,6 +152,7 @@ impl ClientBuilder {
             connector: client.connector,
             log_event_added_transient_tx: client.log_event_added_transient_tx.clone(),
             request_hook: client.request_hook.clone(),
+            reuse_connector: Some(client.api.connector().clone()),
         }
     }
 
@@ -370,8 +373,8 @@ impl ClientBuilder {
             .await
     }
 
-    pub async fn preview(self, invite_code: &InviteCode) -> anyhow::Result<ClientPreview> {
-        let config = self
+    pub async fn preview(mut self, invite_code: &InviteCode) -> anyhow::Result<ClientPreview> {
+        let (config, api) = self
             .connector
             .download_from_invite_code(invite_code)
             .await?;
@@ -380,10 +383,10 @@ impl ClientBuilder {
             // Fetching api announcements using invite urls before joining, then write them
             // to database This ensures the client can communicated with the
             // Federation even if all the peers moved.
-            let api = DynGlobalApi::from_endpoints(invite_code.peers(), &invite_code.api_secret())
-                .await?;
             refresh_api_announcement_sync(&api, self.db_no_decoders(), &guardian_pub_keys).await?;
         }
+
+        self.reuse_connector = Some(api.connector().clone());
 
         Ok(ClientPreview {
             inner: self,
@@ -504,25 +507,38 @@ impl ClientBuilder {
         let connector = self.connector;
         let peer_urls = get_api_urls(&db, &config).await;
         let api = match self.admin_creds.as_ref() {
-            Some(admin_creds) => ReconnectFederationApi::new_admin(
-                admin_creds.peer_id,
-                peer_urls
-                    .into_iter()
-                    .find_map(|(peer, api_url)| (admin_creds.peer_id == peer).then_some(api_url))
-                    .context("Admin creds should match a peer")?,
-                &api_secret,
-            )
-            .await?
-            .with_client_ext(db.clone(), log_ordering_wakeup_tx.clone())
-            .with_request_hook(&request_hook)
-            .with_cache()
-            .into(),
-            None => ReconnectFederationApi::from_endpoints(peer_urls, &api_secret, None)
-                .await?
-                .with_client_ext(db.clone(), log_ordering_wakeup_tx.clone())
-                .with_request_hook(&request_hook)
-                .with_cache()
-                .into(),
+            Some(admin_creds) => {
+                let connector = make_admin_connector(
+                    admin_creds.peer_id,
+                    peer_urls
+                        .into_iter()
+                        .find_map(|(peer, api_url)| {
+                            (admin_creds.peer_id == peer).then_some(api_url)
+                        })
+                        .context("Admin creds should match a peer")?,
+                    &api_secret,
+                )
+                .await?;
+                ReconnectFederationApi::new_admin(connector, admin_creds.peer_id)
+                    .with_client_ext(db.clone(), log_ordering_wakeup_tx.clone())
+                    .with_request_hook(&request_hook)
+                    .with_cache()
+                    .into()
+            }
+            None => {
+                let connector = if let Some(connector) = self.reuse_connector.clone()
+                    && connector.peers().len() == peer_urls.len()
+                {
+                    connector
+                } else {
+                    make_connector(peer_urls, &api_secret).await?
+                };
+                ReconnectFederationApi::new(connector, None)
+                    .with_client_ext(db.clone(), log_ordering_wakeup_tx.clone())
+                    .with_request_hook(&request_hook)
+                    .with_cache()
+                    .into()
+            }
         };
         let task_group = TaskGroup::new();
 
