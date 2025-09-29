@@ -15,7 +15,7 @@ use fedimint_logging::LOG_NET_IROH;
 use futures::Future;
 use futures::stream::{FuturesUnordered, StreamExt};
 use iroh::discovery::pkarr::{PkarrPublisher, PkarrResolver};
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, PathSelection};
 use iroh::{Endpoint, NodeAddr, NodeId, PublicKey, SecretKey};
 use iroh_base::ticket::NodeTicket;
 use serde_json::Value;
@@ -81,6 +81,11 @@ impl IrohConnector {
         let endpoint_stable = {
             let mut builder = Endpoint::builder();
 
+            // iOS unfortunately shows a scary permission prompt if we try to create a
+            // direct connection, so for now we disable them o that platform.
+            #[cfg(target_os = "ios")]
+            builder = builder.path_selection(PathSelection::RelayOnly);
+
             for iroh_dns in iroh_dns_servers {
                 builder = builder
                     .add_discovery({
@@ -104,8 +109,15 @@ impl IrohConnector {
         };
         let endpoint_next = {
             let builder = iroh_next::Endpoint::builder().discovery_n0();
+
             #[cfg(not(target_family = "wasm"))]
             let builder = builder.discovery_dht();
+
+            // iOS unfortunately shows a scary permission prompt if we try to create a
+            // direct connection, so for now we disable them o that platform.
+            #[cfg(target_os = "ios")]
+            let builder = builder.path_selection(iroh_next::endpoint::PathSelection::RelayOnly);
+
             let endpoint = builder.bind().await?;
             debug!(
                 target: LOG_NET_IROH,
