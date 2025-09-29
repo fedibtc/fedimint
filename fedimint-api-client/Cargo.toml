@@ -60,6 +60,7 @@ aws-lc-sys = { version = "0.30", features = ["bindgen"] }
 curve25519-dalek = { workspace = true, optional = true }
 iroh = { workspace = true, default-features = false, features = [
   "discovery-pkarr-dht",
+  "no_holepunch",
 ] }
 iroh-next = { workspace = true, default-features = false, features = [
   "discovery-pkarr-dht",
