@@ -71,7 +71,7 @@ use global_ctx::ModuleGlobalClientContext;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::WatchStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ClientBuilder;
 use crate::api_announcements::{ApiAnnouncementPrefix, get_api_urls};
@@ -424,6 +424,7 @@ impl Client {
 
         let (added_input_bundle, change_outputs) = self
             .primary_module()
+            .await
             .create_final_inputs_and_outputs(
                 self.primary_module_instance,
                 dbtx,
@@ -637,6 +638,7 @@ impl Client {
         out_point: OutPoint,
     ) -> anyhow::Result<()> {
         self.primary_module()
+            .await
             .await_primary_module_output(operation_id, out_point)
             .await
     }
@@ -731,15 +733,37 @@ impl Client {
     }
 
     /// Get the primary module
-    pub fn primary_module(&self) -> &DynClientModule {
-        self.modules
-            .get(self.primary_module_instance)
-            .expect("primary module must be present")
+    pub async fn primary_module(&self) -> &DynClientModule {
+        retry(
+            "Waiting for primary module to be present",
+            backoff_util::aggressive_backoff(),
+            || async move {
+                match self.modules.get(self.primary_module_instance) {
+                    Some(primary_module) => Ok(primary_module),
+                    None => {
+                        let modules = self
+                            .modules
+                            .iter_modules()
+                            .map(|(id, kind, _)| format!("{id} => {kind})"))
+                            .collect::<Vec<_>>();
+                        error!(
+                            ?modules,
+                            "Primary module instance {} not found, retrying...",
+                            self.primary_module_instance
+                        );
+                        Err(anyhow!("Primary module instance not found"))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("Primary module must be present")
     }
 
     /// Balance available to the client for spending
     pub async fn get_balance(&self) -> Amount {
         self.primary_module()
+            .await
             .get_balance(
                 self.primary_module_instance,
                 &mut self.db().begin_transaction_nc().await,
@@ -750,10 +774,14 @@ impl Client {
     /// Returns a stream that yields the current client balance every time it
     /// changes.
     pub async fn subscribe_balance_changes(&self) -> BoxStream<'static, Amount> {
-        let mut balance_changes = self.primary_module().subscribe_balance_changes().await;
+        let mut balance_changes = self
+            .primary_module()
+            .await
+            .subscribe_balance_changes()
+            .await;
         let initial_balance = self.get_balance().await;
         let db = self.db().clone();
-        let primary_module = self.primary_module().clone();
+        let primary_module = self.primary_module().await.clone();
         let primary_module_instance = self.primary_module_instance;
 
         Box::pin(async_stream::stream! {
