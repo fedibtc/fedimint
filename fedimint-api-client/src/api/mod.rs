@@ -704,23 +704,22 @@ impl IClientConnector for WebsocketConnector {
             ),
         ];
 
-        let replacement_url =
-            API_REPLACEMENT_LIST
-                .iter()
-                .find_map(|(search_url, replacement_url)| {
-                    if *search_url == api_endpoint.as_str() {
-                        debug!(
+        let replacement_url = API_REPLACEMENT_LIST.iter().find_map(
+            |(search_url, replacement_url)| {
+                if *search_url == api_endpoint.as_str() {
+                    debug!(
                         "Replacing API URL '{}' with '{}', quick-fix for fedimint/fedimint#5482",
                         search_url, replacement_url
                     );
-                        Some(
-                            SafeUrl::parse(replacement_url)
-                                .expect("hardcoded replacement url is valid"),
-                        )
-                    } else {
-                        None
-                    }
-                });
+                    Some(
+                        SafeUrl::parse(replacement_url)
+                            .expect("hardcoded replacement url is valid"),
+                    )
+                } else {
+                    None
+                }
+            },
+        );
         let api_endpoint = replacement_url.as_ref().unwrap_or(api_endpoint);
 
         #[cfg(not(target_family = "wasm"))]

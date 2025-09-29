@@ -222,8 +222,6 @@ imbl = "5.0.0"
 impl-tools = "0.10.3"
 iroh = { version = "=0.35.0", default-features = false }
 iroh-base = { version = "=0.35.0", default-features = false }
-iroh-next = { version = "=0.90.0", default-features = false, package = "iroh" }
-iroh-next-base = { version = "=0.90.0", default-features = false, package = "iroh-base" }
 iroh-relay = { version = "=0.35.0", default-features = false }
 itertools = "0.14.0"
 jaq-core = "2.1.1"
@@ -379,3 +377,8 @@ opt-level = 1
 codegen-units = 4
 debug = "line-tables-only"
 lto = "fat"
+
+[patch.crates-io]
+iroh = { git = "https://github.com/elsirion/iroh", branch = "v0.35.0-no-holepunch" }
+iroh-base = { git = "https://github.com/elsirion/iroh", branch = "v0.35.0-no-holepunch" }
+iroh-relay = { git = "https://github.com/elsirion/iroh", branch = "v0.35.0-no-holepunch" }
