@@ -286,6 +286,10 @@ impl ClientBuilder {
         self
     }
 
+    pub fn with_reused_connector(&mut self, connector: DynClientConnector) {
+        self.reuse_connector = Some(connector);
+    }
+
     /// Migrate client module databases
     ///
     /// Note: Client core db migration are done immediately in
