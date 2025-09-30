@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -15,8 +14,6 @@ use fedimint_core::util::{FmtCompact as _, SafeUrl};
 use fedimint_logging::LOG_NET_IROH;
 use futures::Future;
 use futures::stream::{FuturesUnordered, StreamExt};
-#[cfg(not(target_family = "wasm"))]
-use iroh::discovery::dns::DnsDiscovery;
 use iroh::discovery::pkarr::PkarrResolver;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, NodeId, PublicKey};
@@ -90,24 +87,7 @@ impl IrohConnector {
                 builder = builder.add_discovery(move |_| Some(PkarrResolver::new(iroh_dns)));
             }
 
-            #[cfg(not(target_family = "wasm"))]
-            let mut builder = builder.discovery_dht();
-
-            // instead of `.discovery_n0`, which brings publisher we don't want
-            {
-                #[cfg(target_family = "wasm")]
-                {
-                    builder =
-                        builder.add_discovery(move |_| Some(Box::new(PkarrResolver::n0_dns())));
-                }
-
-                #[cfg(not(target_family = "wasm"))]
-                {
-                    builder =
-                        builder.add_discovery(move |_| Some(Arc::new(DnsDiscovery::n0_dns())));
-                }
-            }
-
+            // Only adding n0 discovery without the publisher didn't work
             let endpoint = builder.discovery_n0().bind().await?;
             debug!(
                 target: LOG_NET_IROH,
