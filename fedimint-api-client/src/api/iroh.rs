@@ -90,20 +90,7 @@ impl IrohConnector {
                 builder = builder.add_discovery(move |_| Some(PkarrResolver::new(iroh_dns)));
             }
 
-            // instead of `.discovery_n0`, which brings publisher we don't want
-            {
-                #[cfg(target_family = "wasm")]
-                {
-                    builder =
-                        builder.add_discovery(move |_| Some(Arc::new(PkarrResolver::n0_dns())));
-                }
-
-                #[cfg(not(target_family = "wasm"))]
-                {
-                    builder =
-                        builder.add_discovery(move |_| Some(Arc::new(DnsDiscovery::n0_dns())));
-                }
-            }
+            builder = builder.add_discovery(move |_| Some(PkarrResolver::n0_dns()));
 
             let endpoint = builder.bind().await?;
             debug!(
