@@ -150,17 +150,7 @@ impl IrohConnector {
 
                 // instead of `.discovery_n0`, which brings publisher we don't want
                 {
-                    #[cfg(target_family = "wasm")]
-                    {
-                        builder = builder.add_discovery(move |_| Some(PkarrResolver::n0_dns()));
-                    }
-
-                    #[cfg(not(target_family = "wasm"))]
-                    {
-                        builder = builder.add_discovery(move |_| {
-                            Some(iroh::discovery::dns::DnsDiscovery::n0_dns())
-                        });
-                    }
+                    builder = builder.add_discovery(move |_| Some(PkarrResolver::n0_dns()));
                 }
 
                 let endpoint = builder.bind().await?;
@@ -192,18 +182,8 @@ impl IrohConnector {
 
             // instead of `.discovery_n0`, which brings publisher we don't want
             {
-                // Resolve using HTTPS requests to our DNS server's /pkarr path in browsers
-                #[cfg(target_family = "wasm")]
-                {
-                    builder =
-                        builder.add_discovery(iroh_next::discovery::pkarr::PkarrResolver::n0_dns());
-                }
-                // Resolve using DNS queries outside browsers.
-                #[cfg(not(target_family = "wasm"))]
-                {
-                    builder =
-                        builder.add_discovery(iroh_next::discovery::dns::DnsDiscovery::n0_dns());
-                }
+                builder =
+                    builder.add_discovery(iroh_next::discovery::pkarr::PkarrResolver::n0_dns());
             }
 
             let endpoint = builder.bind().await?;
