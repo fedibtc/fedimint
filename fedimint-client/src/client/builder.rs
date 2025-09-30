@@ -10,7 +10,10 @@ use fedimint_api_client::api::global_api::with_request_hook::{
     ApiRequestHook, RawFederationApiWithRequestHookExt as _,
 };
 use fedimint_api_client::api::net::Connector;
-use fedimint_api_client::api::{ApiVersionSet, DynGlobalApi, ReconnectFederationApi, DynClientConnector, make_admin_connector, make_connector, };
+use fedimint_api_client::api::{
+    ApiVersionSet, DynClientConnector, DynGlobalApi, ReconnectFederationApi, make_admin_connector,
+    make_connector,
+};
 use fedimint_client_module::api::ClientRawFederationApiExt as _;
 use fedimint_client_module::meta::LegacyMetaSource;
 use fedimint_client_module::module::init::ClientModuleInit;
@@ -255,6 +258,10 @@ impl ClientBuilder {
 
     pub fn with_meta_service(&mut self, meta_service: Arc<MetaService>) {
         self.meta_service = meta_service;
+    }
+
+    pub fn with_reused_connector(&mut self, connector: DynClientConnector) {
+        self.reuse_connector = Some(connector);
     }
 
     /// Migrate client module databases
