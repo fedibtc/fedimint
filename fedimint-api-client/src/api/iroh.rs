@@ -90,9 +90,6 @@ impl IrohConnector {
                 builder = builder.add_discovery(move |_| Some(PkarrResolver::new(iroh_dns)));
             }
 
-            #[cfg(not(target_family = "wasm"))]
-            let mut builder = builder.discovery_dht();
-
             // instead of `.discovery_n0`, which brings publisher we don't want
             {
                 #[cfg(target_family = "wasm")]
@@ -108,7 +105,7 @@ impl IrohConnector {
                 }
             }
 
-            let endpoint = builder.discovery_n0().bind().await?;
+            let endpoint = builder.bind().await?;
             debug!(
                 target: LOG_NET_IROH,
                 node_id = %endpoint.node_id(),
