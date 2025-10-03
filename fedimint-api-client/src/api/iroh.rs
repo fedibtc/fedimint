@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -38,6 +38,9 @@ pub struct IrohConnector {
     /// This is useful for testing, or forcing non-default network
     /// connectivity.
     pub connection_overrides: BTreeMap<NodeId, NodeAddr>,
+
+    /// Connection pool for stable endpoint connections
+    connections_stable: Arc<tokio::sync::Mutex<HashMap<NodeId, Connection>>>,
 }
 
 impl IrohConnector {
@@ -106,12 +109,48 @@ impl IrohConnector {
             node_ids,
             endpoint_stable,
             connection_overrides: BTreeMap::new(),
+            connections_stable: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
     pub fn with_connection_override(mut self, node: NodeId, addr: NodeAddr) -> Self {
         self.connection_overrides.insert(node, addr);
         self
+    }
+
+    async fn get_or_create_connection_stable(
+        &self,
+        node_id: NodeId,
+        node_addr: Option<NodeAddr>,
+    ) -> PeerResult<Connection> {
+        // Check if we have an existing connection
+        if let Some(conn) = self.connections_stable.lock().await.get(&node_id) {
+            if conn.close_reason().is_none() {
+                trace!(target: LOG_NET_IROH, %node_id, "Using existing stable connection");
+                return Ok(conn.clone());
+            }
+        }
+
+        trace!(target: LOG_NET_IROH, %node_id, "Creating new stable connection");
+        let conn = match node_addr {
+            Some(node_addr) => {
+                trace!(target: LOG_NET_IROH, %node_id, "Using a connectivity override for connection");
+                let conn = self.endpoint_stable
+                    .connect(node_addr.clone(), FEDIMINT_API_ALPN)
+                    .await;
+
+                conn
+            }
+            None => self.endpoint_stable.connect(node_id, FEDIMINT_API_ALPN).await,
+        }.map_err(PeerError::Connection)?;
+
+        // Add to connection pool
+        self.connections_stable
+            .lock()
+            .await
+            .insert(node_id, conn.clone());
+
+        Ok(conn)
     }
 }
 
@@ -131,21 +170,16 @@ impl IClientConnector for IrohConnector {
             Pin<Box<dyn Future<Output = PeerResult<DynClientConnection>> + Send>>,
         >::new();
         let connection_override = self.connection_overrides.get(&node_id).cloned();
-        let endpoint_stable = self.endpoint_stable.clone();
 
+        // Use connection pool for stable endpoint
+        let self_clone = self.clone();
         futures.push(Box::pin({
             let connection_override = connection_override.clone();
             async move {
-                match connection_override {
-                    Some(node_addr) => {
-                        trace!(target: LOG_NET_IROH, %node_id, "Using a connectivity override for connection");
-                        endpoint_stable
-                            .connect(node_addr.clone(), FEDIMINT_API_ALPN)
-                            .await
-                    }
-                    None => endpoint_stable.connect(node_id, FEDIMINT_API_ALPN).await,
-                }.map_err(PeerError::Connection)
-                .map(super::IClientConnection::into_dyn)
+                self_clone
+                    .get_or_create_connection_stable(node_id, connection_override)
+                    .await
+                    .map(super::IClientConnection::into_dyn)
             }
         }));
 
