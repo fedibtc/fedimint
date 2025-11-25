@@ -49,6 +49,7 @@ pub struct MintRecovery {
     client_ctx: ClientContext<MintClientModule>,
 }
 
+
 #[apply(async_trait_maybe_send!)]
 impl RecoveryFromHistory for MintRecovery {
     type Init = MintClientInit;
@@ -219,7 +220,8 @@ impl RecoveryFromHistory for MintRecovery {
                 "Reissuing chunk of spendable notes"
             );
 
-            let mint_inputs = self.client_ctx.self_ref().create_input_from_notes(notes)?;
+            let mint_inputs =
+                MintClientModule::create_input_from_notes_inner(&self.state.tbs_pks, notes)?;
 
             let tx = TransactionBuilder::new().with_inputs(
                 self.client_ctx

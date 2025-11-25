@@ -1266,21 +1266,23 @@ impl MintClientModule {
         &self,
         notes: TieredMulti<SpendableNote>,
     ) -> anyhow::Result<Vec<(ClientInput<MintInput>, SpendableNote)>> {
-        let mut inputs_and_notes = Vec::new();
+        Self::create_input_from_notes_inner(&self.cfg.tbs_pks, notes)
+    }
 
+    #[allow(clippy::type_complexity)]
+    fn create_input_from_notes_inner(
+        tbs_pks: &Tiered<AggregatePublicKey>,
+        notes: TieredMulti<SpendableNote>,
+    ) -> anyhow::Result<Vec<(ClientInput<MintInput>, SpendableNote)>> {
+        let mut inputs_and_notes = Vec::new();
         for (amount, spendable_note) in notes.into_iter_items() {
-            let key = self
-                .cfg
-                .tbs_pks
+            let key = tbs_pks
                 .get(amount)
                 .ok_or(anyhow!("Invalid amount tier: {amount}"))?;
-
             let note = spendable_note.note();
-
             if !note.verify(*key) {
                 bail!("Invalid note");
             }
-
             inputs_and_notes.push((
                 ClientInput {
                     input: MintInput::new_v0(amount, note),
@@ -1290,7 +1292,6 @@ impl MintClientModule {
                 spendable_note,
             ));
         }
-
         Ok(inputs_and_notes)
     }
 
