@@ -13,7 +13,7 @@ use fedimint_core::db::{
 use fedimint_core::{apply, async_trait_maybe_send};
 use futures::stream;
 use imbl::OrdMap;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 const KV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("fedimint_kv");
 
