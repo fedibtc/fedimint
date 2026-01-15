@@ -35,21 +35,20 @@ impl StorageBackend for WasmBackend {
         Ok(size as u64)
     }
 
-    fn read(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let mut buffer = vec![0u8; len];
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
         let mut bytes_read = 0;
         let options = FileSystemReadWriteOptions::new();
         // redb wants exact reads
-        while bytes_read != len {
-            assert!(bytes_read < len);
+        while bytes_read != out.len() {
+            assert!(bytes_read < out.len());
             options.set_at((offset + bytes_read as u64) as f64);
 
             bytes_read += self
                 .sync_handle
-                .read_with_u8_array_and_options(&mut buffer[bytes_read..], &options)
+                .read_with_u8_array_and_options(&mut out[bytes_read..], &options)
                 .map_err(js_error_to_io_error)? as usize;
         }
-        Ok(buffer)
+        Ok(())
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
@@ -59,7 +58,7 @@ impl StorageBackend for WasmBackend {
         Ok(())
     }
 
-    fn sync_data(&self, _eventual: bool) -> io::Result<()> {
+    fn sync_data(&self) -> io::Result<()> {
         self.sync_handle.flush().map_err(js_error_to_io_error)?;
         Ok(())
     }
