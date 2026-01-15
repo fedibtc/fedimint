@@ -210,7 +210,8 @@ impl<'a> IDatabaseTransactionOps for MemAndRedbTransaction<'a> {
 impl<'a> IRawDatabaseTransaction for MemAndRedbTransaction<'a> {
     async fn commit_tx(self) -> Result<()> {
         let mut data_locked = self.db.data.lock().expect("poison");
-        let write_txn = self.db.db.begin_write()?;
+        let mut write_txn = self.db.db.begin_write()?;
+        write_txn.set_two_phase_commit(true);
         let operations = self.operations;
         let mut data_new = data_locked.clone();
         {
