@@ -400,3 +400,8 @@ opt-level = 1
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"
+
+[patch.crates-io]
+iroh = { git = "https://github.com/elsirion/iroh", branch = "v0.35.0-no-holepunch" }
+iroh-base = { git = "https://github.com/elsirion/iroh", branch = "v0.35.0-no-holepunch" }
+iroh-relay = { git = "https://github.com/elsirion/iroh", branch = "v0.35.0-no-holepunch" }
