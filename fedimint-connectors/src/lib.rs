@@ -249,6 +249,30 @@ impl fmt::Debug for ConnectorRegistry {
     }
 }
 
+const API_REPLACEMENT_LIST: &[(&str, &str)] = &[
+    (
+        "wss://fedimintd.fedimint.freedommint.xyz/",
+        "wss://fedimintd.fedimint.tigerboat21.com/",
+    ),
+    ("wss://api.bitcoinprinciples.xyz/", "wss://api.d6o.org/"),
+    (
+        "wss://outlying-mouse-4ex5u4hthfuo44e6z7gb.wnext.app/ws/",
+        "wss://api.m0na.org/",
+    ),
+    (
+        "wss://third-alligator-vrj3e2jue57qllu7ktje.wnext.app/ws/",
+        "wss://api.boc0.net/",
+    ),
+    (
+        "wss://blank-orc-e6o4bhwtlrasdrmfpend.wnext.app/ws/",
+        "wss://api.og0n.io/",
+    ),
+    (
+        "wss://dependable-distribution-rc47wuqts5mdhq35v7x6.wnext.app/ws/",
+        "wss://api.dac0.com/",
+    ),
+];
+
 impl ConnectorRegistry {
     /// Create a builder with recommended defaults intended for client-side
     /// usage
@@ -264,7 +288,15 @@ impl ConnectorRegistry {
             ws_force_tor: false,
             http_enable: true,
 
-            connection_overrides: BTreeMap::default(),
+            connection_overrides: API_REPLACEMENT_LIST
+                .into_iter()
+                .map(|(a, b)| {
+                    (
+                        SafeUrl::parse(*a).expect("hardcoded replacement url is valid"),
+                        SafeUrl::parse(*b).expect("hardcoded replacement url is valid"),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -280,7 +312,15 @@ impl ConnectorRegistry {
             ws_force_tor: false,
             http_enable: false,
 
-            connection_overrides: BTreeMap::default(),
+            connection_overrides: API_REPLACEMENT_LIST
+                .into_iter()
+                .map(|(a, b)| {
+                    (
+                        SafeUrl::parse(*a).expect("hardcoded replacement url is valid"),
+                        SafeUrl::parse(*b).expect("hardcoded replacement url is valid"),
+                    )
+                })
+                .collect(),
         }
     }
 
