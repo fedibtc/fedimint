@@ -3078,6 +3078,7 @@ dependencies = [
  "fedimint-derive-secret",
  "fedimint-eventlog",
  "fedimint-logging",
+ "fedimint-metrics",
  "futures",
  "reqwest 0.12.22",
  "serde",
