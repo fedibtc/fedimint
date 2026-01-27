@@ -20,6 +20,7 @@ use fedimint_core::util::backoff_util::{FibonacciBackoff, custom_backoff};
 use fedimint_core::util::{FmtCompact, FmtCompactAnyhow, SafeUrl};
 use fedimint_core::{apply, async_trait_maybe_send};
 use fedimint_logging::{LOG_CLIENT_NET_API, LOG_NET};
+use fedimint_metrics::HistogramExt as _;
 use reqwest::Method;
 use serde_json::Value;
 use tokio::sync::{OnceCell, SetOnce, broadcast, watch};
@@ -409,7 +410,7 @@ impl ConnectorRegistry {
 
         let timer = CONNECTION_DURATION_SECONDS
             .with_label_values(&[&scheme])
-            .start_timer();
+            .start_timer_ext();
 
         let result = connector_lazy
             .1
@@ -488,7 +489,7 @@ impl ConnectorRegistry {
 
         let timer = CONNECTION_DURATION_SECONDS
             .with_label_values(&[&scheme])
-            .start_timer();
+            .start_timer_ext();
 
         let result = connector_lazy
             .1
