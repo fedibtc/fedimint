@@ -11,7 +11,9 @@ use bitcoin::Txid;
 use clap::Subcommand;
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::envs::{FM_DISABLE_BASE_FEES_ENV, FM_ENABLE_MODULE_LNV2_ENV, is_env_var_set};
+use fedimint_core::envs::{
+    FM_DISABLE_BASE_FEES_ENV, FM_ENABLE_MODULE_LNV2_ENV, is_env_var_set, is_env_var_set_opt,
+};
 use fedimint_core::module::registry::ModuleRegistry;
 use fedimint_core::net::api_announcement::SignedApiAnnouncement;
 use fedimint_core::task::block_in_place;
@@ -819,7 +821,13 @@ pub async fn cli_tests(dev_fed: DevFed) -> Result<()> {
     }
 
     // OUTGOING: fedimint-cli pays LDK via LND gateway
-    if let Some(iroh_gw_id) = &gw_lnd.iroh_gateway_id
+    if
+    // Since we (Fedi) are using patch Iroh-stable that can't do
+    // direct connections, this test has no chance of working, especially in Nix sandboxes (can't go
+    // through public relays). Added an env var that can be set to re-enable if we ever
+    // want to try again.
+    is_env_var_set_opt("FEDI_ENABLE_IROH_TESTS").unwrap_or(false)
+        && let Some(iroh_gw_id) = &gw_lnd.iroh_gateway_id
         && crate::util::FedimintCli::version_or_default().await >= *VERSION_0_10_0_ALPHA
     {
         info!("Testing outgoing payment from client to LDK via IROH LND Gateway");
