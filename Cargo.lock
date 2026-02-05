@@ -3620,6 +3620,7 @@ dependencies = [
  "fedimint-ldk-node",
  "fedimint-ln-common",
  "fedimint-logging",
+ "fedimint-metrics",
  "fedimint-tonic-lnd",
  "futures",
  "hex",
