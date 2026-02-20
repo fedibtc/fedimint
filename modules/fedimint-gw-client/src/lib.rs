@@ -8,6 +8,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use async_stream::stream;
 use async_trait::async_trait;
 use bitcoin::hashes::{Hash, sha256};
@@ -34,7 +35,8 @@ use fedimint_core::core::{Decoder, IntoDynInstance, ModuleInstanceId, ModuleKind
 use fedimint_core::db::{AutocommitError, DatabaseTransaction};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{Amounts, ApiVersion, ModuleInit, MultiApiVersion};
-use fedimint_core::util::{FmtCompact, SafeUrl, Spanned};
+use fedimint_core::util::backoff_util::custom_backoff;
+use fedimint_core::util::{FmtCompactAnyhow as _, SafeUrl, Spanned, retry};
 use fedimint_core::{Amount, OutPoint, apply, async_trait_maybe_send, secp256k1};
 use fedimint_derive_secret::ChildId;
 use fedimint_lightning::{
@@ -410,10 +412,22 @@ impl GatewayClientModule {
             .await
             .global
             .calculate_federation_id();
-        match self.module_api.register_gateway(&registration_info).await {
+        let register_res = retry(
+            "register-gateway-api-call".to_string(),
+            custom_backoff(Duration::from_millis(250), Duration::from_secs(1), 5.into()),
+            || async {
+                self.module_api
+                    .register_gateway(&registration_info)
+                    .await
+                    .context("Call to register federation via api call")
+            },
+        )
+        .await;
+
+        match register_res {
             Err(e) => {
                 warn!(
-                    e = %e.fmt_compact(),
+                    e = %e.fmt_compact_anyhow(),
                     "Failed to register gateway {gateway_id} with federation {federation_id}"
                 );
             }
