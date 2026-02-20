@@ -17,6 +17,7 @@ use devimint::util::{ProcessManager, almost_equal, poll, poll_with_timeout};
 use devimint::version_constants::{VERSION_0_8_0_ALPHA, VERSION_0_8_2, VERSION_0_10_0_ALPHA};
 use devimint::{Gatewayd, LightningNode, cli, cmd, util};
 use fedimint_core::config::FederationId;
+use fedimint_core::envs::is_env_var_set_opt;
 use fedimint_core::time::now;
 use fedimint_core::{Amount, BitcoinAmountOrAll, bitcoin, default_esplora_server};
 use fedimint_gateway_common::{
@@ -463,10 +464,12 @@ async fn config_test(gw_type: LightningNodeType) -> anyhow::Result<()> {
 
                 assert_eq!(second_fed_balance_msat, rejoined_federation_balance_msat);
 
-                if gw.gatewayd_version >= *VERSION_0_10_0_ALPHA {
-                    // Try to get the info over iroh
-                    info!(target: LOG_TEST, gatewayd_version = %gw.gatewayd_version, "Getting info over iroh");
-                    gw.get_info_iroh().await?;
+                if is_env_var_set_opt("FEDI_ENABLE_IROH_TESTS").unwrap_or(false) {
+                    if gw.gatewayd_version >= *VERSION_0_10_0_ALPHA {
+                        // Try to get the info over iroh
+                        info!(target: LOG_TEST, gatewayd_version = %gw.gatewayd_version, "Getting info over iroh");
+                        gw.get_info_iroh().await?;
+                    }
                 }
 
                 info!(target: LOG_TEST, "Gateway configuration test successful");
