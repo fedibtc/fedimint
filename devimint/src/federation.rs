@@ -39,7 +39,7 @@ use super::vars::utf8;
 use crate::envs::{FM_CLIENT_DIR_ENV, FM_DATA_DIR_ENV};
 use crate::util::{FedimintdCmd, poll, poll_simple, poll_with_timeout};
 use crate::version_constants::VERSION_0_10_0_ALPHA;
-use crate::{poll_almost_equal, poll_eq, vars};
+use crate::{poll_almost_equal, poll_eq, poll_lte, vars};
 
 // TODO: Are we still using the 3rd port for anything?
 /// Number of ports we allocate for every `fedimintd` instance
@@ -881,14 +881,13 @@ impl Federation {
 
             // After version v0.10.0, the LND gateway will register twice. Once for the HTTP
             // server, and once for the iroh endpoint.
-            let expected_gateways =
-                if crate::util::Gatewayd::version_or_default().await < *VERSION_0_10_0_ALPHA {
-                    1
-                } else {
-                    2
-                };
-
-            poll_eq!(num_gateways, expected_gateways)
+            if crate::util::Gatewayd::version_or_default().await < *VERSION_0_10_0_ALPHA {
+                poll_eq!(1, num_gateways)
+            } else {
+                // HACK: Actually, we disabled Iroh on the gateway,
+                // so we might not get 2
+                poll_lte!(1, num_gateways)
+            }
         })
         .await?;
         debug!(target: LOG_DEVIMINT,

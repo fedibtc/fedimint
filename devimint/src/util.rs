@@ -452,6 +452,23 @@ macro_rules! poll_eq {
 }
 
 #[macro_export]
+macro_rules! poll_lte {
+    ($left:expr_2021, $right:expr_2021) => {
+        match ($left, $right) {
+            (left, right) => {
+                if left <= right {
+                    Ok(())
+                } else {
+                    Err(std::ops::ControlFlow::Continue(anyhow::anyhow!(
+                        "assertion failed, left: {left:?} right: {right:?}"
+                    )))
+                }
+            }
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! poll_almost_equal {
     ($left:expr_2021, $right:expr_2021) => {
         match ($left, $right) {
