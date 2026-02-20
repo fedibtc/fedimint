@@ -15,7 +15,9 @@ if [ -z "${FM_ENABLE_IROH:-}" ]; then
     # don't want to run the tests twice, so we just randomize
     # which one is used per high-level CI test.
     if (( $((RANDOM % 2)) == 0 )); then
-        export FM_ENABLE_IROH=true
+        # HACK: fedimint's iroh fork can't do iroh in the sandbox
+        # export FM_ENABLE_IROH=true
+        export FM_ENABLE_IROH=false
     else
         export FM_ENABLE_IROH=false
     fi

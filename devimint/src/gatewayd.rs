@@ -14,6 +14,7 @@ use fedimint_core::envs::is_env_var_set;
 use fedimint_core::secp256k1::PublicKey;
 use fedimint_core::util::{backoff_util, retry};
 use fedimint_core::{Amount, BitcoinAmountOrAll, BitcoinHash};
+use fedimint_gateway_common::envs::FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV;
 use fedimint_gateway_common::{
     ChannelInfo, CreateOfferResponse, GatewayBalances, GatewayFedConfig, GetInvoiceResponse,
     ListTransactionsResponse, MnemonicResponse, PaymentDetails, PaymentStatus,
@@ -780,10 +781,10 @@ impl Gatewayd {
             //     FM_GATEWAY_IROH_LISTEN_ADDR_ENV.to_owned(),
             //     format!("127.0.0.1:{}", iroh_endpoint.port()),
             // ),
-            // (
-            //     FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV.to_owned(),
-            //     iroh_endpoint.secret_key(),
-            // ),
+            (
+                FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV.to_owned(),
+                iroh_endpoint.secret_key(),
+            ),
             (
                 FM_GATEWAY_METRICS_LISTEN_ADDR_ENV.to_owned(),
                 format!("127.0.0.1:{metrics_port}"),
@@ -860,10 +861,8 @@ impl Gatewayd {
                         .to_owned();
                     let iroh_gateway_id = info["registrations"]["iroh"][1]
                         .as_str()
-                        .context("gateway id must be a string")
-                        .map_err(ControlFlow::Break)?
-                        .to_owned();
-                    (gateway_id, Some(iroh_gateway_id))
+                        .map(std::borrow::ToOwned::to_owned);
+                    (gateway_id, iroh_gateway_id)
                 };
 
                 Ok((gateway_id, iroh_gateway_id))
