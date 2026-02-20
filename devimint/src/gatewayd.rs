@@ -12,7 +12,6 @@ use fedimint_core::config::FederationId;
 use fedimint_core::secp256k1::PublicKey;
 use fedimint_core::util::{backoff_util, retry};
 use fedimint_core::{Amount, BitcoinAmountOrAll, BitcoinHash};
-use fedimint_gateway_common::envs::FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV;
 use fedimint_gateway_common::{
     ChannelInfo, CreateOfferResponse, GatewayBalances, GetInvoiceResponse,
     ListTransactionsResponse, MnemonicResponse, PaymentDetails, PaymentStatus,
@@ -27,8 +26,7 @@ use tracing::info;
 
 use crate::cmd;
 use crate::envs::{
-    FM_GATEWAY_API_ADDR_ENV, FM_GATEWAY_DATA_DIR_ENV, FM_GATEWAY_IROH_LISTEN_ADDR_ENV,
-    FM_GATEWAY_LISTEN_ADDR_ENV, FM_PORT_LDK_ENV,
+    FM_GATEWAY_API_ADDR_ENV, FM_GATEWAY_DATA_DIR_ENV, FM_GATEWAY_LISTEN_ADDR_ENV, FM_PORT_LDK_ENV,
 };
 use crate::external::{Bitcoind, LightningNode};
 use crate::federation::Federation;
@@ -94,14 +92,16 @@ impl Gatewayd {
             ),
             (FM_GATEWAY_API_ADDR_ENV.to_owned(), addr.clone()),
             (FM_PORT_LDK_ENV.to_owned(), lightning_node_port.to_string()),
-            (
-                FM_GATEWAY_IROH_LISTEN_ADDR_ENV.to_owned(),
-                format!("127.0.0.1:{}", iroh_endpoint.port()),
-            ),
-            (
-                FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV.to_owned(),
-                iroh_endpoint.secret_key(),
-            ),
+            // HACK: disabled as Fedi's hacked Iroh fork can't do direct connections,
+            // so can't work in Nix sandbox
+            // (
+            //     FM_GATEWAY_IROH_LISTEN_ADDR_ENV.to_owned(),
+            //     format!("127.0.0.1:{}", iroh_endpoint.port()),
+            // ),
+            // (
+            //     FM_GATEWAY_IROH_SECRET_KEY_OVERRIDE_ENV.to_owned(),
+            //     iroh_endpoint.secret_key(),
+            // ),
         ]);
 
         let gatewayd_version = crate::util::Gatewayd::version_or_default().await;
