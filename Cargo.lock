@@ -661,11 +661,10 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.30.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbfd150b5dbdb988bcc8fb1fe787eb6b7ee6180ca24da683b61ea5405f3d43ff"
+checksum = "4321e568ed89bb5a7d291a7f37997c2c0df89809d7b6d12062c81ddb54aa782e"
 dependencies = [
- "bindgen 0.69.5",
  "cc",
  "cmake",
  "dunce",
@@ -674,10 +673,11 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.38.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4321e568ed89bb5a7d291a7f37997c2c0df89809d7b6d12062c81ddb54aa782e"
+checksum = "83a25cf98105baa966497416dbd42565ce3a8cf8dbfd59803ec9ad46f3126399"
 dependencies = [
+ "bindgen 0.72.1",
  "cc",
  "cmake",
  "dunce",
@@ -1029,15 +1029,12 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "lazycell",
- "log",
- "prettyplease 0.2.35",
  "proc-macro2",
  "quote",
  "regex",
  "rustc-hash 1.1.0",
  "shlex",
  "syn 2.0.104",
- "which",
 ]
 
 [[package]]
@@ -1050,6 +1047,26 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 2.1.1",
+ "shlex",
+ "syn 2.0.104",
+]
+
+[[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags 2.9.1",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease 0.2.35",
  "proc-macro2",
  "quote",
  "regex",
@@ -3201,7 +3218,7 @@ dependencies = [
  "anyhow",
  "arti-client",
  "async-trait",
- "aws-lc-sys 0.30.0",
+ "aws-lc-sys 0.39.1",
  "base64 0.22.1",
  "curve25519-dalek 4.1.3",
  "fedimint-core",
@@ -3238,7 +3255,7 @@ dependencies = [
  "async-lock",
  "async-recursion",
  "async-trait",
- "aws-lc-sys 0.30.0",
+ "aws-lc-sys 0.39.1",
  "backon",
  "backtrace",
  "base64 0.22.1",
@@ -4578,7 +4595,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
- "aws-lc-sys 0.30.0",
+ "aws-lc-sys 0.39.1",
  "axum 0.8.7",
  "bcrypt",
  "bitcoin",
