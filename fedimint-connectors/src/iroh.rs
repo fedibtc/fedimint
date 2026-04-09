@@ -161,7 +161,8 @@ impl IrohConnector {
 
             #[cfg(not(target_family = "wasm"))]
             if iroh_enable_dht {
-                builder = builder.discovery(iroh_next::discovery::pkarr::dht::DhtDiscovery::builder());
+                builder =
+                    builder.discovery(iroh_next::discovery::pkarr::dht::DhtDiscovery::builder());
             }
 
             // instead of `.discovery_n0`, which brings publisher we don't want
@@ -389,7 +390,8 @@ impl IrohConnector {
         node_id: NodeId,
         node_addr: Option<NodeAddr>,
     ) -> ServerResult<iroh_next::endpoint::Connection> {
-        let next_node_id = iroh_next::EndpointId::from_bytes(node_id.as_bytes()).expect("Can't fail");
+        let next_node_id =
+            iroh_next::EndpointId::from_bytes(node_id.as_bytes()).expect("Can't fail");
 
         let endpoint_next = endpoint_next.clone();
 
@@ -422,12 +424,13 @@ impl IrohConnector {
 }
 
 fn node_addr_stable_to_next(stable: &iroh::NodeAddr) -> iroh_next::EndpointAddr {
-    let next_node_id = iroh_next::EndpointId::from_bytes(stable.node_id.as_bytes()).expect("Can't fail");
-    let relay_addrs = stable
-        .relay_url
-        .iter()
-        .cloned()
-        .map(|u| iroh_next::TransportAddr::Relay(iroh_next::RelayUrl::from_str(&u.to_string()).expect("Can't fail")));
+    let next_node_id =
+        iroh_next::EndpointId::from_bytes(stable.node_id.as_bytes()).expect("Can't fail");
+    let relay_addrs = stable.relay_url.iter().cloned().map(|u| {
+        iroh_next::TransportAddr::Relay(
+            iroh_next::RelayUrl::from_str(&u.to_string()).expect("Can't fail"),
+        )
+    });
     let direct_addrs = stable
         .direct_addresses
         .iter()
