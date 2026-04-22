@@ -1799,14 +1799,143 @@ impl LightningClientModule {
         invoice: Bolt11Invoice,
         extra_meta: M,
     ) -> anyhow::Result<(OutgoingLightningPayment, BoxStream<'static, LnPayState>)> {
-        let payment = self
-            .pay_bolt11_invoice_force_external(gateway, invoice, extra_meta)
-            .await?;
-        let PayType::Lightning(operation_id) = payment.payment_type else {
-            unreachable!("force-external payment helper returned a non-lightning pay type");
+        let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
+        let maybe_gateway_id = Some(gateway.gateway_id);
+        let prev_payment_result = self
+            .get_prev_payment_result(invoice.payment_hash(), &mut dbtx.to_ref_nc())
+            .await;
+
+        if let Some(completed_payment) = prev_payment_result.completed_payment {
+            let PayType::Lightning(operation_id) = completed_payment.payment_type else {
+                unreachable!("force-external payment helper returned a non-lightning pay type");
+            };
+            let updates = self.subscribe_ln_pay_replay(operation_id).await?;
+            return Ok((completed_payment, updates));
+        }
+
+        let prev_operation_id = LightningClientModule::get_payment_operation_id(
+            invoice.payment_hash(),
+            prev_payment_result.index,
+        );
+        if self.client_ctx.has_active_states(prev_operation_id).await {
+            bail!(
+                PayBolt11InvoiceError::PreviousPaymentAttemptStillInProgress {
+                    operation_id: prev_operation_id
+                }
+            )
+        }
+
+        let next_index = prev_payment_result.index + 1;
+        let operation_id =
+            LightningClientModule::get_payment_operation_id(invoice.payment_hash(), next_index);
+
+        let new_payment_result = PaymentResult {
+            index: next_index,
+            completed_payment: None,
         };
-        let updates = self.subscribe_ln_pay_replay(operation_id).await?;
-        Ok((payment, updates))
+
+        dbtx.insert_entry(
+            &PaymentResultKey {
+                payment_hash: *invoice.payment_hash(),
+            },
+            &new_payment_result,
+        )
+        .await;
+
+        let (client_output, client_output_sm, contract_id) = self
+            .create_outgoing_output(
+                operation_id,
+                invoice.clone(),
+                gateway,
+                self.client_ctx
+                    .get_config()
+                    .await
+                    .global
+                    .calculate_federation_id(),
+                rand::rngs::OsRng,
+            )
+            .await?;
+
+        if let Ok(Some(contract)) = self.module_api.fetch_contract(contract_id).await
+            && contract.amount.msats != 0
+        {
+            bail!(PayBolt11InvoiceError::FundedContractAlreadyExists { contract_id });
+        }
+
+        let fee = match &client_output.output {
+            LightningOutputV0::Contract(contract) => {
+                let fee_msat = contract
+                    .amount
+                    .msats
+                    .checked_sub(
+                        invoice
+                            .amount_milli_satoshis()
+                            .ok_or(anyhow!("MissingInvoiceAmount"))?,
+                    )
+                    .expect("Contract amount should be greater or equal than invoice amount");
+                Amount::from_msats(fee_msat)
+            }
+            _ => unreachable!("User client will only create contract outputs on spend"),
+        };
+
+        let output = self.client_ctx.make_client_outputs(ClientOutputBundle::new(
+            vec![ClientOutput {
+                output: LightningOutput::V0(client_output.output),
+                amounts: client_output.amounts,
+            }],
+            vec![client_output_sm],
+        ));
+
+        let tx = TransactionBuilder::new().with_outputs(output);
+        let extra_meta =
+            serde_json::to_value(extra_meta).context("Failed to serialize extra meta")?;
+        let operation_meta_gen = move |change_range: OutPointRange| LightningOperationMeta {
+            variant: LightningOperationMetaVariant::Pay(LightningOperationMetaPay {
+                out_point: OutPoint {
+                    txid: change_range.txid(),
+                    out_idx: 0,
+                },
+                invoice: invoice.clone(),
+                fee,
+                change: change_range.into_iter().collect(),
+                is_internal_payment: false,
+                contract_id,
+                gateway_id: maybe_gateway_id,
+            }),
+            extra_meta: extra_meta.clone(),
+        };
+
+        dbtx.commit_tx_result().await?;
+
+        // Attach the notifier subscription before transaction submission so no
+        // lightning-pay state transition can land in a post-submit gap.
+        let raw_updates = self.notifier.subscribe(operation_id).await;
+
+        self.client_ctx
+            .finalize_and_submit_transaction(
+                operation_id,
+                LightningCommonInit::KIND.as_str(),
+                operation_meta_gen,
+                tx,
+            )
+            .await?;
+
+        let pay_details = self.get_ln_pay_details_for(operation_id).await?;
+        let updates = ln_pay_replay_stream(
+            self.client_ctx.clone(),
+            operation_id,
+            pay_details.change,
+            raw_updates,
+        );
+
+        Ok((
+            OutgoingLightningPayment {
+                payment_type: PayType::Lightning(operation_id),
+                contract_id,
+                fee,
+            },
+            updates,
+        ))
     }
 
     /// Scan unspent incoming contracts for a payment hash that matches a
