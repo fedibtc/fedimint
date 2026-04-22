@@ -1750,6 +1750,65 @@ impl LightningClientModule {
         }))
     }
 
+    /// Subscribes to a replayable stream of updates for an external Lightning
+    /// payment operation specified by the `operation_id`.
+    ///
+    /// Unlike [`Self::subscribe_ln_pay`], this method always rebuilds the state
+    /// stream from the operation state machine history instead of shortcutting
+    /// to a cached final outcome. This is useful for callers that must still
+    /// observe intermediate states such as [`LnPayState::Funded`] even when the
+    /// operation has already completed before subscription time.
+    pub async fn subscribe_ln_pay_replay(
+        &self,
+        operation_id: OperationId,
+    ) -> anyhow::Result<BoxStream<'static, LnPayState>> {
+        let operation = self.client_ctx.get_operation(operation_id).await?;
+        let LightningOperationMetaVariant::Pay(LightningOperationMetaPay {
+            out_point: _,
+            invoice: _,
+            change,
+            is_internal_payment,
+            ..
+        }) = operation.meta::<LightningOperationMeta>().variant
+        else {
+            bail!("Operation is not a lightning payment")
+        };
+
+        ensure!(
+            !is_internal_payment,
+            "Subscribing to an internal LN payment, expected external LN payment"
+        );
+
+        let stream = self.notifier.subscribe(operation_id).await;
+        Ok(ln_pay_replay_stream(
+            self.client_ctx.clone(),
+            operation_id,
+            change,
+            stream,
+        ))
+    }
+
+    /// Pays a LN invoice using the supplied gateway while forcing the external
+    /// Lightning path and returns an eagerly attached replay subscription for
+    /// the resulting pay operation.
+    pub async fn pay_bolt11_invoice_force_external_with_subscription<
+        M: Serialize + MaybeSend + MaybeSync,
+    >(
+        &self,
+        gateway: LightningGateway,
+        invoice: Bolt11Invoice,
+        extra_meta: M,
+    ) -> anyhow::Result<(OutgoingLightningPayment, BoxStream<'static, LnPayState>)> {
+        let payment = self
+            .pay_bolt11_invoice_force_external(gateway, invoice, extra_meta)
+            .await?;
+        let PayType::Lightning(operation_id) = payment.payment_type else {
+            unreachable!("force-external payment helper returned a non-lightning pay type");
+        };
+        let updates = self.subscribe_ln_pay_replay(operation_id).await?;
+        Ok((payment, updates))
+    }
+
     /// Scan unspent incoming contracts for a payment hash that matches a
     /// tweaked keys in the `indices` vector
     #[deprecated(since = "0.7.0", note = "Use recurring payment functionality instead")]
@@ -2205,6 +2264,107 @@ impl LightningClientModule {
             "Internal or external outgoing lightning payment did not reach a final state"
         ))
     }
+}
+
+fn ln_pay_replay_stream(
+    client_ctx: ClientContext<LightningClientModule>,
+    operation_id: OperationId,
+    change: Vec<OutPoint>,
+    mut stream: BoxStream<'static, LightningClientStateMachines>,
+) -> BoxStream<'static, LnPayState> {
+    async fn get_next_pay_state(
+        stream: &mut BoxStream<'_, LightningClientStateMachines>,
+    ) -> Option<LightningPayStates> {
+        match stream.next().await {
+            Some(LightningClientStateMachines::LightningPay(state)) => Some(state.state),
+            Some(event) => {
+                // nosemgrep: use-err-formatting
+                error!(event = ?event, "Operation is not a lightning payment");
+                debug_assert!(false, "Operation is not a lightning payment: {event:?}");
+                None
+            }
+            None => None,
+        }
+    }
+
+    Box::pin(stream! {
+        let state = get_next_pay_state(&mut stream).await;
+        match state {
+            Some(LightningPayStates::CreatedOutgoingLnContract(_)) => {
+                yield LnPayState::Created;
+            }
+            Some(LightningPayStates::FundingRejected) => {
+                yield LnPayState::Canceled;
+                return;
+            }
+            Some(state) => {
+                yield LnPayState::UnexpectedError { error_message: format!("Found unexpected state during lightning payment: {state:?}") };
+                return;
+            }
+            None => {
+                error!("Unexpected end of lightning pay state machine");
+                return;
+            }
+        }
+
+        let state = get_next_pay_state(&mut stream).await;
+        match state {
+            Some(LightningPayStates::Funded(funded)) => {
+                yield LnPayState::Funded { block_height: funded.timelock }
+            }
+            Some(state) => {
+                yield LnPayState::UnexpectedError { error_message: format!("Found unexpected state during lightning payment: {state:?}") };
+                return;
+            }
+            _ => {
+                error!("Unexpected end of lightning pay state machine");
+                return;
+            }
+        }
+
+        let state = get_next_pay_state(&mut stream).await;
+        match state {
+            Some(LightningPayStates::Success(preimage)) => {
+                if change.is_empty() {
+                    yield LnPayState::Success { preimage };
+                } else {
+                    yield LnPayState::AwaitingChange;
+                    match client_ctx.await_primary_module_outputs(operation_id, change.clone()).await {
+                        Ok(()) => {
+                            yield LnPayState::Success { preimage };
+                        }
+                        Err(e) => {
+                            yield LnPayState::UnexpectedError { error_message: format!("Error occurred while waiting for the change: {e:?}") };
+                        }
+                    }
+                }
+            }
+            Some(LightningPayStates::Refund(refund)) => {
+                yield LnPayState::WaitingForRefund {
+                    error_reason: refund.error_reason.clone(),
+                };
+
+                match client_ctx.await_primary_module_outputs(operation_id, refund.out_points).await {
+                    Ok(()) => {
+                        let gateway_error = GatewayPayError::GatewayInternalError { error_code: Some(500), error_message: refund.error_reason };
+                        yield LnPayState::Refunded { gateway_error };
+                    }
+                    Err(e) => {
+                        yield LnPayState::UnexpectedError {
+                            error_message: format!("Error occurred trying to get refund. Refund was not successful: {e:?}"),
+                        };
+                    }
+                }
+            }
+            Some(state) => {
+                yield LnPayState::UnexpectedError { error_message: format!("Found unexpected state during lightning payment: {state:?}") };
+            }
+            None => {
+                error!("Unexpected end of lightning pay state machine");
+                yield LnPayState::UnexpectedError { error_message: "Unexpected end of lightning pay state machine".to_string() };
+            }
+        }
+    })
 }
 
 // TODO: move to appropriate module (cli?)

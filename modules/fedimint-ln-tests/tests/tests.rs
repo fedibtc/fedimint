@@ -356,6 +356,54 @@ async fn cannot_pay_same_external_invoice_twice() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn replay_subscription_preserves_funded_after_operation_completion() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_degraded().await;
+    let gw = gateway(&fixtures, &fed).await;
+    let client = fed.new_client().await;
+    let dummy_module = client.get_first_module::<DummyClientModule>()?;
+
+    let (op, outpoint) = dummy_module.print_money(sats(1000)).await?;
+    client
+        .await_primary_bitcoin_module_output(op, outpoint)
+        .await?;
+
+    let other_ln = FakeLightningTest::new();
+    let invoice = other_ln.invoice(Amount::from_sats(100), None)?;
+
+    let OutgoingLightningPayment {
+        payment_type,
+        contract_id: _,
+        fee: _,
+    } = pay_invoice(&client, invoice, Some(gw.http_gateway_id().await)).await?;
+
+    let PayType::Lightning(operation_id) = payment_type else {
+        panic!("Expected lightning payment!");
+    };
+
+    let outcome = client
+        .get_first_module::<LightningClientModule>()?
+        .subscribe_ln_pay(operation_id)
+        .await?
+        .await_outcome()
+        .await;
+    assert_matches!(outcome, Some(LnPayState::Success { .. }));
+
+    let mut replay = client
+        .get_first_module::<LightningClientModule>()?
+        .subscribe_ln_pay_replay(operation_id)
+        .await?;
+
+    assert_eq!(replay.ok().await?, LnPayState::Created);
+    assert_matches!(replay.ok().await?, LnPayState::Funded { .. });
+    assert_matches!(replay.ok().await?, LnPayState::Success { .. });
+
+    drop(gw);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn makes_internal_payments_within_federation() -> anyhow::Result<()> {
     let fixtures = fixtures();
     let fed = fixtures.new_fed_degraded().await;
