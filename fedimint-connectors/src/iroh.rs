@@ -105,10 +105,7 @@ impl fmt::Debug for IrohConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IrohEndpoint")
             .field("stable-id", &self.stable.node_id())
-            .field(
-                "next-id",
-                &self.next.as_ref().map(iroh_next::Endpoint::node_id),
-            )
+            .field("next-id", &self.next.as_ref().map(iroh_next::Endpoint::id))
             .finish_non_exhaustive()
     }
 }
@@ -200,8 +197,8 @@ impl IrohConnector {
             let mut builder = iroh_next::Endpoint::builder();
 
             if let Some(iroh_dns) = iroh_dns.map(SafeUrl::to_unsafe) {
-                builder = builder.add_discovery(
-                    iroh_next::discovery::pkarr::PkarrResolver::builder(iroh_dns).build(),
+                builder = builder.address_lookup(
+                    iroh_next::address_lookup::PkarrResolver::builder(iroh_dns).build(),
                 );
             }
 
@@ -210,7 +207,8 @@ impl IrohConnector {
 
             #[cfg(not(target_family = "wasm"))]
             if iroh_enable_dht {
-                builder = builder.discovery_dht();
+                builder =
+                    builder.address_lookup(iroh_next::address_lookup::DhtAddressLookup::builder());
             }
 
             // instead of `.discovery_n0`, which brings publisher we don't want
@@ -219,21 +217,21 @@ impl IrohConnector {
                 #[cfg(target_family = "wasm")]
                 {
                     builder =
-                        builder.add_discovery(iroh_next::discovery::pkarr::PkarrResolver::n0_dns());
+                        builder.address_lookup(iroh_next::address_lookup::PkarrResolver::n0_dns());
                 }
                 // Resolve using DNS queries outside browsers.
                 #[cfg(not(target_family = "wasm"))]
                 {
-                    builder =
-                        builder.add_discovery(iroh_next::discovery::dns::DnsDiscovery::n0_dns());
+                    builder = builder
+                        .address_lookup(iroh_next::address_lookup::DnsAddressLookup::n0_dns());
                 }
             }
 
             let endpoint = builder.bind().await?;
             debug!(
                 target: LOG_NET_IROH,
-                node_id = %endpoint.node_id(),
-                node_id_pkarr = %z32::encode(endpoint.node_id().as_bytes()),
+                node_id = %endpoint.id(),
+                node_id_pkarr = %z32::encode(endpoint.id().as_bytes()),
                 "Iroh api client endpoint (next)"
             );
             Ok(endpoint)
@@ -392,21 +390,18 @@ impl IrohConnector {
 
     #[cfg(not(target_family = "wasm"))]
     fn spawn_connection_monitoring_next(
-        endpoint: &iroh_next::Endpoint,
-        node_addr: &iroh_next::NodeAddr,
+        conn: &iroh_next::endpoint::Connection,
+        node_id: iroh_next::EndpointId,
     ) {
-        if let Some(mut conn_type_watcher) = endpoint.conn_type(node_addr.node_id) {
-            let node_id = node_addr.node_id;
-            #[allow(clippy::let_underscore_future)]
-            let _ = spawn("iroh connection (next)", async move {
-                if let Ok(conn_type) = conn_type_watcher.get() {
-                    debug!(target: LOG_NET_IROH, %node_id, type = %conn_type, "Connection type (initial)");
-                }
-                while let Ok(event) = conn_type_watcher.updated().await {
-                    debug!(target: LOG_NET_IROH, node_id = %node_id, %event, "Connection type changed");
-                }
-            });
-        }
+        let mut paths_watcher = conn.paths();
+        #[allow(clippy::let_underscore_future)]
+        let _ = spawn("iroh connection (next)", async move {
+            let paths = paths_watcher.get();
+            debug!(target: LOG_NET_IROH, %node_id, ?paths, "Connection paths (initial)");
+            while let Ok(paths) = paths_watcher.updated().await {
+                debug!(target: LOG_NET_IROH, %node_id, ?paths, "Connection paths changed");
+            }
+        });
     }
 
     async fn make_new_connection_stable(
@@ -440,7 +435,8 @@ impl IrohConnector {
         node_id: NodeId,
         node_addr: Option<NodeAddr>,
     ) -> ServerResult<iroh_next::endpoint::Connection> {
-        let next_node_id = iroh_next::NodeId::from_bytes(node_id.as_bytes()).expect("Can't fail");
+        let next_node_id =
+            iroh_next::EndpointId::from_bytes(node_id.as_bytes()).expect("Can't fail");
 
         let endpoint_next = endpoint_next.clone();
 
@@ -454,8 +450,8 @@ impl IrohConnector {
                     .await;
 
                 #[cfg(not(target_family = "wasm"))]
-                if conn.is_ok() {
-                    Self::spawn_connection_monitoring_next(&endpoint_next, &node_addr);
+                if let Ok(conn) = &conn {
+                    Self::spawn_connection_monitoring_next(conn, node_addr.id);
                 }
 
                 conn
@@ -472,15 +468,21 @@ impl IrohConnector {
     }
 }
 
-fn node_addr_stable_to_next(stable: &iroh::NodeAddr) -> iroh_next::NodeAddr {
-    iroh_next::NodeAddr {
-        node_id: iroh_next::NodeId::from_bytes(stable.node_id.as_bytes()).expect("Can't fail"),
-        relay_url: stable
-            .relay_url
-            .as_ref()
-            .map(|u| iroh_next::RelayUrl::from_str(&u.to_string()).expect("Can't fail")),
-        direct_addresses: stable.direct_addresses.clone(),
-    }
+fn node_addr_stable_to_next(stable: &iroh::NodeAddr) -> iroh_next::EndpointAddr {
+    let next_node_id =
+        iroh_next::EndpointId::from_bytes(stable.node_id.as_bytes()).expect("Can't fail");
+    let relay_addrs = stable.relay_url.iter().cloned().map(|u| {
+        iroh_next::TransportAddr::Relay(
+            iroh_next::RelayUrl::from_str(&u.to_string()).expect("Can't fail"),
+        )
+    });
+    let direct_addrs = stable
+        .direct_addresses
+        .iter()
+        .copied()
+        .map(iroh_next::TransportAddr::Ip);
+
+    iroh_next::EndpointAddr::from_parts(next_node_id, relay_addrs.chain(direct_addrs))
 }
 
 #[apply(async_trait_maybe_send!)]
