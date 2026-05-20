@@ -1949,6 +1949,7 @@ impl Gateway {
                 lnd_rpc_addr,
                 lnd_tls_cert,
                 lnd_macaroon,
+                lnd_time_pref,
             } => {
                 // The LND backend uses this to ignore HOLD invoices on the
                 // shared LND node that aren't federation-bound. Returns true
@@ -1971,6 +1972,7 @@ impl Gateway {
                     lnd_rpc_addr,
                     lnd_tls_cert,
                     lnd_macaroon,
+                    lnd_time_pref,
                     None,
                     lnv2_filter,
                 ))
