@@ -21,6 +21,7 @@ mod error;
 mod events;
 mod federation_manager;
 mod iroh_server;
+mod metrics;
 pub mod rpc_server;
 mod types;
 
@@ -97,8 +98,8 @@ use fedimint_gwv2_client::{
 use fedimint_lightning::lnd::GatewayLndClient;
 use fedimint_lightning::{
     CreateInvoiceRequest, ILnRpcClient, InterceptPaymentRequest, InterceptPaymentResponse,
-    InvoiceDescription, LightningContext, LightningRpcError, PayInvoiceResponse, PaymentAction,
-    RouteHtlcStream, ldk,
+    InvoiceDescription, LightningContext, LightningRpcError, LnRpcTracked, PayInvoiceResponse,
+    PaymentAction, RouteHtlcStream, ldk,
 };
 use fedimint_ln_client::pay::PaymentData;
 use fedimint_ln_common::LightningCommonInit;
@@ -241,6 +242,9 @@ pub struct Gateway {
     /// The socket the gateway listens on.
     listen: SocketAddr,
 
+    /// The socket the gateway's metrics server listens on.
+    metrics_listen: SocketAddr,
+
     /// The task group for all tasks related to the gateway.
     task_group: TaskGroup,
 
@@ -360,6 +364,11 @@ impl Gateway {
         let versioned_api = api_addr
             .join(V1_API_ENDPOINT)
             .expect("Failed to version gateway API address");
+        // Default metrics listen to localhost on UI port + 1
+        let metrics_listen = SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            listen.port() + 1,
+        );
         Gateway::new(
             lightning_mode,
             GatewayParameters {
@@ -374,6 +383,7 @@ impl Gateway {
                 iroh_dns: None,
                 iroh_relays: vec![],
                 skip_setup: true,
+                metrics_listen,
             },
             gateway_db,
             client_builder,
@@ -574,6 +584,7 @@ impl Gateway {
             client_builder,
             gateway_db: gateway_db.clone(),
             listen: gateway_parameters.listen,
+            metrics_listen: gateway_parameters.metrics_listen,
             task_group,
             bcrypt_password_hash: Arc::new(gateway_parameters.bcrypt_password_hash),
             num_route_hints,
@@ -641,6 +652,8 @@ impl Gateway {
         self.load_clients().await?;
         self.start_gateway(runtime, mnemonic_receiver.resubscribe());
         self.spawn_backup_task();
+        // start metrics server
+        fedimint_metrics::spawn_api_server(self.metrics_listen, self.task_group.clone()).await?;
         // start webserver last to avoid handling requests before fully initialized
         let handle = self.task_group.make_handle();
         run_webserver(Arc::new(self), mnemonic_receiver.resubscribe()).await?;
@@ -717,8 +730,20 @@ impl Gateway {
                     }
 
                     if let GatewayState::NotConfigured{ .. } = self_copy.get_state().await {
-                        info!(target: LOG_GATEWAY, "Waiting for the mnemonic to be set before starting lightning receive loop.");
+                        info!(
+                            target: LOG_GATEWAY,
+                            "Waiting for the mnemonic to be set before starting lightning receive loop."
+                        );
+                        info!(
+                            target: LOG_GATEWAY,
+                            "You might need to provide it from the UI or refer to documentation w.r.t how to initialize it."
+                        );
+
                         let _ = mnemonic_receiver.recv().await;
+                        info!(
+                            target: LOG_GATEWAY,
+                            "Received mnemonic, attempting to start lightning receive loop"
+                        );
                     }
 
                     let payment_stream_task_group = tg.make_subgroup();
@@ -800,7 +825,7 @@ impl Gateway {
         }
 
         let lightning_context = LightningContext {
-            lnrpc: ln_client,
+            lnrpc: LnRpcTracked::new(ln_client, "gateway"),
             lightning_public_key,
             lightning_alias,
             lightning_network,
@@ -821,6 +846,7 @@ impl Gateway {
 
         // Runs until the connection to the lightning node breaks or we receive the
         // shutdown signal.
+        let htlc_task_group = self.task_group.make_subgroup();
         if handle
             .cancel_on_shutdown(async move {
                 loop {
@@ -843,7 +869,26 @@ impl Gateway {
 
                     let state_guard = self.state.read().await;
                     if let GatewayState::Running { ref lightning_context } = *state_guard {
-                        self.handle_lightning_payment(payment_request, lightning_context).await;
+                        // Spawn a subtask to handle each payment in parallel
+                        let gateway = self.clone();
+                        let lightning_context = lightning_context.clone();
+                        htlc_task_group.spawn_cancellable_silent(
+                            "handle_lightning_payment",
+                            async move {
+                                let start = fedimint_core::time::now();
+                                let outcome = gateway
+                                    .handle_lightning_payment(payment_request, &lightning_context)
+                                    .await;
+                                metrics::HTLC_HANDLING_DURATION_SECONDS
+                                    .with_label_values(&[outcome])
+                                    .observe(
+                                        fedimint_core::time::now()
+                                            .duration_since(start)
+                                            .unwrap_or_default()
+                                            .as_secs_f64(),
+                                    );
+                            },
+                        );
                     } else {
                         warn!(
                             target: LOG_GATEWAY,
@@ -884,31 +929,59 @@ impl Gateway {
     /// back) the HTLC so the sender can retry rather than treating the
     /// gateway as a dead route. Otherwise (real-channel forwards), resumes
     /// the HTLC so LND can route it as a normal forward.
+    ///
+    /// Returns the outcome label for metrics tracking.
     async fn handle_lightning_payment(
         &self,
         payment_request: InterceptPaymentRequest,
         lightning_context: &LightningContext,
-    ) {
+    ) -> &'static str {
         info!(
             target: LOG_GATEWAY,
             lightning_payment = %PrettyInterceptPaymentRequest(&payment_request),
             "Intercepting lightning payment",
         );
 
-        if self
+        let lnv2_start = fedimint_core::time::now();
+        let lnv2_result = self
             .try_handle_lightning_payment_lnv2(&payment_request, lightning_context)
-            .await
-            .is_ok()
-        {
-            return;
+            .await;
+        let lnv2_outcome = if lnv2_result.is_ok() {
+            "success"
+        } else {
+            "error"
+        };
+        metrics::HTLC_LNV2_ATTEMPT_DURATION_SECONDS
+            .with_label_values(&[lnv2_outcome])
+            .observe(
+                fedimint_core::time::now()
+                    .duration_since(lnv2_start)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+            );
+        if lnv2_result.is_ok() {
+            return "lnv2";
         }
 
-        if self
+        let lnv1_start = fedimint_core::time::now();
+        let lnv1_result = self
             .try_handle_lightning_payment_ln_legacy(&payment_request)
-            .await
-            .is_ok()
-        {
-            return;
+            .await;
+        let lnv1_outcome = if lnv1_result.is_ok() {
+            "success"
+        } else {
+            "error"
+        };
+        metrics::HTLC_LNV1_ATTEMPT_DURATION_SECONDS
+            .with_label_values(&[lnv1_outcome])
+            .observe(
+                fedimint_core::time::now()
+                    .duration_since(lnv1_start)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+            );
+        if lnv1_result.is_ok() {
+            return "lnv1";
         }
 
         // Neither LNv1 nor LNv2 matched. If the last-hop scid is one of our
@@ -927,8 +1000,10 @@ impl Gateway {
 
         if is_federation_scid {
             Self::cancel_unmatched_lightning_payment(payment_request, lightning_context).await;
+            "cancel"
         } else {
             Self::forward_lightning_payment(payment_request, lightning_context).await;
+            "forward"
         }
     }
 
