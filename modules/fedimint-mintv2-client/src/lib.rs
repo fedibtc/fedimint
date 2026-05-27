@@ -947,23 +947,54 @@ impl MintClientModule {
     }
 
     /// Await the final state of the receive operation.
+    ///
+    /// The terminal state is persisted to the operation log via
+    /// `outcome_or_updates`, so callers reading the operation log entry's
+    /// `outcome` after this future resolves will see the cached value.
     pub async fn await_final_receive_operation_state(
         &self,
         operation_id: OperationId,
-    ) -> FinalReceiveOperationState {
-        let mut stream = self.notifier.subscribe(operation_id).await;
+    ) -> anyhow::Result<FinalReceiveOperationState> {
+        let operation = self.client_ctx.get_operation(operation_id).await?;
+        let mut notifier_stream = self.notifier.subscribe(operation_id).await;
 
-        loop {
-            let Some(MintClientStateMachines::Receive(state)) = stream.next().await else {
-                continue;
-            };
+        let mut stream = self
+            .client_ctx
+            .outcome_or_updates(operation, operation_id, move || {
+                async_stream::stream! {
+                    loop {
+                        let Some(MintClientStateMachines::Receive(state)) =
+                            notifier_stream.next().await
+                        else {
+                            continue;
+                        };
 
-            match state.state {
-                ReceiveSMState::Pending => {}
-                ReceiveSMState::Success => return FinalReceiveOperationState::Success,
-                ReceiveSMState::Rejected(..) => return FinalReceiveOperationState::Rejected,
-            }
+                        match state.state {
+                            ReceiveSMState::Pending => {}
+                            ReceiveSMState::Success => {
+                                yield FinalReceiveOperationState::Success;
+                                return;
+                            }
+                            ReceiveSMState::Rejected(..) => {
+                                yield FinalReceiveOperationState::Rejected;
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .into_stream();
+
+        // Drain the stream so that caching_operation_update_stream's
+        // post-loop `optimistically_set_operation_outcome` runs and the
+        // terminal state is written to the operation log. Taking just the
+        // first item would short-circuit the cache write.
+        let mut final_state = None;
+        while let Some(state) = stream.next().await {
+            final_state = Some(state);
         }
+
+        final_state.ok_or_else(|| anyhow!("Receive operation stream ended without a final state"))
     }
 
     async fn remove_spendable_note(
