@@ -774,10 +774,15 @@ impl MintClientModule {
     /// before the reissue is complete in which case the reissued notes are
     /// returned to the regular balance. To cancel a successful ecash send
     /// simply receive it yourself.
+    ///
+    /// If `include_invite` is set, the federation's invite code is embedded in
+    /// the returned ecash so a recipient that has not joined the federation can
+    /// do so directly from the received ecash.
     pub async fn send(
         &self,
         amount: Amount,
         custom_meta: Value,
+        include_invite: bool,
     ) -> Result<(OperationId, ECash), SendECashError> {
         let amount = round_to_multiple(amount, client_denominations().next().unwrap().amount());
 
@@ -785,7 +790,14 @@ impl MintClientModule {
             .client_ctx
             .module_db()
             .autocommit(
-                |dbtx, _| Box::pin(self.send_ecash_dbtx(dbtx, amount, custom_meta.clone())),
+                |dbtx, _| {
+                    Box::pin(self.send_ecash_dbtx(
+                        dbtx,
+                        amount,
+                        custom_meta.clone(),
+                        include_invite,
+                    ))
+                },
                 Some(100),
             )
             .await
@@ -829,7 +841,7 @@ impl MintClientModule {
                 .map_err(|_| SendECashError::Failure)?;
         }
 
-        Box::pin(self.send(amount, custom_meta)).await
+        Box::pin(self.send(amount, custom_meta, include_invite)).await
     }
 
     async fn send_ecash_dbtx(
@@ -837,6 +849,7 @@ impl MintClientModule {
         dbtx: &mut DatabaseTransaction<'_>,
         mut remaining_amount: Amount,
         custom_meta: Value,
+        include_invite: bool,
     ) -> Result<Option<(OperationId, ECash)>, Infallible> {
         let mut stream = dbtx
             .find_by_prefix_sorted_descending(&SpendableNotePrefix)
@@ -864,8 +877,12 @@ impl MintClientModule {
             self.remove_spendable_note(dbtx, spendable_note).await;
         }
 
-        let invite = self.client_ctx.get_invite_code().await;
-        let ecash = ECash::new_with_invite(notes, &invite);
+        let ecash = if include_invite {
+            let invite = self.client_ctx.get_invite_code().await;
+            ECash::new_with_invite(notes, &invite)
+        } else {
+            ECash::new(self.federation_id, notes)
+        };
         let amount = ecash.amount();
         let operation_id = OperationId::new_random();
 
