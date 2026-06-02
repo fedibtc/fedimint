@@ -13,7 +13,13 @@ enum Opts {
     /// Count the `ECash` notes in the client's database by denomination.
     Count,
     /// Send `ECash` for the given amount.
-    Send { amount: Amount },
+    Send {
+        amount: Amount,
+        /// Embed the federation's invite code in the serialized ecash so a
+        /// recipient that hasn't joined the federation can do so from it.
+        #[clap(long)]
+        include_invite: bool,
+    },
     /// Receive the `ECash` by reissuing the notes and return the amount.
     Receive { ecash: String },
 }
@@ -26,8 +32,11 @@ pub(crate) async fn handle_cli_command(
 
     match opts {
         Opts::Count => Ok(json(mint.get_count_by_denomination().await)),
-        Opts::Send { amount } => {
-            let (_, ecash) = mint.send(amount, Value::Null).await?;
+        Opts::Send {
+            amount,
+            include_invite,
+        } => {
+            let (_, ecash) = mint.send(amount, Value::Null, include_invite).await?;
             let ecash = base32::encode_prefixed(FEDIMINT_PREFIX, &ecash);
 
             Ok(json(ecash))
