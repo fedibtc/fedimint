@@ -33,7 +33,7 @@ use fedimint_api_client::api::DynModuleApi;
 use fedimint_client::module::ClientModule;
 use fedimint_client::transaction::{
     ClientInput, ClientInputBundle, ClientInputSM, ClientOutput, ClientOutputBundle,
-    ClientOutputSM, TransactionBuilder,
+    ClientOutputSM, FeeQuote, TransactionBuilder,
 };
 use fedimint_client_module::db::ClientModuleMigrationFn;
 use fedimint_client_module::module::init::{
@@ -1062,6 +1062,31 @@ impl MintClientModule {
         dbtx.commit_tx().await;
 
         Ok(operation_id)
+    }
+
+    /// Computes the exact fee a `receive(ecash)` would incur given the client's
+    /// current note inventory, without submitting anything.
+    ///
+    /// This runs the same change generation the real receive does
+    /// (`create_final_inputs_and_outputs`, including funding selection and
+    /// rebalancing) against a non-committable transaction that is dropped
+    /// rather than committed, so the client's notes are read but left
+    /// untouched. The quote is point-in-time: it depends on the current
+    /// inventory and can move as notes change.
+    pub async fn receive_fee_quote(&self, ecash: &ECash) -> anyhow::Result<FeeQuote> {
+        // Build the same partial transaction `receive` would submit — the ecash
+        // notes as explicit inputs — and let the shared, module-agnostic fee
+        // quote run the primary-module balancing (rebalancing + minting change)
+        // as a dry-run over the real inventory.
+        let operation_id = OperationId::new_random();
+        let input =
+            Self::create_input_bundle(operation_id, ecash.notes(), true, self.cfg.amount_unit);
+        let input = self.client_ctx.make_client_inputs(input);
+        let tx_builder = TransactionBuilder::new().with_inputs(input);
+
+        self.client_ctx
+            .fee_quote(operation_id, self.cfg.amount_unit, &tx_builder)
+            .await
     }
 
     /// Await the final state of the receive operation.
