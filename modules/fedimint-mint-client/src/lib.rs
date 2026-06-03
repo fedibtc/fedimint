@@ -61,7 +61,7 @@ use fedimint_client_module::oplog::{OperationLogEntry, UpdateStreamOrOutcome};
 use fedimint_client_module::sm::{Context, DynState, ModuleNotifier, State, StateTransition};
 use fedimint_client_module::transaction::{
     ClientInput, ClientInputBundle, ClientInputSM, ClientOutput, ClientOutputBundle,
-    ClientOutputSM, TransactionBuilder,
+    ClientOutputSM, FeeQuote, TransactionBuilder,
 };
 use fedimint_client_module::{DynGlobalClientContext, sm_enum_variant_translation};
 use fedimint_core::base32::{FEDIMINT_PREFIX, encode_prefixed};
@@ -1775,6 +1775,32 @@ impl MintClientModule {
     ) -> (NoteIssuanceRequest, BlindNonce) {
         let secret = self.new_note_secret(amount, dbtx).await;
         NoteIssuanceRequest::new(&self.secp, &secret)
+    }
+
+    /// Computes the exact fee `reissue_external_notes(oob_notes)` would incur
+    /// given the wallet's current note inventory, without submitting anything.
+    ///
+    /// Runs the same change generation the real reissue does
+    /// (`create_final_inputs_and_outputs`, including note consolidation)
+    /// against a non-committable transaction that is dropped rather than
+    /// committed, so the wallet's notes are read but left untouched. The
+    /// quote is point-in-time: it depends on the current inventory and can
+    /// move as notes change.
+    pub async fn reissue_fee_quote(&self, oob_notes: &OOBNotes) -> anyhow::Result<FeeQuote> {
+        // Build the same partial transaction `reissue_external_notes` would
+        // submit — the external notes as explicit inputs — and let the shared,
+        // module-agnostic fee quote run the primary-module balancing (note
+        // consolidation + minting change) as a dry-run over the real inventory.
+        let operation_id = OperationId::new_random();
+        let mint_inputs = self.create_input_from_notes(oob_notes.notes().clone())?;
+        let tx_builder = TransactionBuilder::new().with_inputs(
+            self.client_ctx
+                .make_dyn(create_bundle_for_inputs(mint_inputs, operation_id)),
+        );
+
+        self.client_ctx
+            .fee_quote(operation_id, AmountUnit::BITCOIN, &tx_builder)
+            .await
     }
 
     /// Try to reissue e-cash notes received from a third party to receive them
