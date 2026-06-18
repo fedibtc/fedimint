@@ -127,14 +127,15 @@ async fn send_and_receive() -> anyhow::Result<()> {
     for i in 0..10 {
         tracing::info!("Sending ecash payment {i} of 10");
 
-        let ecash = client_send
+        let (send_operation_id, ecash) = client_send
             .get_first_module::<MintClientModule>()?
             .send(Amount::from_sats(1_000), Value::Null)
             .await?;
 
-        let Some(MintEvent::Send(_)) = send_events.next().await else {
+        let Some(MintEvent::Send(send)) = send_events.next().await else {
             panic!("Expected Send event");
         };
+        assert_eq!(send.operation_id, send_operation_id);
 
         let ecash = base32::encode_prefixed(FEDIMINT_PREFIX, &ecash);
 
@@ -222,14 +223,15 @@ async fn double_spend_is_rejected() -> anyhow::Result<()> {
     let mut send_events = pin!(mint_event_stream(&client_send));
     let mut receive_events = pin!(mint_event_stream(&client_receive));
 
-    let ecash = client_send
+    let (send_operation_id, ecash) = client_send
         .get_first_module::<MintClientModule>()?
         .send(Amount::from_sats(1_000), Value::Null)
         .await?;
 
-    let Some(MintEvent::Send(_)) = send_events.next().await else {
+    let Some(MintEvent::Send(send)) = send_events.next().await else {
         panic!("Expected Send event");
     };
+    assert_eq!(send.operation_id, send_operation_id);
 
     let operation_id = client_send
         .get_first_module::<MintClientModule>()?
@@ -291,14 +293,15 @@ async fn transaction_with_invalid_signature_is_rejected() -> anyhow::Result<()> 
 
     let mut events = pin!(mint_event_stream(&client));
 
-    let ecash = client
+    let (operation_id, ecash) = client
         .get_first_module::<MintClientModule>()?
         .send(Amount::from_sats(1_000), Value::Null)
         .await?;
 
-    let Some(MintEvent::Send(_)) = events.next().await else {
+    let Some(MintEvent::Send(send)) = events.next().await else {
         panic!("Expected Send event");
     };
+    assert_eq!(send.operation_id, operation_id);
 
     let mut invalid_notes = ecash.notes();
 

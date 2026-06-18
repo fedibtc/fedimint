@@ -757,7 +757,7 @@ impl MintClientModule {
             .await
     }
 
-    /// Send `ECash` for the given amount. The
+    /// Send `ECash` for the given amount and return the send operation ID. The
     /// amount will be rounded up to a multiple of 512 msats which is the
     /// smallest denomination used throughout the client. If the rounded
     /// amount cannot be covered with the ecash notes in the client's
@@ -766,10 +766,14 @@ impl MintClientModule {
     /// before the reissue is complete in which case the reissued notes are
     /// returned to the regular balance. To cancel a successful ecash send
     /// simply receive it yourself.
-    pub async fn send(&self, amount: Amount, custom_meta: Value) -> Result<ECash, SendECashError> {
+    pub async fn send(
+        &self,
+        amount: Amount,
+        custom_meta: Value,
+    ) -> Result<(OperationId, ECash), SendECashError> {
         let amount = round_to_multiple(amount, client_denominations().next().unwrap().amount());
 
-        if let Some(ecash) = self
+        if let Some((operation_id, ecash)) = self
             .client_ctx
             .module_db()
             .autocommit(
@@ -779,7 +783,7 @@ impl MintClientModule {
             .await
             .expect("Failed to commit dbtx after 100 retries")
         {
-            return Ok(ecash);
+            return Ok((operation_id, ecash));
         }
 
         self.client_ctx
@@ -825,7 +829,7 @@ impl MintClientModule {
         dbtx: &mut DatabaseTransaction<'_>,
         mut remaining_amount: Amount,
         custom_meta: Value,
-    ) -> Result<Option<ECash>, Infallible> {
+    ) -> Result<Option<(OperationId, ECash)>, Infallible> {
         let mut stream = dbtx
             .find_by_prefix_sorted_descending(&SpendableNotePrefix)
             .await
@@ -882,7 +886,7 @@ impl MintClientModule {
         let sender = self.balance_update_sender.clone();
         dbtx.on_commit(move || sender.send_replace(()));
 
-        Ok(Some(ecash))
+        Ok(Some((operation_id, ecash)))
     }
 
     /// Receive the `ECash` by reissuing the notes and return the total amount

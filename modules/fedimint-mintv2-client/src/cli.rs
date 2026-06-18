@@ -27,10 +27,8 @@ pub(crate) async fn handle_cli_command(
     match opts {
         Opts::Count => Ok(json(mint.get_count_by_denomination().await)),
         Opts::Send { amount } => {
-            let ecash = mint
-                .send(amount, Value::Null)
-                .await
-                .map(|ecash| base32::encode_prefixed(FEDIMINT_PREFIX, &ecash))?;
+            let (_, ecash) = mint.send(amount, Value::Null).await?;
+            let ecash = base32::encode_prefixed(FEDIMINT_PREFIX, &ecash);
 
             Ok(json(ecash))
         }
