@@ -18,9 +18,9 @@ use fedimint_logging::LOG_TEST;
 use fedimint_mint_client::api::MintFederationApi;
 use fedimint_mint_client::client_db::{NextECashNoteIndexKey, NoteKey};
 use fedimint_mint_client::{
-    MintClientInit, MintClientModule, Note, OOBNotes, ReissueExternalNotesState,
-    SelectNotesWithAtleastAmount, SelectNotesWithExactAmount, SpendOOBState,
-    SpendableNoteUndecoded,
+    MintClientInit, MintClientModule, Note, OOB_SPEND_NO_TIMEOUT, OOBNotes,
+    ReissueExternalNotesState, SelectNotesWithAtleastAmount, SelectNotesWithExactAmount,
+    SpendOOBState, SpendableNoteUndecoded,
 };
 use fedimint_mint_common::{MintInput, MintInputV0, Nonce};
 use fedimint_mint_server::MintInit;
@@ -391,6 +391,30 @@ async fn sends_ecash_out_of_band_cancel() -> anyhow::Result<()> {
     }
 
     panic!("Did not receive refund in time");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sends_ecash_out_of_band_no_timeout_finishes_without_refund() -> anyhow::Result<()> {
+    let fed = fixtures().new_fed_degraded().await;
+    let client = fed.new_client().await;
+    issue_ecash(&client, sats(1000)).await?;
+
+    let mint_module = client.get_first_module::<MintClientModule>()?;
+    let (op, _) = mint_module
+        .spend_notes_with_selector(
+            &SelectNotesWithAtleastAmount,
+            sats(750),
+            OOB_SPEND_NO_TIMEOUT,
+            false,
+            (),
+        )
+        .await?;
+
+    let sub = &mut mint_module.subscribe_spend_notes(op).await?.into_stream();
+    assert_eq!(sub.ok().await?, SpendOOBState::Created);
+    assert_eq!(sub.ok().await?, SpendOOBState::Success);
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
