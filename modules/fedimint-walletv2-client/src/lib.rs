@@ -44,7 +44,7 @@ use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{
     AmountUnit, Amounts, ApiVersion, CommonModuleInit, ModuleCommon, ModuleInit, MultiApiVersion,
 };
-use fedimint_core::task::{TaskGroup, block_in_place, sleep};
+use fedimint_core::task::{TaskGroup, TaskHandle, sleep};
 use fedimint_core::{Amount, OutPoint, TransactionId, apply, async_trait_maybe_send};
 use fedimint_derive_secret::{ChildId, DerivableSecret};
 use fedimint_logging::LOG_CLIENT_MODULE_WALLETV2;
@@ -479,15 +479,34 @@ impl WalletClientModule {
     }
 
     /// Find the next valid index starting from (and including) `start_index`.
-    #[allow(clippy::maybe_infinite_iter)]
-    fn next_valid_index(&self, start_index: u64) -> u64 {
+    ///
+    /// Only ~1/65536 indices are valid, so the search is CPU-bound and may scan
+    /// many indices before finding one. The scan runs in bounded batches and
+    /// yields to the executor between them, so it does not stall the runtime —
+    /// important on wasm, which is single-threaded. It stops and returns `None`
+    /// once the task group begins shutting down.
+    async fn next_valid_index(&self, start_index: u64, handle: &TaskHandle) -> Option<u64> {
+        /// Indices to scan per batch before yielding to the executor.
+        const SCAN_BATCH: u64 = 256;
+
         let pks_hash = self.cfg.bitcoin_pks.consensus_hash();
 
-        block_in_place(|| {
-            (start_index..)
-                .find(|i| is_potential_receive(&self.derive_address(*i).script_pubkey(), &pks_hash))
-                .expect("Will always find a valid index")
-        })
+        let mut index = start_index;
+
+        while !handle.is_shutting_down() {
+            for _ in 0..SCAN_BATCH {
+                if is_potential_receive(&self.derive_address(index).script_pubkey(), &pks_hash) {
+                    return Some(index);
+                }
+
+                index += 1;
+            }
+
+            // Hand control back to the executor between batches.
+            sleep(Duration::ZERO).await;
+        }
+
+        None
     }
 
     /// Issue ecash for an unspent output with a given fee.
@@ -574,6 +593,7 @@ impl WalletClientModule {
 
     fn spawn_output_scanner(&self, task_group: &TaskGroup) {
         let module = self.clone();
+        let handle = task_group.make_handle();
 
         task_group.spawn_cancellable("output-scanner", async move {
             let mut dbtx = module.db.begin_transaction().await;
@@ -585,14 +605,18 @@ impl WalletClientModule {
                 .await
                 .is_none()
             {
-                dbtx.insert_new_entry(&ValidAddressIndexKey(module.next_valid_index(0)), &())
+                let Some(index) = module.next_valid_index(0, &handle).await else {
+                    return;
+                };
+
+                dbtx.insert_new_entry(&ValidAddressIndexKey(index), &())
                     .await;
             }
 
             dbtx.commit_tx().await;
 
             loop {
-                match module.check_outputs().await {
+                match module.check_outputs(&handle).await {
                     Ok(skip_wait) => {
                         if skip_wait {
                             continue;
@@ -608,7 +632,7 @@ impl WalletClientModule {
         });
     }
 
-    async fn check_outputs(&self) -> anyhow::Result<bool> {
+    async fn check_outputs(&self, handle: &TaskHandle) -> anyhow::Result<bool> {
         let mut dbtx = self.db.begin_transaction_nc().await;
 
         let next_output_index = dbtx.get_value(&NextOutputIndexKey).await.unwrap_or(0);
@@ -644,7 +668,10 @@ impl WalletClientModule {
 
                 // If we used the highest valid index, add the next valid one
                 if address_index == next_address_index {
-                    let index = self.next_valid_index(next_address_index + 1);
+                    let Some(index) = self.next_valid_index(next_address_index + 1, handle).await
+                    else {
+                        return Ok(false);
+                    };
 
                     let mut dbtx = self.db.begin_transaction().await;
 
