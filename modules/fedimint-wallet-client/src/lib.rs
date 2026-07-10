@@ -21,7 +21,7 @@ use events::{DepositConfirmed, SendPaymentEvent};
 mod pegin_monitor;
 mod withdraw;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1617,6 +1617,35 @@ impl WalletClientModule {
         }
     }
 
+    /// Returns a stream of per-UTXO receive operation ids discovered by the
+    /// wallet's peg-in monitor.
+    ///
+    /// The stream first yields all receive operations already known to the
+    /// local wallet database (including pre-start backfilled history), then
+    /// waits for peg-in monitor updates and yields any newly-created receive
+    /// operations. Operation ids are deduplicated for the lifetime of the
+    /// stream, so reused deposit addresses and multi-UTXO transactions produce
+    /// one item per distinct UTXO receive operation.
+    pub fn subscribe_receive_operations(&self) -> BoxStream<'static, OperationId> {
+        let db = self.db.clone();
+        let data = self.data.clone();
+        let mut pegin_monitor_update_receiver = self.pegin_monitor_update_receiver.clone();
+
+        Box::pin(stream! {
+            let mut seen = HashSet::new();
+
+            loop {
+                for operation_id in receive_operation_ids_from_db(&db, &data, &mut seen).await {
+                    yield operation_id;
+                }
+
+                if pegin_monitor_update_receiver.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
     /// Reads the final outcome of a *legacy* deposit operation — a
     /// [`WalletOperationMetaVariant::DepositAddress`] operation from before
     /// receives were tracked as their own per-UTXO operations.
@@ -2470,6 +2499,34 @@ async fn first_receive_operation_for_address(
     None
 }
 
+async fn receive_operation_ids_from_db(
+    db: &Database,
+    data: &WalletClientModuleData,
+    seen: &mut HashSet<OperationId>,
+) -> Vec<OperationId> {
+    let indexed_receives = db
+        .begin_transaction_nc()
+        .await
+        .find_by_prefix(&ReceiveOperationPrefix)
+        .await
+        .collect::<Vec<_>>()
+        .await;
+
+    indexed_receives
+        .into_iter()
+        .filter_map(|(key, _creation_time)| {
+            let (_script, _address, _tweak_key, address_operation_id) =
+                data.derive_peg_in_script(key.peg_in_index);
+            let operation_id = WalletClientModuleData::receive_operation_id(
+                address_operation_id,
+                key.btc_out_point,
+            );
+
+            seen.insert(operation_id).then_some(operation_id)
+        })
+        .collect()
+}
+
 fn bridge_deposit_address_to_receive_updates(
     context: ReceiveUpdateContext,
     db: Database,
@@ -2586,13 +2643,25 @@ impl State for WalletClientStates {
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::{IDatabaseTransactionOpsCoreTyped as _, IRawDatabaseExt as _};
+    use fedimint_core::encoding::btc::NetworkLegacyEncodingWrapper;
+    use fedimint_core::envs::BitcoinRpcConfig;
+    use fedimint_core::util::SafeUrl;
+    use fedimint_core::{Amount, PeerId};
+    use fedimint_derive_secret::DerivableSecret;
+    use fedimint_wallet_common::config::{FeeConsensus, WalletClientConfig, WalletConfig};
+    use fedimint_wallet_common::keys::CompressedPublicKey;
 
     use super::*;
     use crate::backup::{
         RECOVER_NUM_IDX_ADD_TO_LAST_USED, RecoverScanOutcome, recover_scan_idxes_for_activity,
     };
+    use crate::client_db::ReceiveOperationKey;
 
     #[test]
     fn receive_history_transition_is_recoverable() {
@@ -2652,6 +2721,90 @@ mod tests {
             })
         );
         assert!(!reported_out_of_mempool);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn receive_operation_discovery_dedupes_multi_utxo_reused_addresses() {
+        let db = MemDatabase::new().into_database();
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&[1; 32]).expect("valid secret key");
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let wallet_config = WalletConfig::new(
+            BTreeMap::from([(PeerId::from(0), CompressedPublicKey::new(pk))]),
+            sk,
+            1,
+            bitcoin::Network::Regtest,
+            1,
+            BitcoinRpcConfig {
+                kind: "esplora".to_owned(),
+                url: SafeUrl::from_str("http://127.0.0.1:3000").expect("valid url"),
+            },
+            FeeConsensus {
+                peg_in_abs: Amount::ZERO,
+                peg_out_abs: Amount::ZERO,
+            },
+        );
+        let data = WalletClientModuleData {
+            cfg: WalletClientConfig {
+                peg_in_descriptor: wallet_config.consensus.peg_in_descriptor,
+                network: NetworkLegacyEncodingWrapper(bitcoin::Network::Regtest),
+                finality_delay: 1,
+                fee_consensus: FeeConsensus {
+                    peg_in_abs: Amount::ZERO,
+                    peg_out_abs: Amount::ZERO,
+                },
+                default_bitcoin_rpc: BitcoinRpcConfig {
+                    kind: "esplora".to_owned(),
+                    url: SafeUrl::from_str("http://127.0.0.1:3000").expect("valid url"),
+                },
+            },
+            module_root_secret: DerivableSecret::new_root(&[2; 32], b"wallet-test"),
+        };
+        let tweak_idx = TweakIdx(7);
+        let outpoint_a = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([3; 32]),
+            vout: 0,
+        };
+        let outpoint_b = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([3; 32]),
+            vout: 1,
+        };
+
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_entry(
+            &ReceiveOperationKey {
+                peg_in_index: tweak_idx,
+                btc_out_point: outpoint_a,
+            },
+            &SystemTime::UNIX_EPOCH,
+        )
+        .await;
+        dbtx.insert_entry(
+            &ReceiveOperationKey {
+                peg_in_index: tweak_idx,
+                btc_out_point: outpoint_b,
+            },
+            &(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+        )
+        .await;
+        dbtx.commit_tx().await;
+
+        let (_script, _address, _tweak_key, address_operation_id) =
+            data.derive_peg_in_script(tweak_idx);
+        let expected = BTreeSet::from([
+            WalletClientModuleData::receive_operation_id(address_operation_id, outpoint_a),
+            WalletClientModuleData::receive_operation_id(address_operation_id, outpoint_b),
+        ]);
+        let mut seen = HashSet::new();
+
+        let first_scan: BTreeSet<_> = receive_operation_ids_from_db(&db, &data, &mut seen)
+            .await
+            .into_iter()
+            .collect();
+        let second_scan = receive_operation_ids_from_db(&db, &data, &mut seen).await;
+
+        assert_eq!(first_scan, expected);
+        assert!(second_scan.is_empty());
     }
 
     #[allow(clippy::too_many_lines)] // shut-up clippy, it's a test
