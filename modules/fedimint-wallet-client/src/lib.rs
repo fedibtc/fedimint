@@ -923,7 +923,7 @@ impl WalletClientModule {
                     }
                 }
 
-                cursor = events.last().map(|entry| entry.id().next());
+                cursor = events.last().map(|entry| entry.id().saturating_add(1));
             }
 
             Ok(amounts)
