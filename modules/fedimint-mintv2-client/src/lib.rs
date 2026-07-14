@@ -25,7 +25,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, ensure};
 use bitcoin_hashes::sha256;
 use client_db::{RecoveryState, RecoveryStateKey, SpendableNoteAmountPrefix, SpendableNotePrefix};
 pub use events::*;
@@ -61,13 +61,14 @@ use fedimint_derive_secret::DerivableSecret;
 use fedimint_mintv2_common::config::{FeeConsensus, MintClientConfig, client_denominations};
 use fedimint_mintv2_common::{
     Denomination, KIND, MintCommonInit, MintInput, MintModuleTypes, MintOutput, Note, RecoveryItem,
+    verify_note,
 };
 use futures::{StreamExt, pin_mut};
 use itertools::Itertools;
 use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tbs::AggregatePublicKey;
+use tbs::{AggregatePublicKey, BlindedMessage, BlindedSignature, aggregate_signature_shares};
 use thiserror::Error;
 
 use crate::api::MintV2ModuleApi;
@@ -739,6 +740,111 @@ impl MintClientModule {
         pin_mut!(stream);
 
         stream.next_or_pending().await
+    }
+
+    /// Await the mint's signatures for a transaction's mint outputs, given
+    /// as public (denomination, blinded message) pairs, and return one
+    /// aggregated blinded signature per output.
+    ///
+    /// The inputs are public, so any party can collect the signatures for
+    /// outputs it cannot unblind. This serves protocols where one party
+    /// funds a transaction whose mint outputs are issued to blinded messages
+    /// another party supplied (escrow, invoicing): the funder collects the
+    /// blinded signatures and relays them, and only the holder of the
+    /// issuance request secrets can unblind them into spendable notes with
+    /// [`NoteIssuanceRequest::finalize`]. It equally lets the holder of the
+    /// secrets finalize outputs of a transaction submitted outside this
+    /// client, where no output state machine exists. Notes finalized this
+    /// way live outside the module's balance; pass them through
+    /// [`Self::receive`] to make them part of the balance.
+    ///
+    /// Each peer's signature shares are verified against the blinded
+    /// messages before aggregation. `outputs` must match the transaction's
+    /// mint outputs at `range` in order. This only resolves once the
+    /// transaction is accepted, so callers that cannot assume acceptance
+    /// should apply a timeout.
+    pub async fn await_output_signatures(
+        &self,
+        range: OutPointRange,
+        outputs: Vec<(Denomination, BlindedMessage)>,
+    ) -> anyhow::Result<Vec<BlindedSignature>> {
+        ensure!(
+            range.count() == outputs.len(),
+            "outputs do not match the transaction's output range"
+        );
+
+        for (denomination, _) in &outputs {
+            ensure!(
+                self.cfg.tbs_pks.contains_key(denomination),
+                "no public key shares for denomination"
+            );
+        }
+
+        self.client_ctx
+            .global_api()
+            .await_transaction(range.txid())
+            .await;
+
+        let signature_shares = self
+            .client_ctx
+            .module_api()
+            .fetch_signature_shares(range, outputs.clone(), self.cfg.tbs_pks.clone())
+            .await;
+
+        Ok((0..outputs.len())
+            .map(|i| {
+                aggregate_signature_shares(
+                    &signature_shares
+                        .iter()
+                        .map(|(peer, shares)| (peer.to_usize() as u64, shares[i]))
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// Unblind externally collected blinded signatures for the given
+    /// issuance requests and return the spendable notes, verifying every
+    /// note against the mint's aggregate public keys.
+    ///
+    /// This is the local counterpart of [`Self::await_output_signatures`]:
+    /// the holder of the issuance request secrets finalizes signatures that
+    /// another party collected and relayed, without contacting the
+    /// federation. Notes finalized this way live outside the module's
+    /// balance; pass them through [`Self::receive`] to make them part of
+    /// the balance.
+    ///
+    /// `signatures` must match `requests` in order.
+    pub fn finalize_external_issuance(
+        &self,
+        requests: &[NoteIssuanceRequest],
+        signatures: &[BlindedSignature],
+    ) -> anyhow::Result<Vec<SpendableNote>> {
+        ensure!(
+            requests.len() == signatures.len(),
+            "signatures do not match the issuance requests"
+        );
+
+        requests
+            .iter()
+            .zip(signatures)
+            .map(|(request, signature)| {
+                let spendable_note = request.finalize(*signature);
+
+                let agg_pk = self
+                    .cfg
+                    .tbs_agg_pks
+                    .get(&request.denomination)
+                    .context("no aggregate public key for denomination")?;
+
+                ensure!(
+                    verify_note(spendable_note.note(), *agg_pk),
+                    "invalid note signature"
+                );
+
+                Ok(spendable_note)
+            })
+            .collect()
     }
 
     /// Count the `ECash` notes in the client's database by denomination.
