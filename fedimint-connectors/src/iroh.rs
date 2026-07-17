@@ -80,7 +80,6 @@ use iroh::discovery::pkarr::PkarrResolver;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, NodeId, PublicKey};
 use iroh_base::ticket::NodeTicket;
-use iroh_next::Watcher as _;
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 use tracing::{debug, trace, warn};
@@ -194,12 +193,11 @@ impl IrohConnector {
             }
         });
         let endpoint_next = Box::pin(async {
-            let mut builder = iroh_next::Endpoint::builder();
+            let mut builder = iroh_next::Endpoint::builder(iroh_next::endpoint::presets::Minimal);
 
             if let Some(iroh_dns) = iroh_dns.map(SafeUrl::to_unsafe) {
-                builder = builder.address_lookup(
-                    iroh_next::address_lookup::PkarrResolver::builder(iroh_dns).build(),
-                );
+                builder = builder
+                    .address_lookup(iroh_next::address_lookup::PkarrResolver::builder(iroh_dns));
             }
 
             // As a client, we don't need to register on any relays
@@ -207,11 +205,12 @@ impl IrohConnector {
 
             #[cfg(not(target_family = "wasm"))]
             if iroh_enable_dht {
-                builder =
-                    builder.address_lookup(iroh_next::address_lookup::DhtAddressLookup::builder());
+                builder = builder
+                    .address_lookup(iroh_mainline_address_lookup::DhtAddressLookup::builder());
             }
 
-            // instead of `.discovery_n0`, which brings publisher we don't want
+            // Add only resolver services here; the iroh preset convenience also
+            // installs a publisher.
             {
                 // Resolve using HTTPS requests to our DNS server's /pkarr path in browsers
                 #[cfg(target_family = "wasm")]
@@ -393,12 +392,14 @@ impl IrohConnector {
         conn: &iroh_next::endpoint::Connection,
         node_id: iroh_next::EndpointId,
     ) {
-        let mut paths_watcher = conn.paths();
+        let conn = conn.clone();
         #[allow(clippy::let_underscore_future)]
         let _ = spawn("iroh connection (next)", async move {
-            let paths = paths_watcher.get();
-            debug!(target: LOG_NET_IROH, %node_id, ?paths, "Connection paths (initial)");
-            while let Ok(paths) = paths_watcher.updated().await {
+            let mut paths = conn.paths_stream();
+            if let Some(paths) = paths.next().await {
+                debug!(target: LOG_NET_IROH, %node_id, ?paths, "Connection paths (initial)");
+            }
+            while let Some(paths) = paths.next().await {
                 debug!(target: LOG_NET_IROH, %node_id, ?paths, "Connection paths changed");
             }
         });
