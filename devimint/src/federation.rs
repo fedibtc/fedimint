@@ -953,6 +953,12 @@ impl Federation {
     }
 
     pub async fn await_gateways_registered(&self) -> Result<()> {
+        // Gateways register only with the lnv1 module; without it there is
+        // nothing to await (lnv2 gateways are vetted by guardians instead).
+        if !crate::util::supports_lnv1() {
+            debug!(target: LOG_DEVIMINT, "lnv1 disabled, skipping LN gateway registration wait");
+            return Ok(());
+        }
         let start_time = Instant::now();
         debug!(target: LOG_DEVIMINT, "Awaiting LN gateways registration");
 
