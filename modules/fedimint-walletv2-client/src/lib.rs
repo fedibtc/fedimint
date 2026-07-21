@@ -661,29 +661,6 @@ impl WalletClientModule {
 
         for output in &outputs {
             if let Some(&address_index) = address_map.get(&output.script) {
-                let next_address_index = valid_indices
-                    .last()
-                    .copied()
-                    .expect("we have at least one address index");
-
-                // If we used the highest valid index, add the next valid one
-                if address_index == next_address_index {
-                    let Some(index) = self.next_valid_index(next_address_index + 1, handle).await
-                    else {
-                        return Ok(false);
-                    };
-
-                    let mut dbtx = self.db.begin_transaction().await;
-
-                    dbtx.insert_entry(&ValidAddressIndexKey(index), &()).await;
-
-                    dbtx.commit_tx_result().await?;
-
-                    valid_indices.push(index);
-
-                    address_map.insert(self.derive_address(index).script_pubkey(), index);
-                }
-
                 if !output.spent {
                     // In order to not overpay on fees we choose to wait,
                     // the congestion will clear up within a few blocks.
@@ -715,6 +692,33 @@ impl WalletClientModule {
                             .await
                             .map_err(|e| anyhow!("Claim transaction was rejected: {e}"))?;
                     }
+                }
+
+                let next_address_index = valid_indices
+                    .last()
+                    .copied()
+                    .expect("we have at least one address index");
+
+                // If we used the highest valid index, add the next valid one.
+                // This search is CPU-bound and can take longer than a
+                // short-lived client process (e.g. a cli invocation) lives,
+                // so it must come after the claim above: the claim is quick
+                // and the extension can be retried on the next scan.
+                if address_index == next_address_index {
+                    let Some(index) = self.next_valid_index(next_address_index + 1, handle).await
+                    else {
+                        return Ok(false);
+                    };
+
+                    let mut dbtx = self.db.begin_transaction().await;
+
+                    dbtx.insert_entry(&ValidAddressIndexKey(index), &()).await;
+
+                    dbtx.commit_tx_result().await?;
+
+                    valid_indices.push(index);
+
+                    address_map.insert(self.derive_address(index).script_pubkey(), index);
                 }
             }
 
