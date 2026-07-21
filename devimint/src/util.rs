@@ -13,8 +13,7 @@ use fedimint_core::PeerId;
 use fedimint_core::admin_client::SetupStatus;
 use fedimint_core::envs::{
     FM_ENABLE_MODULE_LNV1_ENV, FM_ENABLE_MODULE_LNV2_ENV, FM_ENABLE_MODULE_MINTV2_ENV,
-    FM_ENABLE_MODULE_WALLETV2_ENV,
-    is_env_var_set,
+    FM_ENABLE_MODULE_WALLETV2_ENV, is_env_var_set,
 };
 use fedimint_core::module::ApiAuth;
 use fedimint_core::task::{self, block_in_place, block_on};
