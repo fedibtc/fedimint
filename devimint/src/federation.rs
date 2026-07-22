@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 use std::{env, fs};
@@ -23,6 +23,7 @@ use fedimint_core::util::SafeUrl;
 use fedimint_core::{Amount, NumPeers, PeerId};
 use fedimint_gateway_common::WithdrawResponse;
 use fedimint_logging::LOG_DEVIMINT;
+use fedimint_server::config::io::{CONSENSUS_CONFIG, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG};
 use fedimint_testing_core::config::API_AUTH;
 use fedimint_testing_core::node_type::LightningNodeType;
 use fedimint_wallet_client::WalletClientModule;
@@ -38,7 +39,7 @@ use super::util::{Command, ProcessHandle, ProcessManager, cmd};
 use super::vars::utf8;
 use crate::envs::{FM_CLIENT_DIR_ENV, FM_DATA_DIR_ENV};
 use crate::util::{FedimintdCmd, poll, poll_simple, poll_with_timeout};
-use crate::version_constants::{VERSION_0_10_0_ALPHA, VERSION_0_11_0_ALPHA};
+use crate::version_constants::{VERSION_0_10_0_ALPHA, VERSION_0_11_0_ALPHA, VERSION_0_12_0_ALPHA};
 use crate::{poll_almost_equal, poll_eq, vars};
 
 // TODO: Are we still using the 3rd port for anything?
@@ -237,13 +238,42 @@ impl Client {
         }
     }
 
+    /// Waits for the next walletv2 receive recorded at or after `position` (as
+    /// returned by [`Self::get_deposit_addr`] or a prior `await_receive`) to be
+    /// claimed, and returns the event log position to use for the following
+    /// wait.
+    pub async fn await_receive(&self, position: &str) -> Result<String> {
+        let output = cmd!(self, "module", "walletv2", "await-receive", position)
+            .out_json()
+            .await?;
+
+        // Walletv2 `await-receive` returns `[final_state, next_position]`.
+        Ok(output[1].to_string())
+    }
+
     pub async fn get_deposit_addr(&self) -> Result<(String, String)> {
         if crate::util::supports_wallet_v2() {
-            let address = cmd!(self, "module", "walletv2", "receive")
-                .out_json()
-                .await?;
-            // Walletv2 auto-claims deposits, no operation_id needed
-            Ok((address.as_str().unwrap().to_string(), String::new()))
+            if crate::util::FedimintCli::version_or_default().await >= *VERSION_0_12_0_ALPHA {
+                // Capture the event log position *before* deriving the address so
+                // `await_receive` can wait from it; there is no operation id as
+                // deposits are auto-claimed.
+                let position = cmd!(self, "dev", "next-event-log-id").out_json().await?;
+
+                let address = cmd!(self, "module", "walletv2", "receive")
+                    .out_json()
+                    .await?;
+
+                Ok((address.as_str().unwrap().to_string(), position.to_string()))
+            } else {
+                // Legacy walletv2 (<= 0.11): `receive` returns the bare address
+                // and deposits are auto-claimed, so there is no position or
+                // operation id to wait on.
+                let address = cmd!(self, "module", "walletv2", "receive")
+                    .out_json()
+                    .await?;
+
+                Ok((address.as_str().unwrap().to_string(), String::new()))
+            }
         } else {
             let deposit = cmd!(self, "deposit-address").out_json().await?;
             Ok((
@@ -322,6 +352,7 @@ impl Federation {
         bitcoind: Bitcoind,
         skip_setup: bool,
         pre_dkg: bool,
+        pre_restore: bool,
         // Which of the pre-allocated federations to use (most tests just use single `0` one)
         fed_index: usize,
         federation_name: String,
@@ -424,6 +455,16 @@ impl Federation {
             }
 
             debug!("Moved invite-code files to client data directory");
+
+            if pre_restore {
+                Self::restart_guardian_for_manual_restore(
+                    process_mgr,
+                    &mut members,
+                    &peer_to_env_vars_map,
+                    &bitcoind,
+                )
+                .await?;
+            }
         }
 
         let client = JitTryAnyhow::new_try({
@@ -444,6 +485,84 @@ impl Federation {
             client,
             connectors,
         })
+    }
+
+    async fn restart_guardian_for_manual_restore(
+        process_mgr: &ProcessManager,
+        members: &mut BTreeMap<usize, Fedimintd>,
+        peer_to_env_vars_map: &BTreeMap<usize, vars::Fedimintd>,
+        bitcoind: &Bitcoind,
+    ) -> Result<()> {
+        const RESTORE_PEER: usize = 0;
+
+        let peer_env_vars = &peer_to_env_vars_map[&RESTORE_PEER];
+        let backup_dir = process_mgr.globals.FM_TEST_DIR.join("fedimintd-backups");
+        tokio::fs::create_dir_all(&backup_dir)
+            .await
+            .context("Creating fedimintd backup directory")?;
+        let backup_path = backup_dir.join("fedimint-0-guardian-backup.tar");
+
+        Self::write_guardian_backup_tar(&peer_env_vars.FM_DATA_DIR, &backup_path).await?;
+        info!(
+            target: LOG_DEVIMINT,
+            path = %backup_path.display(),
+            "Wrote guardian backup for manual restore"
+        );
+
+        let fedimintd = members
+            .remove(&RESTORE_PEER)
+            .context("Missing fedimint-0 process")?;
+        fedimintd.terminate().await?;
+        tokio::fs::remove_dir_all(&peer_env_vars.FM_DATA_DIR)
+            .await
+            .with_context(|| format!("Removing {}", peer_env_vars.FM_DATA_DIR.display()))?;
+        tokio::fs::create_dir_all(&peer_env_vars.FM_DATA_DIR)
+            .await
+            .with_context(|| format!("Creating {}", peer_env_vars.FM_DATA_DIR.display()))?;
+
+        let fedimintd = Fedimintd::new(
+            process_mgr,
+            bitcoind.clone(),
+            RESTORE_PEER,
+            peer_env_vars,
+            "default".to_string(),
+        )
+        .await?;
+        members.insert(RESTORE_PEER, fedimintd);
+
+        info!(
+            target: LOG_DEVIMINT,
+            ui = %peer_env_vars.FM_BIND_UI,
+            backup = %backup_path.display(),
+            "fedimint-0 restarted in setup mode for manual restore"
+        );
+
+        Ok(())
+    }
+
+    async fn write_guardian_backup_tar(data_dir: &Path, backup_path: &Path) -> Result<()> {
+        let data_dir = data_dir.to_path_buf();
+        let backup_path = backup_path.to_path_buf();
+        spawn_blocking(move || {
+            let file = fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(&backup_path)
+                .with_context(|| format!("Creating {}", backup_path.display()))?;
+            let mut archive = tar::Builder::new(file);
+            for path in [
+                PathBuf::from(LOCAL_CONFIG).with_extension(JSON_EXT),
+                PathBuf::from(CONSENSUS_CONFIG).with_extension(JSON_EXT),
+                PathBuf::from(PRIVATE_CONFIG).with_extension(JSON_EXT),
+            ] {
+                archive
+                    .append_path_with_name(data_dir.join(&path), &path)
+                    .with_context(|| format!("Adding {} to backup", path.display()))?;
+            }
+            archive.finish().context("Finishing guardian backup tar")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
     }
 
     pub fn client_config(&self) -> Result<ClientConfig> {
@@ -703,35 +822,46 @@ impl Federation {
         let deposit_fees = deposit_fees_msat / 1000;
         info!(amount, deposit_fees, "Pegging-in client funds");
 
-        let (address, operation_id) = client.get_deposit_addr().await?;
+        // For walletv1 this is the deposit operation id; for walletv2 it is the
+        // event log position to wait for the receive from.
+        let (address, handle) = client.get_deposit_addr().await?;
 
         self.bitcoind
             .send_to(address, amount + deposit_fees)
             .await?;
         self.bitcoind.mine_blocks(21).await?;
 
-        Ok(operation_id)
+        Ok(handle)
     }
 
     pub async fn pegin_client(&self, amount: u64, client: &Client) -> Result<()> {
-        // For walletv2, we need to capture the initial balance and wait for it to
-        // increase since there is no state machine - deposits are auto-claimed
-        let initial_balance = if crate::util::supports_wallet_v2() {
+        let walletv2_await_receive = crate::util::supports_wallet_v2()
+            && crate::util::FedimintCli::version_or_default().await >= *VERSION_0_12_0_ALPHA;
+
+        // Legacy walletv2 (<= 0.11) auto-claims deposits with no way to wait on
+        // them directly, so capture the balance before the deposit to wait for
+        // it to increase.
+        let initial_balance = if crate::util::supports_wallet_v2() && !walletv2_await_receive {
             Some(client.balance().await?)
         } else {
             None
         };
 
-        let operation_id = self.pegin_client_no_wait(amount, client).await?;
+        let handle = self.pegin_client_no_wait(amount, client).await?;
 
-        if let Some(initial) = initial_balance {
-            // Walletv2: wait for balance to increase. We expect slightly less than
+        if walletv2_await_receive {
+            // `handle` is the event log position from which to wait for the
+            // receive.
+            client.await_receive(&handle).await?;
+        } else if let Some(initial) = initial_balance {
+            // Wait for the balance to increase. We expect slightly less than
             // `amount` due to mint module fees when creating ecash notes.
             let expected_balance = initial + (amount * 1000 * 9 / 10);
             client.await_balance(expected_balance).await?;
         } else {
-            client.await_deposit(&operation_id).await?;
+            client.await_deposit(&handle).await?;
         }
+
         Ok(())
     }
 
@@ -768,24 +898,50 @@ impl Federation {
             }
         }
 
+        let mut gateway_deposit_addrs = Vec::new();
         for gw in gateways.clone() {
             let pegin_addr = gw.client().get_pegin_addr(&fed_id).await?;
+            debug!(
+                gateway = %gw.gw_name,
+                ln = %gw.ln.ln_type(),
+                address = %pegin_addr,
+                amount_sats = amount + deposit_fees,
+                uses_walletv2,
+                "Sending gateway pegin"
+            );
             self.bitcoind
-                .send_to(pegin_addr, amount + deposit_fees)
+                .send_to(pegin_addr.clone(), amount + deposit_fees)
                 .await?;
+            gateway_deposit_addrs.push(pegin_addr);
         }
 
+        let pegin_start = Instant::now();
         self.bitcoind.mine_blocks(21).await?;
         let bitcoind_block_height: u64 = self.bitcoind.get_block_count().await? - 1;
+        debug!(
+            bitcoind_block_height,
+            elapsed_ms = %pegin_start.elapsed().as_millis(),
+            "Mined gateway pegin blocks"
+        );
+
         try_join_all(gateways.into_iter().enumerate().map(|(i, gw)| {
             let initial_balance = if uses_walletv2 {
                 initial_balances[i]
             } else {
                 0
             };
+            let gateway_name = gw.gw_name.clone();
+            let gateway_ln = gw.ln.ln_type().to_string();
+            let gateway_id = gw.gateway_id.clone();
+            let gateway_index = gw.gateway_index;
+            let deposit_address = gateway_deposit_addrs[i].clone();
             let fed_id = fed_id.clone();
             poll("gateway pegin", move || {
                 let fed_id = fed_id.clone();
+                let gateway_name = gateway_name.clone();
+                let gateway_ln = gateway_ln.clone();
+                let gateway_id = gateway_id.clone();
+                let deposit_address = deposit_address.clone();
                 async move {
                     let gw_info = gw
                         .client()
@@ -804,8 +960,16 @@ impl Federation {
                     };
 
                     if bitcoind_block_height != block_height {
+                        debug!(
+                            gateway = %gateway_name,
+                            ln = %gateway_ln,
+                            bitcoind_block_height,
+                            gateway_block_height = block_height,
+                            elapsed_ms = %pegin_start.elapsed().as_millis(),
+                            "Waiting for gateway pegin block sync"
+                        );
                         return Err(std::ops::ControlFlow::Continue(anyhow::anyhow!(
-                            "gateway block height is not synced"
+                            "Gateway {gateway_name} ({gateway_id}, index {gateway_index}) block height {block_height} has not reached bitcoind block height {bitcoind_block_height}"
                         )));
                     }
 
@@ -820,11 +984,20 @@ impl Federation {
                         // the expected amount. Use 90% threshold to account
                         // for mintv2 fees (same as pegin_client).
                         let expected = initial_balance + (amount * 1000 * 9 / 10);
-                        if gateway_balance >= expected {
+                        debug!(
+                            gateway = %gateway_name,
+                            ln = %gateway_ln,
+                            gateway_balance_msats = gateway_balance,
+                            expected_msats = expected,
+                            initial_balance_msats = initial_balance,
+                            elapsed_ms = %pegin_start.elapsed().as_millis(),
+                            "Checked walletv2 gateway pegin balance"
+                        );
+                        if expected <= gateway_balance {
                             Ok(())
                         } else {
                             Err(ControlFlow::Continue(anyhow::anyhow!(
-                                "Gateway balance {gateway_balance} has not reached expected {expected} (initial: {initial_balance})"
+                                "Gateway {gateway_name} ({gateway_id}, index {gateway_index}) balance {gateway_balance} has not reached expected {expected} for deposit address {deposit_address} (initial: {initial_balance})"
                             )))
                         }
                     } else {
@@ -993,6 +1166,15 @@ impl Federation {
     }
 
     pub async fn await_gateways_registered(&self) -> Result<()> {
+        // `list-gateways` is an LNv1 concept: gateways register with the LNv1
+        // module and the client lists them. LNv2 instead addresses gateways
+        // directly and vets them via an explicit consensus item, so there is
+        // nothing to poll here when the LNv1 module isn't present. The gateway
+        // connection itself is awaited separately (via `connect_fed`).
+        if !crate::util::supports_lnv1() {
+            return Ok(());
+        }
+
         let start_time = Instant::now();
         debug!(target: LOG_DEVIMINT, "Awaiting LN gateways registration");
 

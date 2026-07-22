@@ -17,15 +17,16 @@ use fedimint_core::task::TaskGroup;
 use fedimint_core::time::now;
 use fedimint_core::util::{FmtCompactResult as _, backoff_util, retry};
 use fedimint_gateway_common::{
-    ChannelInfo, CloseChannelsWithPeerRequest, CloseChannelsWithPeerResponse, GetInvoiceRequest,
-    GetInvoiceResponse, LightningInfo, ListTransactionsResponse, OpenChannelRequest,
-    SendOnchainRequest, SetChannelFeesRequest,
+    ChannelInfo, CloseChannelsWithPeerRequest, CloseChannelsWithPeerResponse, ConnectPeerRequest,
+    GetInvoiceRequest, GetInvoiceResponse, LightningInfo, ListTransactionsResponse,
+    OpenChannelRequest, SendOnchainRequest, SetChannelFeesRequest,
 };
 use fedimint_ln_common::PrunedInvoice;
 pub use fedimint_ln_common::contracts::Preimage;
 use fedimint_ln_common::route_hints::RouteHint;
 use fedimint_logging::LOG_LIGHTNING;
 use fedimint_metrics::HistogramExt as _;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use lightning_invoice::Bolt11Invoice;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,14 @@ use tracing::{info, trace, warn};
 pub const MAX_LIGHTNING_RETRIES: u32 = 10;
 
 pub type RouteHtlcStream<'a> = BoxStream<'a, InterceptPaymentRequest>;
+
+/// Returns `true` if the given payment hash corresponds to a HOLD invoice that
+/// the gateway created on behalf of a federation. Used by the LND backend to
+/// ignore unrelated HOLD invoices on a shared LND node, which would otherwise
+/// be mistaken for federation-bound payments and produce invalid responses on
+/// LND's HTLC interceptor wire.
+pub type Lnv2HoldInvoiceFilter =
+    Arc<dyn Fn(sha256::Hash) -> BoxFuture<'static, bool> + Send + Sync + 'static>;
 
 #[derive(
     Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq, Hash,
@@ -144,9 +153,6 @@ pub trait ILnRpcClient: Debug + Send + Sync {
     /// This is more private than [`ILnRpcClient::pay`], as it does not require
     /// the invoice description. If this is implemented,
     /// [`ILnRpcClient::supports_private_payments`] must return true.
-    ///
-    /// Note: This is only used for outbound LNv1 payments and will be removed
-    /// when we switch to LNv2.
     async fn pay_private(
         &self,
         _invoice: PrunedInvoice,
@@ -212,6 +218,9 @@ pub trait ILnRpcClient: Debug + Send + Sync {
         &self,
         payload: OpenChannelRequest,
     ) -> Result<OpenChannelResponse, LightningRpcError>;
+
+    /// Connects to a peer lightning node without opening a channel.
+    async fn connect_peer(&self, payload: ConnectPeerRequest) -> Result<(), LightningRpcError>;
 
     /// Closes all channels with a peer lightning node.
     async fn close_channels_with_peer(
@@ -599,6 +608,10 @@ impl ILnRpcClient for LnRpcTracked {
         payload: OpenChannelRequest,
     ) -> Result<OpenChannelResponse, LightningRpcError> {
         tracked_call!(self, "open_channel", self.inner.open_channel(payload).await)
+    }
+
+    async fn connect_peer(&self, payload: ConnectPeerRequest) -> Result<(), LightningRpcError> {
+        tracked_call!(self, "connect_peer", self.inner.connect_peer(payload).await)
     }
 
     async fn close_channels_with_peer(

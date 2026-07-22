@@ -24,9 +24,11 @@ use fedimint_core::{
     Amount, OutPoint, PeerId, apply, async_trait_maybe_send, dyn_newtype_define, maybe_add_send,
     maybe_add_send_sync,
 };
-use fedimint_eventlog::{Event, EventKind, EventPersistence};
+use fedimint_eventlog::{
+    DBTransactionEventLogExt, Event, EventKind, EventLogId, EventPersistence, PersistedLogEntry,
+};
 use fedimint_logging::LOG_CLIENT;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::warn;
@@ -36,7 +38,9 @@ use crate::module::recovery::{DynModuleBackup, ModuleBackup};
 use crate::oplog::{IOperationLog, OperationLogEntry, UpdateStreamOrOutcome};
 use crate::sm::executor::{ActiveStateKey, IExecutor, InactiveStateKey};
 use crate::sm::{self, ActiveStateMeta, Context, DynContext, DynState, InactiveStateMeta, State};
-use crate::transaction::{ClientInputBundle, ClientOutputBundle, TransactionBuilder};
+use crate::transaction::{
+    ClientInputBundle, ClientOutputBundle, FeeQuote, FeeQuoteRequest, TransactionBuilder,
+};
 use crate::{AddStateMachinesResult, InstancelessDynClientInputBundle, TransactionUpdates, oplog};
 
 pub mod init;
@@ -81,6 +85,19 @@ pub trait ClientContextIface: MaybeSend + MaybeSync {
         operation_id: OperationId,
         tx_builder: TransactionBuilder,
     ) -> anyhow::Result<OutPointRange>;
+
+    /// Computes the fee finalizing and submitting a transaction with the
+    /// explicit items described by `request` would incur, without submitting
+    /// anything. See `Client::fee_quote`.
+    async fn fee_quote(
+        &self,
+        operation_id: OperationId,
+        request: FeeQuoteRequest,
+    ) -> anyhow::Result<FeeQuote>;
+
+    /// The client's balance for `unit`, held by the primary module. See
+    /// `Client::get_balance_for_unit`.
+    async fn get_balance_for_unit(&self, unit: AmountUnit) -> anyhow::Result<Amount>;
 
     async fn transaction_updates(&self, operation_id: OperationId) -> TransactionUpdates;
 
@@ -406,6 +423,31 @@ where
             .await
     }
 
+    /// Computes the fee that finalizing and submitting a transaction with the
+    /// explicit items described by `request` would incur, as a dry-run over the
+    /// client's current funds, without submitting anything. See
+    /// `Client::fee_quote`.
+    ///
+    /// Summarize the explicit inputs/outputs the operation would submit (their
+    /// gross amounts and federation fees) in `request`; the returned breakdown
+    /// adds the change the primary module's balancing would produce.
+    pub async fn fee_quote(
+        &self,
+        operation_id: OperationId,
+        request: FeeQuoteRequest,
+    ) -> anyhow::Result<FeeQuote> {
+        self.client.get().fee_quote(operation_id, request).await
+    }
+
+    /// The client's Bitcoin balance, held by the primary module. See
+    /// `Client::get_balance_for_btc`.
+    pub async fn get_balance_for_btc(&self) -> anyhow::Result<Amount> {
+        self.client
+            .get()
+            .get_balance_for_unit(AmountUnit::BITCOIN)
+            .await
+    }
+
     pub async fn transaction_updates(&self, operation_id: OperationId) -> TransactionUpdates {
         self.client.get().transaction_updates(operation_id).await
     }
@@ -461,6 +503,20 @@ where
         &self.module_db
     }
 
+    /// Read a portion of the client's event log, starting at `pos` (or the
+    /// beginning of the log if `None`) and returning up to `limit` entries.
+    pub async fn get_event_log(
+        &self,
+        pos: Option<EventLogId>,
+        limit: u64,
+    ) -> Vec<PersistedLogEntry> {
+        self.global_db()
+            .begin_transaction_nc()
+            .await
+            .get_event_log(pos, limit)
+            .await
+    }
+
     pub async fn has_active_states(&self, op_id: OperationId) -> bool {
         self.client.get().has_active_states(op_id).await
     }
@@ -488,6 +544,61 @@ where
                 )
             })
             .collect()
+    }
+
+    /// Returns this module's currently active state machines for the operation.
+    pub async fn get_own_operation_active_states(
+        &self,
+        operation_id: OperationId,
+    ) -> Vec<(M::States, ActiveStateMeta)> {
+        let db = self.global_db();
+        let mut dbtx = db.begin_transaction_nc().await;
+
+        self.client
+            .get()
+            .read_operation_active_states(operation_id, self.module_instance_id, &mut dbtx)
+            .await
+            .map(|(key, meta)| {
+                (
+                    Clone::clone(
+                        key.state
+                            .as_any()
+                            .downcast_ref::<M::States>()
+                            .expect("incorrect output type passed to module plugin"),
+                    ),
+                    meta,
+                )
+            })
+            .collect()
+            .await
+    }
+
+    /// Returns this module's previously active state machines for the
+    /// operation.
+    pub async fn get_own_operation_inactive_states(
+        &self,
+        operation_id: OperationId,
+    ) -> Vec<(M::States, InactiveStateMeta)> {
+        let db = self.global_db();
+        let mut dbtx = db.begin_transaction_nc().await;
+
+        self.client
+            .get()
+            .read_operation_inactive_states(operation_id, self.module_instance_id, &mut dbtx)
+            .await
+            .map(|(key, meta)| {
+                (
+                    Clone::clone(
+                        key.state
+                            .as_any()
+                            .downcast_ref::<M::States>()
+                            .expect("incorrect output type passed to module plugin"),
+                    ),
+                    meta,
+                )
+            })
+            .collect()
+            .await
     }
 
     pub async fn get_config(&self) -> ClientConfig {

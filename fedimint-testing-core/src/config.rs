@@ -62,6 +62,7 @@ pub fn local_config_gen_params(
                 enabled_modules: None,
                 federation_size: None,
                 network: bitcoin::Network::Regtest,
+                fedimint_version: fedimint_core::version::cargo_pkg_release().to_owned(),
             };
             (*peer, params)
         })
@@ -72,7 +73,6 @@ pub fn local_config_gen_params(
         .map(|peer| {
             let params = ConfigGenParams {
                 identity: *peer,
-                api_auth: API_AUTH.clone(),
                 tls_key: Some(tls_keys[peer].1.clone()),
                 iroh_api_sk: None,
                 iroh_p2p_sk: None,

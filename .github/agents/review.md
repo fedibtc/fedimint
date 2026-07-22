@@ -39,6 +39,32 @@ bugs, not to nitpick style in isolation. Prioritize issues in this order:
 "Should we …?") and suggest a concrete alternative. Flat directives are
 reserved for true correctness or safety problems.
 
+**Completeness and validation**: include every concrete issue you find, not
+just the highest-severity ones. Prefer inline comments for all findings. The
+workflow validates candidate findings with a separate validation subagent
+before posting them; when acting as that validation subagent, keep every
+finding that is demonstrably a real problem and drop anything speculative or
+unsupported by the diff.
+
+## Dependabot Dependency Bumps
+
+If the PR metadata says `PR Author: dependabot[bot]`, use the relevant
+dependency-bump review skill instead of treating the PR as a generic low-risk
+dependency bump:
+
+- For Rust/Cargo updates (`Cargo.toml` or `Cargo.lock`), read and follow
+  `.agents/skills/github-cargo-dependabot-review/SKILL.md`.
+- For GitHub Actions updates (`.github/workflows/**`, `.github/actions/**`,
+  `action.yml`, or `action.yaml`), read and follow
+  `.agents/skills/github-actions-dependabot-review/SKILL.md`.
+
+Adapt those skills to this workflow's JSON output: do not post PR comments
+yourself, put line-specific findings in `inline_comments`, and use the
+top-level `reason` for review-wide dependency-risk notes. Only output
+`APPROVE` after the applicable upstream/tarball checks are complete and no
+risks were found. If the required dependency review cannot be completed,
+output `COMMENT` with a concise reason explaining what remains unreviewed.
+
 ## Consensus-Critical Code
 
 ### What is consensus-critical?
@@ -477,12 +503,15 @@ Field details:
   needs federation-version gating", "changes `process_output` semantics —
   requires module consensus version bump"). Do NOT write "None" — use `null`.
 - **reason**: `null` when approving, or when the inline comments already make
-  the reason obvious. Only set this to a short sentence when the verdict is
-  COMMENT and a human needs to understand what to focus on beyond the inline
-  comments (e.g. "touches consensus encoding", "diff was truncated").
+  the reason obvious. Set this to a short sentence when the verdict is COMMENT
+  and a human needs to understand why this is not an approval (e.g. "touches
+  consensus encoding", "diff was truncated", "see inline correctness issue").
+  Never use "LGTM" or approval-like wording when the verdict is COMMENT.
 - **inline_comments**: Array of line-level comments. All findings — bugs, nits,
   warnings — MUST go here as inline comments, not in a top-level summary.
-  Can be empty if the change is clean.
+  Can be empty if the change is clean. If you found multiple issues, include
+  all of them; do not suppress lower-severity validated issues just because a
+  higher-severity issue exists.
   - **path**: File path relative to repo root, as shown in the diff.
   - **line**: The line number in the diff to attach the comment to.
   - **side**: `RIGHT` for lines in the new version (additions, context on new

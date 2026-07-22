@@ -35,7 +35,7 @@ jobs:
     name: Flake self-check
     runs-on: [self-hosted, linux, x64]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Check Nix flake inputs
         if: github.event_name == 'pull_request' && github.base_ref == 'master'
         uses: DeterminateSystems/flake-checker-action@3164002371bc90729c68af0e24d5aacf20d7c9f6 # v12
@@ -49,13 +49,14 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dpc/nix-installer-action@c6e05d595d5ed6d6b7c46e42409ca2a126efe13d # dpc/jj-vqymqvyntouw
       - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
+      - uses: ./.github/actions/pin-nix-flake-inputs
 
       # run the same check that git `pre-commit` hook would, just in case
       - name: Commit check
@@ -96,7 +97,7 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         if: github.event_name != 'pull_request' || matrix.build-in-pr
 
       - uses: dpc/nix-installer-action@c6e05d595d5ed6d6b7c46e42409ca2a126efe13d # dpc/jj-vqymqvyntouw
@@ -106,6 +107,8 @@ jobs:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
+      - uses: ./.github/actions/pin-nix-flake-inputs
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
 
       - name: Build dev shell
         if: github.event_name != 'pull_request' || matrix.build-in-pr
@@ -136,7 +139,7 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         if: github.event_name != 'pull_request' || matrix.build-in-pr
 
       - name: Prepare
@@ -151,6 +154,8 @@ jobs:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
+      - uses: ./.github/actions/pin-nix-flake-inputs
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
 
       - name: Build workspace
         if: github.event_name != 'pull_request' || matrix.build-in-pr
@@ -227,13 +232,14 @@ jobs:
     timeout-minutes: 60
     if: github.event_name == 'merge_group'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dpc/nix-installer-action@c6e05d595d5ed6d6b7c46e42409ca2a126efe13d # dpc/jj-vqymqvyntouw
       - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
+      - uses: ./.github/actions/pin-nix-flake-inputs
       - name: Check package features
         run: |
           nix build -L .#wasm32-unknown.ci.cargoCheckWasmNoDefaultFeatures
@@ -250,7 +256,7 @@ jobs:
     # we don't want to stop the world because of it
     continue-on-error: true
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dpc/nix-installer-action@c6e05d595d5ed6d6b7c46e42409ca2a126efe13d # dpc/jj-vqymqvyntouw
       - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
@@ -261,10 +267,12 @@ jobs:
       - name: Run cargo audit
         run: |
           nix flake update advisory-db || nix flake lock --update-input advisory-db
+          ./.github/scripts/pin-nix-flake-inputs.sh .
           nix build -L .#ci.cargoAudit
 
       - name: Run cargo deny
         run: |
+          ./.github/scripts/pin-nix-flake-inputs.sh .
           nix build -L .#ci.cargoDeny
 
   cross:
@@ -298,7 +306,7 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         if: github.event_name != 'pull_request' || matrix.build-in-pr
 
       - uses: dpc/nix-installer-action@c6e05d595d5ed6d6b7c46e42409ca2a126efe13d # dpc/jj-vqymqvyntouw
@@ -310,6 +318,8 @@ jobs:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
+      - uses: ./.github/actions/pin-nix-flake-inputs
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
 
       - name: Build client packages for ${{ matrix.toolchain }}
         if: github.event_name != 'pull_request' || matrix.build-in-pr
@@ -355,11 +365,11 @@ jobs:
     steps:
       - name: Checkout Code
         if: github.event_name != 'pull_request' || matrix.platform.run_in_pr
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Prepare
         if: github.event_name != 'pull_request' || matrix.platform.run_in_pr
         uses: ./.github/actions/prepare
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         if: github.event_name != 'pull_request' || matrix.platform.run_in_pr
       - uses: dpc/nix-installer-action@c6e05d595d5ed6d6b7c46e42409ca2a126efe13d # dpc/jj-vqymqvyntouw
         if: github.event_name != 'pull_request' || matrix.platform.run_in_pr
@@ -369,6 +379,8 @@ jobs:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
+      - uses: ./.github/actions/pin-nix-flake-inputs
+        if: github.event_name != 'pull_request' || matrix.platform.run_in_pr
 
       - name: Build ${{ matrix.container.name }} container for ${{ matrix.platform.arch }}
         if: github.event_name != 'pull_request' || matrix.platform.run_in_pr
@@ -382,7 +394,7 @@ jobs:
 
       - name: Login to Docker Hub
         if: (github.ref_type == 'tag' || startsWith(github.ref, 'refs/heads/releases/')) && (github.event_name != 'pull_request' || matrix.platform.run_in_pr)
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: fedimint
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
@@ -412,11 +424,11 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout Code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Prepare
         uses: ./.github/actions/prepare
       - name: Login to Docker Hub
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: fedimint
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
@@ -516,13 +528,14 @@ jobs:
         Please report any issues you encounter.
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dpc/nix-installer-action@c6e05d595d5ed6d6b7c46e42409ca2a126efe13d # dpc/jj-vqymqvyntouw
       - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
+      - uses: ./.github/actions/pin-nix-flake-inputs
 
       - name: Set BUILD_ID to tag or commit hash
         run: |
@@ -656,7 +669,7 @@ jobs:
           path: "bins/**"
 
       - name: Release Binaries
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: "bins/**"
@@ -694,7 +707,7 @@ jobs:
 
       - name: Release DEB packages
         if: startsWith(github.ref, 'refs/tags/') && matrix.platform.build-deb
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           files: "debs/**.deb"
           prerelease: ${{ env.IS_PRERELEASE }}
@@ -709,7 +722,7 @@ jobs:
 
       - name: Release RPM packages
         if: startsWith(github.ref, 'refs/tags/') && matrix.platform.build-rpm
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           files: "rpms/**.rpm"
           prerelease: ${{ env.IS_PRERELEASE }}
@@ -797,17 +810,17 @@ jobs:
           cargo install --force --locked toml-cli "web-static-pack-packer@0.5.0"
           cargo install --git=https://github.com/Start9Labs/md-packer.git --branch=main
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Checkout start-os SDK
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: Start9Labs/start-os
           ref: v0.3.5.1
           submodules: recursive
       - name: Cache start-sdk
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache
         with:
           path: |
@@ -829,7 +842,7 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Checkout fedimint
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Stamp version from tag
         working-directory: fedimint-startos
         run: |
@@ -852,7 +865,7 @@ jobs:
           name: fedimintd-v${{ steps.build.outputs.version }}.s9pk
           path: fedimint-startos/fedimintd-v*.s9pk
       - name: Attach to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ env.TAG_NAME }}
           files: fedimint-startos/fedimintd-v*.s9pk
@@ -899,17 +912,17 @@ jobs:
           cargo install --force --locked toml-cli "web-static-pack-packer@0.5.0"
           cargo install --git=https://github.com/Start9Labs/md-packer.git --branch=main
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Checkout start-os SDK
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: Start9Labs/start-os
           ref: v0.3.5.1
           submodules: recursive
       - name: Cache start-sdk
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cache
         with:
           path: |
@@ -931,7 +944,7 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Checkout fedimint
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Stamp version from tag
         working-directory: gatewayd-startos
         run: |
@@ -953,7 +966,7 @@ jobs:
           name: fedimint-gatewayd-v${{ steps.build.outputs.version }}.s9pk
           path: gatewayd-startos/fedimint-gatewayd-v*.s9pk
       - name: Attach to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ env.TAG_NAME }}
           files: gatewayd-startos/fedimint-gatewayd-v*.s9pk

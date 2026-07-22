@@ -100,6 +100,15 @@ pub struct DevJitFed {
 
 impl DevJitFed {
     pub fn new(process_mgr: &ProcessManager, skip_setup: bool, pre_dkg: bool) -> Result<DevJitFed> {
+        Self::new_with_pre_restore(process_mgr, skip_setup, pre_dkg, false)
+    }
+
+    pub fn new_with_pre_restore(
+        process_mgr: &ProcessManager,
+        skip_setup: bool,
+        pre_dkg: bool,
+        pre_restore: bool,
+    ) -> Result<DevJitFed> {
         let fed_size = process_mgr.globals.FM_FED_SIZE;
         let offline_nodes = process_mgr.globals.FM_OFFLINE_NODES;
         anyhow::ensure!(
@@ -157,6 +166,7 @@ impl DevJitFed {
                     bitcoind,
                     skip_setup,
                     pre_dkg,
+                    pre_restore,
                     0,
                     "default".to_string(),
                 )
@@ -457,6 +467,7 @@ impl DevJitFed {
         );
 
         if !self.pre_dkg && !self.skip_setup {
+            let _ = self.gw_lnd_registered().await?;
             let _ = self.internal_client_gw_registered().await?;
         }
         let _ = self.channel_opened.get_try().await?;

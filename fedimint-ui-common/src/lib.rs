@@ -26,14 +26,19 @@ pub struct UiState<T> {
     pub api: T,
     pub auth_cookie_name: String,
     pub auth_cookie_value: String,
+    /// Whether the UI requires a password login. When `false` (passwordless
+    /// mode), the `UserAuth` extractor auto-passes and the `/login` route
+    /// should not be mounted.
+    pub requires_auth: bool,
 }
 
 impl<T> UiState<T> {
-    pub fn new(api: T) -> Self {
+    pub fn new(api: T, requires_auth: bool) -> Self {
         Self {
             api,
             auth_cookie_name: thread_rng().r#gen::<[u8; 4]>().encode_hex(),
             auth_cookie_value: thread_rng().r#gen::<[u8; 32]>().encode_hex(),
+            requires_auth,
         }
     }
 }
@@ -94,18 +99,34 @@ pub struct LoginInput {
 }
 
 pub fn single_card_layout(header: &str, content: Markup) -> Markup {
-    card_layout("col-md-8 col-lg-5 narrow-container", header, content)
+    card_layout("col-md-8 col-lg-5 narrow-container", header, content, None)
 }
 
-fn card_layout(col_class: &str, header: &str, content: Markup) -> Markup {
+/// Variant of [`single_card_layout`] that renders a version footer at the
+/// bottom of the page.
+pub fn single_card_layout_with_version(
+    header: &str,
+    content: Markup,
+    version: &str,
+    version_hash: Option<&str>,
+) -> Markup {
+    card_layout(
+        "col-md-8 col-lg-5 narrow-container",
+        header,
+        content,
+        Some(version_footer(version, version_hash)),
+    )
+}
+
+fn card_layout(col_class: &str, header: &str, content: Markup, footer: Option<Markup>) -> Markup {
     html! {
         (DOCTYPE)
         html {
             head {
                 (common_head("Fedimint"))
             }
-            body class="d-flex align-items-center min-vh-100" {
-                div class="container" {
+            body class="d-flex flex-column min-vh-100" {
+                div class="container my-auto" {
                     div class="row justify-content-center" {
                         div class=(col_class) {
                             div class="card" {
@@ -116,6 +137,9 @@ fn card_layout(col_class: &str, header: &str, content: Markup) -> Markup {
                             }
                         }
                     }
+                }
+                @if let Some(footer) = footer {
+                    (footer)
                 }
                 (connectivity_widget())
                 script src="/assets/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous" {}
@@ -172,7 +196,7 @@ pub fn login_submit_response(
     Html(login_form(Some("The password is invalid")).into_string()).into_response()
 }
 
-pub fn dashboard_layout(content: Markup, version: &str) -> Markup {
+pub fn dashboard_layout(content: Markup, version: &str, version_hash: Option<&str>) -> Markup {
     html! {
         (DOCTYPE)
         html {
@@ -182,13 +206,26 @@ pub fn dashboard_layout(content: Markup, version: &str) -> Markup {
             body {
                 div class="container" {
                     (content)
-
-                    div class="text-center mt-4 mb-3" {
-                        span class="text-muted" { "Version " (version) }
-                    }
                 }
+                (version_footer(version, version_hash))
                 (connectivity_widget())
                 script src="/assets/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous" {}
+            }
+        }
+    }
+}
+
+/// Renders the version line shown at the bottom of guardian admin pages.
+/// `version_hash` is rendered next to the version in monospace when present.
+pub fn version_footer(version: &str, version_hash: Option<&str>) -> Markup {
+    html! {
+        div class="text-center mt-4 mb-3" {
+            span class="text-muted" { "Version " (version) }
+            @if let Some(hash) = version_hash {
+                @let short_hash: String = hash.chars().take(7).collect();
+                span class="text-muted ms-2 font-monospace" style="font-size: 0.85em;" {
+                    "(" (short_hash) ")"
+                }
             }
         }
     }
@@ -220,10 +257,12 @@ pub async fn connectivity_check_handler<Api: Send + Sync + 'static>(
     State(state): State<UiState<Api>>,
     jar: CookieJar,
 ) -> Html<String> {
-    // Check auth manually — return empty fragment if not authenticated
-    let authenticated = jar
-        .get(&state.auth_cookie_name)
-        .is_some_and(|c| c.value() == state.auth_cookie_value);
+    // Check auth manually — return empty fragment if not authenticated.
+    // In passwordless mode (`!requires_auth`), this widget is always shown.
+    let authenticated = !state.requires_auth
+        || jar
+            .get(&state.auth_cookie_name)
+            .is_some_and(|c| c.value() == state.auth_cookie_value);
 
     if !authenticated {
         return Html(String::new());

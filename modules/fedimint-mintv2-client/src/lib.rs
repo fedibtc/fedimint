@@ -33,7 +33,7 @@ use fedimint_api_client::api::DynModuleApi;
 use fedimint_client::module::ClientModule;
 use fedimint_client::transaction::{
     ClientInput, ClientInputBundle, ClientInputSM, ClientOutput, ClientOutputBundle,
-    ClientOutputSM, TransactionBuilder,
+    ClientOutputSM, FeeQuote, FeeQuoteRequest, TransactionBuilder,
 };
 use fedimint_client_module::db::ClientModuleMigrationFn;
 use fedimint_client_module::module::init::{
@@ -156,7 +156,7 @@ impl ClientModuleInit for MintClientInit {
         &self,
         args: &ClientModuleRecoverArgs<Self>,
         _snapshot: Option<&NoModuleBackup>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<Amount>> {
         let mut state = if let Some(state) = args
             .db()
             .begin_transaction_nc()
@@ -175,7 +175,7 @@ impl ClientModuleInit for MintClientInit {
         };
 
         if state.next_index == state.total_items {
-            return Ok(());
+            return Ok(None);
         }
 
         let peer_selector = PeerSelector::new(args.api().all_peers().clone());
@@ -259,6 +259,13 @@ impl ClientModuleInit for MintClientInit {
             dbtx.insert_entry(&RecoveryStateKey, &state).await;
 
             if state.next_index == state.total_items {
+                // Total value of the notes reconstructed during recovery
+                let recovered_amount = state
+                    .requests
+                    .values()
+                    .map(|request| request.denomination.amount())
+                    .sum::<Amount>();
+
                 let state_machines = args
                     .context()
                     .map_dyn(vec![MintClientStateMachines::Output(
@@ -280,7 +287,7 @@ impl ClientModuleInit for MintClientInit {
 
                 dbtx.commit_tx().await;
 
-                return Ok(());
+                return Ok(Some(recovered_amount));
             }
 
             dbtx.commit_tx().await;
@@ -297,7 +304,13 @@ impl ClientModuleInit for MintClientInit {
 
         let filter = issuance::tweak_filter(args.module_root_secret());
 
-        tokio::task::spawn_blocking(move || {
+        // Only ~1/65536 random tweaks pass the filter, so grinding is
+        // CPU-bound. Pre-grind in the background and feed tweaks through a
+        // channel to keep the cost off the spend path. `send` only suspends
+        // once the channel is full, so we yield explicitly on each found tweak
+        // to keep single-threaded (wasm) runtimes responsive while the channel
+        // still has space.
+        fedimint_core::task::spawn("mintv2-tweak-grinder", async move {
             loop {
                 let tweak: [u8; 16] = thread_rng().r#gen();
 
@@ -305,9 +318,11 @@ impl ClientModuleInit for MintClientInit {
                     continue;
                 }
 
-                if tweak_sender.send_blocking(tweak).is_err() {
+                if tweak_sender.send(tweak).await.is_err() {
                     return;
                 }
+
+                fedimint_core::task::sleep(Duration::ZERO).await;
             }
         });
 
@@ -757,7 +772,7 @@ impl MintClientModule {
             .await
     }
 
-    /// Send `ECash` for the given amount. The
+    /// Send `ECash` for the given amount and return the send operation ID. The
     /// amount will be rounded up to a multiple of 512 msats which is the
     /// smallest denomination used throughout the client. If the rounded
     /// amount cannot be covered with the ecash notes in the client's
@@ -766,20 +781,36 @@ impl MintClientModule {
     /// before the reissue is complete in which case the reissued notes are
     /// returned to the regular balance. To cancel a successful ecash send
     /// simply receive it yourself.
-    pub async fn send(&self, amount: Amount, custom_meta: Value) -> Result<ECash, SendECashError> {
+    ///
+    /// If `include_invite` is set, the federation's invite code is embedded in
+    /// the returned ecash so a recipient that has not joined the federation can
+    /// do so directly from the received ecash.
+    pub async fn send(
+        &self,
+        amount: Amount,
+        custom_meta: Value,
+        include_invite: bool,
+    ) -> Result<(OperationId, ECash), SendECashError> {
         let amount = round_to_multiple(amount, client_denominations().next().unwrap().amount());
 
-        if let Some(ecash) = self
+        if let Some((operation_id, ecash)) = self
             .client_ctx
             .module_db()
             .autocommit(
-                |dbtx, _| Box::pin(self.send_ecash_dbtx(dbtx, amount, custom_meta.clone())),
+                |dbtx, _| {
+                    Box::pin(self.send_ecash_dbtx(
+                        dbtx,
+                        amount,
+                        custom_meta.clone(),
+                        include_invite,
+                    ))
+                },
                 Some(100),
             )
             .await
             .expect("Failed to commit dbtx after 100 retries")
         {
-            return Ok(ecash);
+            return Ok((operation_id, ecash));
         }
 
         self.client_ctx
@@ -817,42 +848,31 @@ impl MintClientModule {
                 .map_err(|_| SendECashError::Failure)?;
         }
 
-        Box::pin(self.send(amount, custom_meta)).await
+        Box::pin(self.send(amount, custom_meta, include_invite)).await
     }
 
     async fn send_ecash_dbtx(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
-        mut remaining_amount: Amount,
+        remaining_amount: Amount,
         custom_meta: Value,
-    ) -> Result<Option<ECash>, Infallible> {
-        let mut stream = dbtx
-            .find_by_prefix_sorted_descending(&SpendableNotePrefix)
-            .await
-            .map(|entry| entry.0.0);
-
-        let mut notes = vec![];
-
-        while let Some(spendable_note) = stream.next().await {
-            remaining_amount = match remaining_amount.checked_sub(spendable_note.amount()) {
-                Some(amount) => amount,
-                None => continue,
-            };
-
-            notes.push(spendable_note);
-        }
-
-        drop(stream);
-
-        if remaining_amount != Amount::ZERO {
+        include_invite: bool,
+    ) -> Result<Option<(OperationId, ECash)>, Infallible> {
+        let Some(notes) = Self::select_exact_change(&mut dbtx.to_ref_nc(), remaining_amount).await
+        else {
             return Ok(None);
-        }
+        };
 
         for spendable_note in &notes {
             self.remove_spendable_note(dbtx, spendable_note).await;
         }
 
-        let ecash = ECash::new(self.federation_id, notes);
+        let ecash = if include_invite {
+            let invite = self.client_ctx.get_invite_code().await;
+            ECash::new_with_invite(notes, &invite)
+        } else {
+            ECash::new(self.federation_id, notes)
+        };
         let amount = ecash.amount();
         let operation_id = OperationId::new_random();
 
@@ -882,7 +902,7 @@ impl MintClientModule {
         let sender = self.balance_update_sender.clone();
         dbtx.on_commit(move || sender.send_replace(()));
 
-        Ok(Some(ecash))
+        Ok(Some((operation_id, ecash)))
     }
 
     /// Receive the `ECash` by reissuing the notes and return the total amount
@@ -946,24 +966,165 @@ impl MintClientModule {
         Ok(operation_id)
     }
 
+    /// Computes the exact fee a `receive(ecash)` would incur given the client's
+    /// current note inventory, without submitting anything.
+    ///
+    /// This runs the same change generation the real receive does
+    /// (`create_final_inputs_and_outputs`, including funding selection and
+    /// rebalancing) against a non-committable transaction that is dropped
+    /// rather than committed, so the client's notes are read but left
+    /// untouched. The quote is point-in-time: it depends on the current
+    /// inventory and can move as notes change.
+    pub async fn receive_fee_quote(&self, ecash: &ECash) -> anyhow::Result<FeeQuote> {
+        // A receive submits the ecash notes as explicit inputs and no explicit
+        // outputs; the shared, module-agnostic fee quote runs the primary-module
+        // balancing (rebalancing + minting change) over the real inventory.
+        let notes = ecash.notes();
+        let input_amount: Amount = notes.iter().map(SpendableNote::amount).sum();
+        let input_fee: Amount = notes
+            .iter()
+            .map(|note| self.cfg.fee_consensus.fee(note.amount()))
+            .sum();
+
+        self.client_ctx
+            .fee_quote(
+                OperationId::new_random(),
+                FeeQuoteRequest {
+                    input_amount: Amounts::new_custom(self.cfg.amount_unit, input_amount),
+                    output_amount: Amounts::ZERO,
+                    input_fee: Amounts::new_custom(self.cfg.amount_unit, input_fee),
+                    output_fee: Amounts::ZERO,
+                },
+            )
+            .await
+    }
+
+    /// Computes the fee a `send(amount)` would incur given the client's current
+    /// note inventory, without sending anything.
+    ///
+    /// A send is free when the client's existing notes can cover the (rounded)
+    /// amount exactly — it just hands those notes out. Otherwise the send first
+    /// reissues itself the right denominations, and that self-reissue
+    /// transaction is the only thing a send ever pays a fee for. This quote
+    /// mirrors that: it returns [`FeeQuote::ZERO`] when exact change is
+    /// available, and otherwise quotes the reissue the same way the real send
+    /// submits it (explicit outputs `represent_amount(amount)`, no explicit
+    /// inputs) via the shared, module-agnostic fee quote over the real
+    /// inventory. The quote is point-in-time: it depends on the current
+    /// inventory and can move as notes change.
+    pub async fn send_fee_quote(&self, amount: Amount) -> anyhow::Result<FeeQuote> {
+        let amount = round_to_multiple(amount, client_denominations().next().unwrap().amount());
+
+        // Exact-change path: handing out existing notes never costs a fee.
+        if self.can_make_exact_change(amount).await {
+            return Ok(FeeQuote::ZERO);
+        }
+
+        // Reissue path: the send mints itself `represent_amount(amount)` as
+        // explicit outputs (no explicit inputs) and the primary module funds and
+        // balances it. Quote that exact transaction.
+        let denominations = represent_amount(amount);
+        let output_amount: Amount = denominations.iter().map(|d| d.amount()).sum();
+        let output_fee: Amount = denominations
+            .iter()
+            .map(|d| self.cfg.fee_consensus.fee(d.amount()))
+            .sum();
+
+        self.client_ctx
+            .fee_quote(
+                OperationId::new_random(),
+                FeeQuoteRequest {
+                    input_amount: Amounts::ZERO,
+                    output_amount: Amounts::new_custom(self.cfg.amount_unit, output_amount),
+                    input_fee: Amounts::ZERO,
+                    output_fee: Amounts::new_custom(self.cfg.amount_unit, output_fee),
+                },
+            )
+            .await
+    }
+
+    /// Returns whether the client's current notes can be handed out to cover
+    /// `amount` exactly — the free path in [`Self::send`] — without modifying
+    /// the inventory. Shares its greedy selection with
+    /// [`Self::send_ecash_dbtx`] via [`Self::select_exact_change`].
+    async fn can_make_exact_change(&self, remaining_amount: Amount) -> bool {
+        let mut dbtx = self.client_ctx.module_db().begin_transaction_nc().await;
+
+        Self::select_exact_change(&mut dbtx, remaining_amount)
+            .await
+            .is_some()
+    }
+
+    /// Greedily selects spendable notes (largest-first) summing to *exactly*
+    /// `remaining_amount`, or `None` if the inventory can't make exact change.
+    /// Reads the DB but does not modify it. Single source of truth for the free
+    /// (hand-out-existing-notes) selection shared by [`Self::send_ecash_dbtx`]
+    /// and [`Self::can_make_exact_change`].
+    async fn select_exact_change(
+        dbtx: &mut DatabaseTransaction<'_>,
+        mut remaining_amount: Amount,
+    ) -> Option<Vec<SpendableNote>> {
+        let mut stream = dbtx
+            .find_by_prefix_sorted_descending(&SpendableNotePrefix)
+            .await
+            .map(|entry| entry.0.0);
+
+        let mut notes = vec![];
+
+        while let Some(spendable_note) = stream.next().await {
+            remaining_amount = match remaining_amount.checked_sub(spendable_note.amount()) {
+                Some(amount) => amount,
+                None => continue,
+            };
+
+            notes.push(spendable_note);
+
+            if remaining_amount == Amount::ZERO {
+                break;
+            }
+        }
+
+        (remaining_amount == Amount::ZERO).then_some(notes)
+    }
+
     /// Await the final state of the receive operation.
     pub async fn await_final_receive_operation_state(
         &self,
         operation_id: OperationId,
-    ) -> FinalReceiveOperationState {
+    ) -> anyhow::Result<FinalReceiveOperationState> {
+        let operation = self.client_ctx.get_operation(operation_id).await?;
         let mut stream = self.notifier.subscribe(operation_id).await;
 
-        loop {
-            let Some(MintClientStateMachines::Receive(state)) = stream.next().await else {
-                continue;
-            };
+        let mut stream = self
+            .client_ctx
+            .outcome_or_updates(operation, operation_id, move || {
+                async_stream::stream! {
+                    loop {
+                        if let Some(MintClientStateMachines::Receive(state)) = stream.next().await {
+                            match state.state {
+                                ReceiveSMState::Pending => {}
+                                ReceiveSMState::Success => {
+                                    yield FinalReceiveOperationState::Success;
+                                    return;
+                                }
+                                ReceiveSMState::Rejected(..) => {
+                                    yield FinalReceiveOperationState::Rejected;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .into_stream();
 
-            match state.state {
-                ReceiveSMState::Pending => {}
-                ReceiveSMState::Success => return FinalReceiveOperationState::Success,
-                ReceiveSMState::Rejected(..) => return FinalReceiveOperationState::Rejected,
-            }
+        let mut final_state = None;
+
+        while let Some(state) = stream.next().await {
+            final_state = Some(state);
         }
+
+        Ok(final_state.expect("Stream contains one final state"))
     }
 
     async fn remove_spendable_note(

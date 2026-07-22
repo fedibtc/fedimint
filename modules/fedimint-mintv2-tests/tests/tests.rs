@@ -4,17 +4,18 @@ use anyhow::ensure;
 use async_stream::stream;
 use fedimint_client::secret::{PlainRootSecretStrategy, RootSecretStrategy};
 use fedimint_client::transaction::TransactionBuilder;
-use fedimint_client::{ClientHandleArc, RootSecret};
+use fedimint_client::{ClientHandleArc, ModuleRecoveryCompleted, RootSecret};
 use fedimint_core::Amount;
 use fedimint_core::base32::{self, FEDIMINT_PREFIX};
 use fedimint_core::core::OperationId;
 use fedimint_core::db::mem_impl::MemDatabase;
+use fedimint_core::module::Amounts;
 use fedimint_dummy_client::{DummyClientInit, DummyClientModule};
 use fedimint_dummy_server::DummyInit;
 use fedimint_eventlog::{Event, EventLogEntry, EventLogId};
 use fedimint_mintv2_client::{
-    ECash, FinalReceiveOperationState, MintClientInit, MintClientModule, ReceivePaymentEvent,
-    ReceivePaymentStatus, ReceivePaymentUpdateEvent, SendPaymentEvent,
+    ECash, FinalReceiveOperationState, MintClientInit, MintClientModule, MintOperationMeta,
+    ReceivePaymentEvent, ReceivePaymentStatus, ReceivePaymentUpdateEvent, SendPaymentEvent,
 };
 use fedimint_mintv2_common::KIND;
 use fedimint_mintv2_server::MintInit;
@@ -127,18 +128,32 @@ async fn send_and_receive() -> anyhow::Result<()> {
     for i in 0..10 {
         tracing::info!("Sending ecash payment {i} of 10");
 
-        let ecash = client_send
+        // Exercise both with and without the optional invite code.
+        let include_invite = i % 2 == 0;
+
+        let (operation_id, ecash) = client_send
             .get_first_module::<MintClientModule>()?
-            .send(Amount::from_sats(1_000), Value::Null)
+            .send(Amount::from_sats(1_000), Value::Null, include_invite)
             .await?;
 
-        let Some(MintEvent::Send(_)) = send_events.next().await else {
+        let Some(MintEvent::Send(send)) = send_events.next().await else {
             panic!("Expected Send event");
         };
+        assert_eq!(send.operation_id, operation_id);
 
         let ecash = base32::encode_prefixed(FEDIMINT_PREFIX, &ecash);
 
         let ecash: ECash = base32::decode_prefixed(FEDIMINT_PREFIX, &ecash).unwrap();
+
+        // When requested, the sender embeds the federation invite code so a
+        // recipient can join the issuing federation directly from the received
+        // ecash. Otherwise no invite is present.
+        assert_eq!(
+            ecash
+                .federation_invite()
+                .map(|invite| invite.federation_id()),
+            include_invite.then(|| client_send.federation_id()),
+        );
 
         let operation_id = client_receive
             .get_first_module::<MintClientModule>()?
@@ -148,7 +163,7 @@ async fn send_and_receive() -> anyhow::Result<()> {
         let state = client_receive
             .get_first_module::<MintClientModule>()?
             .await_final_receive_operation_state(operation_id)
-            .await;
+            .await?;
 
         assert_eq!(state, FinalReceiveOperationState::Success);
 
@@ -172,6 +187,164 @@ async fn send_and_receive() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn receive_fee_quote_matches_actual_fee() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+
+    let client_send = fed
+        .join_client_with_db(MemDatabase::new().into(), root_secret(&SEND_SK))
+        .await;
+    let client_receive = fed
+        .join_client_with_db(MemDatabase::new().into(), root_secret(&RECEIVE_SK))
+        .await;
+
+    issue_ecash(&client_send, Amount::from_sats(11_000)).await?;
+
+    // Receive several times so the receiver's note inventory — and therefore the
+    // rebalance-driven fee — differs between iterations (first into an empty
+    // wallet, then into a progressively more populated one).
+    for i in 0..5 {
+        let (_operation_id, ecash) = client_send
+            .get_first_module::<MintClientModule>()?
+            .send(Amount::from_sats(1_000), Value::Null, false)
+            .await?;
+        let ecash: ECash = base32::decode_prefixed(
+            FEDIMINT_PREFIX,
+            &base32::encode_prefixed(FEDIMINT_PREFIX, &ecash),
+        )
+        .unwrap();
+
+        let mint = client_receive.get_first_module::<MintClientModule>()?;
+        let ecash_value = ecash.amount();
+
+        let quote = mint.receive_fee_quote(&ecash).await?;
+        let before = client_receive.get_balance_for_btc().await?;
+
+        let operation_id = mint.receive(ecash, Value::Null).await?;
+        let state = mint
+            .await_final_receive_operation_state(operation_id)
+            .await?;
+        ensure!(state == FinalReceiveOperationState::Success);
+
+        // The receive state machine reports `Success` once the tx is accepted,
+        // but the reissued (change) notes are credited by the output state
+        // machines. Wait for those before reading the settled balance.
+        let MintOperationMeta::Receive {
+            change_outpoint_range,
+            ..
+        } = client_receive
+            .operation_log()
+            .get_operation(operation_id)
+            .await
+            .expect("operation exists")
+            .meta::<MintOperationMeta>()
+        else {
+            panic!("expected a receive operation");
+        };
+        client_receive
+            .await_primary_bitcoin_module_outputs(
+                operation_id,
+                change_outpoint_range.into_iter().collect(),
+            )
+            .await?;
+
+        let after = client_receive.get_balance_for_btc().await?;
+        let actual_fee = ecash_value - (after - before);
+
+        ensure!(
+            quote.total() == Amounts::new_bitcoin(actual_fee),
+            "iteration {i}: quoted fee {quote:?} != actual fee {actual_fee:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_fee_quote_matches_actual_fee() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+
+    let client = fed
+        .join_client_with_db(MemDatabase::new().into(), root_secret(&SEND_SK))
+        .await;
+
+    issue_ecash(&client, Amount::from_sats(11_000)).await?;
+
+    // Send several times so the wallet's note inventory — and therefore whether a
+    // self-reissue (and its fee) is needed to reach the requested denomination —
+    // differs between iterations.
+    for i in 0..5 {
+        let mint = client.get_first_module::<MintClientModule>()?;
+
+        // Settle any pending change from the previous iteration so the quote and
+        // the send observe the same inventory.
+        client.wait_for_all_active_state_machines().await?;
+
+        let quote = mint.send_fee_quote(Amount::from_sats(1_000)).await?;
+        let before = client.get_balance_for_btc().await?;
+
+        let (_operation_id, ecash) = mint
+            .send(Amount::from_sats(1_000), Value::Null, false)
+            .await?;
+        let sent_value = ecash.amount();
+
+        // A send may trigger an internal reissue whose change notes are credited
+        // by output state machines; wait for them before reading the balance.
+        client.wait_for_all_active_state_machines().await?;
+        let after = client.get_balance_for_btc().await?;
+
+        // Value conservation: the wallet loses exactly the sent value plus the fee.
+        let actual_fee = before - after - sent_value;
+
+        ensure!(
+            quote.total() == Amounts::new_bitcoin(actual_fee),
+            "iteration {i}: quoted fee {quote:?} != actual fee {actual_fee:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Wait for and return the `amount` from the mintv2 module's
+/// `ModuleRecoveryCompleted` event in `client`'s event log.
+///
+/// `ModuleRecoveryCompleted` is a core event (its module tag is unset), so
+/// unlike `mint_event_stream` it's matched by event kind and by the mintv2
+/// `kind` carried in the payload (recovery runs for the dummy module too).
+///
+/// Blocks until the event has been ordered into the log; it is emitted as
+/// recovery finishes, so this returns shortly after `wait_for_all_recoveries`.
+async fn mintv2_recovery_completed_amount(client: &ClientHandleArc) -> Option<Amount> {
+    let mut log_rx = client.log_event_added_rx();
+    let mut next_id = EventLogId::LOG_START;
+
+    loop {
+        for entry in client.get_event_log(Some(next_id), 100).await {
+            next_id = entry.id().saturating_add(1);
+
+            if entry.as_raw().kind != ModuleRecoveryCompleted::KIND {
+                continue;
+            }
+
+            let event: ModuleRecoveryCompleted = entry
+                .as_raw()
+                .to_event()
+                .expect("recovery-completed payload must decode");
+
+            if event.kind.as_ref() == Some(&KIND) {
+                return event.amount;
+            }
+        }
+
+        log_rx
+            .changed()
+            .await
+            .expect("event log notifier stays alive while the client is running");
+    }
+}
+
 async fn test_client_recovery(
     fed: &FederationTest,
     client: &ClientHandleArc,
@@ -189,6 +362,14 @@ async fn test_client_recovery(
         .await;
 
     recovering_client.wait_for_all_recoveries().await?;
+
+    // The mintv2 module's recovery-completed event reports the total value of
+    // the notes it reconstructed, which equals the pre-recovery balance.
+    let event_amount = mintv2_recovery_completed_amount(&recovering_client).await;
+    ensure!(
+        event_amount == Some(expected_balance),
+        "recovery-completed event amount mismatch: expected {expected_balance}, got {event_amount:?}"
+    );
 
     // After recovery completes, we need to reopen the client for modules to be
     // available. This is documented behavior - see gateway's client.rs:94-97
@@ -222,14 +403,15 @@ async fn double_spend_is_rejected() -> anyhow::Result<()> {
     let mut send_events = pin!(mint_event_stream(&client_send));
     let mut receive_events = pin!(mint_event_stream(&client_receive));
 
-    let ecash = client_send
+    let (send_operation_id, ecash) = client_send
         .get_first_module::<MintClientModule>()?
-        .send(Amount::from_sats(1_000), Value::Null)
+        .send(Amount::from_sats(1_000), Value::Null, false)
         .await?;
 
-    let Some(MintEvent::Send(_)) = send_events.next().await else {
+    let Some(MintEvent::Send(send)) = send_events.next().await else {
         panic!("Expected Send event");
     };
+    assert_eq!(send.operation_id, send_operation_id);
 
     let operation_id = client_send
         .get_first_module::<MintClientModule>()?
@@ -239,7 +421,7 @@ async fn double_spend_is_rejected() -> anyhow::Result<()> {
     let state = client_send
         .get_first_module::<MintClientModule>()?
         .await_final_receive_operation_state(operation_id)
-        .await;
+        .await?;
 
     assert_eq!(state, FinalReceiveOperationState::Success);
 
@@ -262,7 +444,7 @@ async fn double_spend_is_rejected() -> anyhow::Result<()> {
     let state = client_receive
         .get_first_module::<MintClientModule>()?
         .await_final_receive_operation_state(operation_id)
-        .await;
+        .await?;
 
     assert_eq!(state, FinalReceiveOperationState::Rejected);
 
@@ -291,14 +473,15 @@ async fn transaction_with_invalid_signature_is_rejected() -> anyhow::Result<()> 
 
     let mut events = pin!(mint_event_stream(&client));
 
-    let ecash = client
+    let (operation_id, ecash) = client
         .get_first_module::<MintClientModule>()?
-        .send(Amount::from_sats(1_000), Value::Null)
+        .send(Amount::from_sats(1_000), Value::Null, false)
         .await?;
 
-    let Some(MintEvent::Send(_)) = events.next().await else {
+    let Some(MintEvent::Send(send)) = events.next().await else {
         panic!("Expected Send event");
     };
+    assert_eq!(send.operation_id, operation_id);
 
     let mut invalid_notes = ecash.notes();
 
@@ -316,7 +499,7 @@ async fn transaction_with_invalid_signature_is_rejected() -> anyhow::Result<()> 
     let state = client
         .get_first_module::<MintClientModule>()?
         .await_final_receive_operation_state(operation_id)
-        .await;
+        .await?;
 
     assert_eq!(state, FinalReceiveOperationState::Rejected);
 
@@ -341,7 +524,7 @@ async fn transaction_with_invalid_signature_is_rejected() -> anyhow::Result<()> 
     let state = client
         .get_first_module::<MintClientModule>()?
         .await_final_receive_operation_state(operation_id)
-        .await;
+        .await?;
 
     assert_eq!(state, FinalReceiveOperationState::Success);
 

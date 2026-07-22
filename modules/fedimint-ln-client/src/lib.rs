@@ -42,8 +42,8 @@ use fedimint_client_module::module::{ClientContext, ClientModule, IClientModule,
 use fedimint_client_module::oplog::UpdateStreamOrOutcome;
 use fedimint_client_module::sm::{DynState, ModuleNotifier, State, StateTransition};
 use fedimint_client_module::transaction::{
-    ClientInput, ClientInputBundle, ClientOutput, ClientOutputBundle, ClientOutputSM,
-    TransactionBuilder,
+    ClientInput, ClientInputBundle, ClientOutput, ClientOutputBundle, ClientOutputSM, FeeQuote,
+    FeeQuoteRequest, TransactionBuilder, max_affordable_send_amount,
 };
 use fedimint_client_module::{DynGlobalClientContext, sm_enum_variant_translation};
 use fedimint_core::config::FederationId;
@@ -108,8 +108,8 @@ use crate::pay::{
     LightningPayStateMachine,
 };
 use crate::receive::{
-    LightningReceiveError, LightningReceiveStateMachine, LightningReceiveStates,
-    LightningReceiveSubmittedOffer, get_incoming_contract,
+    LightningReceiveConfirmedInvoice, LightningReceiveError, LightningReceiveStateMachine,
+    LightningReceiveStates, LightningReceiveSubmittedOffer, get_incoming_contract,
 };
 use crate::recurring::RecurringPaymentCodeEntry;
 
@@ -277,7 +277,8 @@ pub use deprecated_variant_hack::LightningOperationMetaVariant;
 #[allow(deprecated)]
 mod deprecated_variant_hack {
     use super::{
-        Bolt11Invoice, Deserialize, LightningOperationMetaPay, OutPoint, Serialize, secp256k1,
+        Bolt11Invoice, Deserialize, LightningOperationMetaPay, OperationId, OutPoint, Serialize,
+        secp256k1,
     };
     use crate::recurring::ReurringPaymentReceiveMeta;
 
@@ -287,6 +288,11 @@ mod deprecated_variant_hack {
         Pay(LightningOperationMetaPay),
         Receive {
             out_point: OutPoint,
+            invoice: Bolt11Invoice,
+            gateway_id: Option<secp256k1::PublicKey>,
+        },
+        ReceiveReclaim {
+            original_operation_id: OperationId,
             invoice: Bolt11Invoice,
             gateway_id: Option<secp256k1::PublicKey>,
         },
@@ -559,6 +565,13 @@ impl ClientModule for LightningClientModule {
                         yield serde_json::to_value(state)?;
                     }
                 }
+                "reclaim_ln_receive" => {
+                    let req: ReclaimLnReceiveRequest = serde_json::from_value(payload)?;
+                    let operation_id = self.reclaim_ln_receive(req.original_operation_id).await?;
+                    yield serde_json::json!({
+                        "operation_id": operation_id,
+                    });
+                }
                 "create_bolt11_invoice_for_user_tweaked" => {
                     let req: CreateBolt11InvoiceForUserTweakedRequest = serde_json::from_value(payload)?;
                     let (op, invoice, _) = self
@@ -652,6 +665,11 @@ struct SubscribeInternalPayRequest {
 #[derive(Deserialize)]
 struct SubscribeLnReceiveRequest {
     operation_id: OperationId,
+}
+
+#[derive(Deserialize)]
+struct ReclaimLnReceiveRequest {
+    original_operation_id: OperationId,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1747,6 +1765,116 @@ impl LightningClientModule {
     }
 
     /// Receive over LN with a new invoice
+    /// Computes the federation fee receiving `amount` over Lightning would
+    /// incur, without submitting anything.
+    ///
+    /// When the incoming contract is claimed, the client submits a transaction
+    /// with a single Lightning input worth the contract amount; the primary
+    /// module balances it by minting the change credited to the wallet. This
+    /// quotes the fee of that transaction — the Lightning input fee, the mint
+    /// output fees, and any sub-denomination dust — via the shared,
+    /// module-agnostic fee quote.
+    ///
+    /// The gateway's off-chain Lightning fee is deliberately excluded: this is
+    /// only the fee of the on-federation transaction. For that reason the quote
+    /// is taken on `amount` directly (rather than the gateway-reduced contract
+    /// amount), and no gateway round-trip is needed.
+    pub async fn receive_fee_quote(&self, amount: Amount) -> anyhow::Result<FeeQuote> {
+        self.client_ctx
+            .fee_quote(
+                OperationId::new_random(),
+                FeeQuoteRequest {
+                    input_amount: Amounts::new_bitcoin(amount),
+                    output_amount: Amounts::ZERO,
+                    input_fee: Amounts::new_bitcoin(self.cfg.fee_consensus.contract_input),
+                    output_fee: Amounts::ZERO,
+                },
+            )
+            .await
+    }
+
+    /// Computes the federation fee a `pay` funding an outgoing contract worth
+    /// `amount` would incur, without submitting anything.
+    ///
+    /// When a payment is sent, the client submits a transaction with a single
+    /// Lightning output (the outgoing contract) worth `amount`; the primary
+    /// module balances it by spending ecash to fund the contract and minting
+    /// any change. This quotes the fee of that transaction — the Lightning
+    /// output fee, the mint input fees on the funding notes, any mint change
+    /// output fees, and sub-denomination dust — via the shared, module-agnostic
+    /// fee quote.
+    ///
+    /// The gateway's off-chain Lightning fee is deliberately excluded: it is
+    /// part of the contract `amount` the gateway claims, not the on-federation
+    /// transaction fee. So `amount` is the full outgoing contract value.
+    pub async fn send_fee_quote(&self, amount: Amount) -> anyhow::Result<FeeQuote> {
+        self.client_ctx
+            .fee_quote(
+                OperationId::new_random(),
+                FeeQuoteRequest {
+                    input_amount: Amounts::ZERO,
+                    output_amount: Amounts::new_bitcoin(amount),
+                    input_fee: Amounts::ZERO,
+                    output_fee: Amounts::new_bitcoin(self.cfg.fee_consensus.contract_output),
+                },
+            )
+            .await
+    }
+
+    /// Computes the largest invoice amount the client can pay in full out of
+    /// `balance`, i.e. the amount to request an invoice for in order to spend
+    /// (close to) the entire balance.
+    ///
+    /// Paying an invoice deducts two kinds of fee from the balance:
+    /// - the *gateway* routing fee, which is added on top of the invoice amount
+    ///   to form the outgoing contract (`invoice_amount + gateway.fees`), and
+    /// - the *federation* fee of funding that contract — the Lightning output
+    ///   fee, the mint input fees on the funding notes, the mint output fees on
+    ///   any change, and sub-denomination dust — as quoted by
+    ///   [`Self::send_fee_quote`].
+    ///
+    /// `balance` is the client's current Bitcoin balance (e.g. from
+    /// `Client::get_balance_for_btc`). `gateway` optionally pins the gateway to
+    /// use; pass the same [`LightningGateway`] you intend to hand to
+    /// [`Self::pay_bolt11_invoice`] so the fee schedules match. If `None`, a
+    /// registered gateway is selected at random, the same way
+    /// [`Self::get_gateway`] does for an external payment.
+    ///
+    /// The maximum payable amount is found by binary search over the real fee
+    /// quote (see [`max_affordable_send_amount`]) rather than a closed form,
+    /// because the federation fee is stepwise in the amount. The quote is
+    /// point-in-time and moves with the balance; the eventual
+    /// [`Self::pay_bolt11_invoice`] remains the source of truth and may still
+    /// fail if balance or gateway state changes in between.
+    ///
+    /// Returns an error if no gateway is available or if the balance cannot
+    /// cover even the smallest payable amount plus fees. Any LNURL
+    /// `minSendable`/`maxSendable` bounds are the caller's responsibility to
+    /// apply.
+    pub async fn spendable_amount(
+        &self,
+        balance: Amount,
+        gateway: Option<LightningGateway>,
+    ) -> anyhow::Result<Amount> {
+        let gateway = match gateway {
+            Some(gateway) => gateway,
+            None => self
+                .get_gateway(None, false)
+                .await?
+                .ok_or_else(|| anyhow!("No gateway available to send the payment"))?,
+        };
+
+        max_affordable_send_amount(
+            balance,
+            Amount::from_msats(1),
+            balance,
+            |invoice_amount: Amount| invoice_amount + gateway.fees.to_amount(&invoice_amount),
+            |contract_amount: Amount| self.send_fee_quote(contract_amount),
+        )
+        .await
+        .ok_or_else(|| anyhow!("Balance is too low to send any amount after fees"))
+    }
+
     pub async fn create_bolt11_invoice<M: Serialize + Send + Sync>(
         &self,
         amount: Amount,
@@ -1895,6 +2023,119 @@ impl LightningClientModule {
         Ok((operation_id, invoice, preimage))
     }
 
+    /// Starts a new state machine that retries claiming a previously paid
+    /// invoice.
+    ///
+    /// This is a local state-history recovery tool: it requires the client DB
+    /// to still contain a historical `SubmittedOffer` or `ConfirmedInvoice`
+    /// state for the original operation. It does not recover seed-only
+    /// restores where that local state-machine history is unavailable.
+    ///
+    /// Repeated calls start independent reclaim attempts. This is intentional:
+    /// this is a manual break-glass recovery path, and concurrent attempts race
+    /// through the normal federation transaction validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the original operation is not a reclaimable
+    /// lightning receive, if it is still active, or if the original receiving
+    /// key cannot be recovered from state history.
+    pub async fn reclaim_ln_receive(
+        &self,
+        original_operation_id: OperationId,
+    ) -> anyhow::Result<OperationId> {
+        let operation = self.client_ctx.get_operation(original_operation_id).await?;
+        let LightningOperationMeta {
+            variant,
+            extra_meta,
+        } = operation
+            .try_meta::<LightningOperationMeta>()
+            .context("Invalid lightning operation metadata")?;
+
+        let (invoice, gateway_id) = match variant {
+            LightningOperationMetaVariant::Receive {
+                invoice,
+                gateway_id,
+                ..
+            } => (invoice, gateway_id),
+            LightningOperationMetaVariant::RecurringPaymentReceive(meta) => (meta.invoice, None),
+            _ => bail!("Operation is not a reclaimable lightning receive"),
+        };
+
+        let active_states = self
+            .client_ctx
+            .get_own_operation_active_states(original_operation_id)
+            .await;
+        ensure!(
+            !active_states
+                .iter()
+                .any(|(state, _)| matches!(state, LightningClientStateMachines::Receive(_))),
+            "Cannot reclaim an active lightning receive"
+        );
+
+        let inactive_states = self
+            .client_ctx
+            .get_own_operation_inactive_states(original_operation_id)
+            .await;
+
+        let receiving_key = inactive_states
+            .iter()
+            .find_map(|(state, _)| Self::ln_receive_key_from_state(state))
+            .ok_or_else(|| {
+                anyhow!("Cannot reclaim LN receive because the original receive key is unavailable")
+            })?;
+        let db = self.client_ctx.module_db();
+        let mut dbtx = db.begin_transaction().await;
+        let reclaim_operation_id = OperationId::new_random();
+        let operation_meta = LightningOperationMeta {
+            variant: LightningOperationMetaVariant::ReceiveReclaim {
+                original_operation_id,
+                invoice: invoice.clone(),
+                gateway_id,
+            },
+            extra_meta,
+        };
+        let state = LightningClientStateMachines::Receive(LightningReceiveStateMachine {
+            operation_id: reclaim_operation_id,
+            state: LightningReceiveStates::ConfirmedInvoice(LightningReceiveConfirmedInvoice {
+                invoice,
+                receiving_key,
+            }),
+        });
+
+        self.client_ctx
+            .manual_operation_start_dbtx(
+                &mut dbtx.to_ref_nc(),
+                reclaim_operation_id,
+                LightningCommonInit::KIND.as_str(),
+                operation_meta,
+                vec![self.client_ctx.make_dyn_state(state)],
+            )
+            .await?;
+
+        dbtx.commit_tx().await;
+
+        Ok(reclaim_operation_id)
+    }
+
+    fn ln_receive_key_from_state(state: &LightningClientStateMachines) -> Option<ReceivingKey> {
+        match state {
+            LightningClientStateMachines::Receive(receive) => match &receive.state {
+                LightningReceiveStates::SubmittedOffer(submitted_offer) => {
+                    Some(submitted_offer.receiving_key)
+                }
+                LightningReceiveStates::ConfirmedInvoice(confirmed_invoice) => {
+                    Some(confirmed_invoice.receiving_key)
+                }
+                LightningReceiveStates::Canceled(_)
+                | LightningReceiveStates::Funded(_)
+                | LightningReceiveStates::Success(_) => None,
+            },
+            LightningClientStateMachines::InternalPay(_)
+            | LightningClientStateMachines::LightningPay(_) => None,
+        }
+    }
+
     #[deprecated(since = "0.7.0", note = "Use recurring payment functionality instead")]
     #[allow(deprecated)]
     pub async fn subscribe_ln_claim(
@@ -1928,18 +2169,21 @@ impl LightningClientModule {
         operation_id: OperationId,
     ) -> anyhow::Result<UpdateStreamOrOutcome<LnReceiveState>> {
         let operation = self.client_ctx.get_operation(operation_id).await?;
-        let LightningOperationMetaVariant::Receive {
-            out_point, invoice, ..
-        } = operation.meta::<LightningOperationMeta>().variant
-        else {
-            bail!("Operation is not a lightning payment")
+        let (invoice, tx_accepted_future) = match operation.meta::<LightningOperationMeta>().variant
+        {
+            LightningOperationMetaVariant::Receive {
+                out_point, invoice, ..
+            } => {
+                let tx_accepted_future = self
+                    .client_ctx
+                    .transaction_updates(operation_id)
+                    .await
+                    .await_tx_accepted(out_point.txid);
+                (invoice, Some(tx_accepted_future))
+            }
+            LightningOperationMetaVariant::ReceiveReclaim { invoice, .. } => (invoice, None),
+            _ => bail!("Operation is not a lightning receive"),
         };
-
-        let tx_accepted_future = self
-            .client_ctx
-            .transaction_updates(operation_id)
-            .await
-            .await_tx_accepted(out_point.txid);
 
         let client_ctx = self.client_ctx.clone();
 
@@ -1950,7 +2194,11 @@ impl LightningClientModule {
 
                 yield LnReceiveState::Created;
 
-                if tx_accepted_future.await.is_err() {
+                let tx_rejected = match tx_accepted_future {
+                    Some(tx_accepted_future) => tx_accepted_future.await.is_err(),
+                    None => false,
+                };
+                if tx_rejected {
                     yield LnReceiveState::Canceled { reason: LightningReceiveError::Rejected };
                     return;
                 }
@@ -1961,16 +2209,24 @@ impl LightningClientModule {
 
                         yield LnReceiveState::Funded;
 
-                        if let Ok(out_points) = self_ref.await_claim_acceptance(operation_id).await {
-                            yield LnReceiveState::AwaitingFunds;
+                        match self_ref.await_claim_acceptance(operation_id).await {
+                            Ok(out_points) => {
+                                yield LnReceiveState::AwaitingFunds;
 
-                            if client_ctx.await_primary_module_outputs(operation_id, out_points).await.is_ok() {
-                                yield LnReceiveState::Claimed;
-                                return;
+                                if client_ctx.await_primary_module_outputs(operation_id, out_points).await.is_ok() {
+                                    yield LnReceiveState::Claimed;
+                                    return;
+                                }
+
+                                // The claim transaction was accepted, but its outputs were not
+                                // confirmed by the primary module. The incoming contract is already
+                                // spent, so this is not reclaimable as a rejected claim.
+                                yield LnReceiveState::Canceled { reason: LightningReceiveError::Rejected };
+                            }
+                            Err(e) => {
+                                yield LnReceiveState::Canceled { reason: e };
                             }
                         }
-
-                        yield LnReceiveState::Canceled { reason: LightningReceiveError::Rejected };
                     }
                     Err(e) => {
                         yield LnReceiveState::Canceled { reason: e };
@@ -2290,58 +2546,93 @@ fn tweak_user_secret_key<Ctx: Verification + Signing>(
     Keypair::from_secret_key(secp, &sk_tweaked)
 }
 
+/// A payment target parsed from user input: either a bolt11 invoice or the
+/// pay parameters resolved from an LNURL/lightning address.
+#[derive(Debug, Clone)]
+pub enum PaymentInfo {
+    Bolt11(Bolt11Invoice),
+    Lnurl(lnurl::pay::PayResponse),
+}
+
+impl PaymentInfo {
+    /// Parse `info` as a bolt11 invoice, or resolve it as an LNURL/lightning
+    /// address by fetching the endpoint's pay parameters.
+    pub async fn parse(info: &str) -> anyhow::Result<Self> {
+        let info = info.trim();
+        match lightning_invoice::Bolt11Invoice::from_str(info) {
+            Ok(invoice) => {
+                debug!("Parsed parameter as bolt11 invoice: {invoice}");
+                Ok(Self::Bolt11(invoice))
+            }
+            Err(e) => {
+                let lnurl = if info.to_lowercase().starts_with("lnurl") {
+                    lnurl::lnurl::LnUrl::from_str(info)?
+                } else if info.contains('@') {
+                    lnurl::lightning_address::LightningAddress::from_str(info)?.lnurl()
+                } else {
+                    bail!("Invalid invoice or lnurl: {e:?}");
+                };
+                debug!("Parsed parameter as lnurl: {lnurl:?}");
+                let async_client = lnurl::AsyncClient::from_client(reqwest::Client::new());
+                let response = async_client.make_request(&lnurl.url).await?;
+                match response {
+                    lnurl::LnUrlResponse::LnUrlPayResponse(response) => Ok(Self::Lnurl(response)),
+                    other => {
+                        bail!("Unexpected response from lnurl: {other:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Produce the bolt11 invoice to pay: the parsed invoice itself, or one
+    /// requested from the LNURL endpoint for `amount`.
+    pub async fn get_invoice(
+        self,
+        amount: Option<Amount>,
+        lnurl_comment: Option<String>,
+    ) -> anyhow::Result<Bolt11Invoice> {
+        match self {
+            Self::Bolt11(invoice) => {
+                match (invoice.amount_milli_satoshis(), amount) {
+                    (Some(_), Some(_)) => {
+                        bail!("Amount specified in both invoice and command line")
+                    }
+                    (None, _) => {
+                        bail!("We don't support invoices without an amount")
+                    }
+                    _ => {}
+                }
+                Ok(invoice)
+            }
+            Self::Lnurl(response) => {
+                let amount = amount.context("When using a lnurl, an amount must be specified")?;
+                let async_client = lnurl::AsyncClient::from_client(reqwest::Client::new());
+                let invoice = async_client
+                    .get_invoice(&response, amount.msats, None, lnurl_comment.as_deref())
+                    .await?;
+                let invoice = Bolt11Invoice::from_str(invoice.invoice())?;
+                let invoice_amount = invoice.amount_milli_satoshis();
+                ensure!(
+                    invoice_amount == Some(amount.msats),
+                    "the amount generated by the lnurl ({invoice_amount:?}) is different from the requested amount ({amount}), try again using a different amount"
+                );
+                Ok(invoice)
+            }
+        }
+    }
+}
+
 /// Get LN invoice with given settings
 pub async fn get_invoice(
     info: &str,
     amount: Option<Amount>,
     lnurl_comment: Option<String>,
 ) -> anyhow::Result<Bolt11Invoice> {
-    let info = info.trim();
-    match lightning_invoice::Bolt11Invoice::from_str(info) {
-        Ok(invoice) => {
-            debug!("Parsed parameter as bolt11 invoice: {invoice}");
-            match (invoice.amount_milli_satoshis(), amount) {
-                (Some(_), Some(_)) => {
-                    bail!("Amount specified in both invoice and command line")
-                }
-                (None, _) => {
-                    bail!("We don't support invoices without an amount")
-                }
-                _ => {}
-            }
-            Ok(invoice)
-        }
-        Err(e) => {
-            let lnurl = if info.to_lowercase().starts_with("lnurl") {
-                lnurl::lnurl::LnUrl::from_str(info)?
-            } else if info.contains('@') {
-                lnurl::lightning_address::LightningAddress::from_str(info)?.lnurl()
-            } else {
-                bail!("Invalid invoice or lnurl: {e:?}");
-            };
-            debug!("Parsed parameter as lnurl: {lnurl:?}");
-            let amount = amount.context("When using a lnurl, an amount must be specified")?;
-            let async_client = lnurl::AsyncClient::from_client(reqwest::Client::new());
-            let response = async_client.make_request(&lnurl.url).await?;
-            match response {
-                lnurl::LnUrlResponse::LnUrlPayResponse(response) => {
-                    let invoice = async_client
-                        .get_invoice(&response, amount.msats, None, lnurl_comment.as_deref())
-                        .await?;
-                    let invoice = Bolt11Invoice::from_str(invoice.invoice())?;
-                    let invoice_amount = invoice.amount_milli_satoshis();
-                    ensure!(
-                        invoice_amount == Some(amount.msats),
-                        "the amount generated by the lnurl ({invoice_amount:?}) is different from the requested amount ({amount}), try again using a different amount"
-                    );
-                    Ok(invoice)
-                }
-                other => {
-                    bail!("Unexpected response from lnurl: {other:?}");
-                }
-            }
-        }
-    }
+    PaymentInfo::parse(info)
+        .await?
+        .get_invoice(amount, lnurl_comment)
+        .await
 }
 
 #[derive(Debug, Clone)]

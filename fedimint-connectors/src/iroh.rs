@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use anyhow::{Context, bail};
 use async_trait::async_trait;
 use fedimint_core::config::ALEPH_BFT_UNIT_BYTE_LIMIT;
 use fedimint_core::envs::{
+    FM_GW_IROH_CONNECT_OVERRIDES_PLAIN_ENV, FM_IROH_CONNECT_OVERRIDES_PLAIN_ENV,
     FM_IROH_N0_DISCOVERY_ENABLE_ENV, FM_IROH_PKARR_RESOLVER_ENABLE_ENV, is_env_var_set_opt,
     parse_kv_list_from_env,
 };
@@ -16,6 +18,7 @@ use fedimint_core::module::{
     ApiError, ApiMethod, ApiRequestErased, FEDIMINT_API_ALPN, FEDIMINT_GATEWAY_ALPN,
     IrohApiRequest, IrohGatewayRequest, IrohGatewayResponse,
 };
+use fedimint_core::net::iroh::{IROH_IDLE_TIMEOUT, IROH_KEEP_ALIVE_INTERVAL};
 
 /// The maximum number of bytes we are willing to buffer when reading an API
 /// response from an iroh QUIC stream. This must be large enough to accommodate
@@ -80,20 +83,18 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use iroh::discovery::pkarr::PkarrResolver;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, NodeAddr, NodeId, PublicKey};
-use iroh_base::ticket::NodeTicket;
-use iroh_next::Watcher as _;
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 use tokio::sync::watch;
 use tracing::{debug, trace, warn};
 
 use super::{DynGuaridianConnection, IGuardianConnection, ServerError, ServerResult};
-use crate::{Connectivity, DynGatewayConnection, IConnection, IGatewayConnection};
+use crate::{Connectivity, DynGatewayConnection, IConnection, IGatewayConnection, IrohPeerInfo};
 
 #[derive(Clone)]
 pub(crate) struct IrohConnector {
     stable: iroh::endpoint::Endpoint,
-    next: Option<iroh_next::endpoint::Endpoint>,
+    next: iroh_next::endpoint::Endpoint,
 
     /// List of overrides to use when attempting to connect to given
     /// `NodeId`
@@ -113,7 +114,7 @@ impl fmt::Debug for IrohConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IrohEndpoint")
             .field("stable-id", &self.stable.node_id())
-            .field("next-id", &self.next.as_ref().map(iroh_next::Endpoint::id))
+            .field("next-id", &self.next.id())
             .finish_non_exhaustive()
     }
 }
@@ -122,21 +123,23 @@ impl IrohConnector {
     pub async fn new(
         iroh_dns: Option<SafeUrl>,
         iroh_enable_dht: bool,
-        iroh_enable_next: bool,
         path_change: Arc<watch::Sender<u64>>,
     ) -> anyhow::Result<Self> {
-        const FM_IROH_CONNECT_OVERRIDES_ENV: &str = "FM_IROH_CONNECT_OVERRIDES";
-        const FM_GW_IROH_CONNECT_OVERRIDES_ENV: &str = "FM_GW_IROH_CONNECT_OVERRIDES";
-        let mut s =
-            Self::new_no_overrides(iroh_dns, iroh_enable_dht, iroh_enable_next, path_change)
-                .await?;
+        let mut s = Self::new_no_overrides(iroh_dns, iroh_enable_dht, path_change).await?;
 
-        for (k, v) in parse_kv_list_from_env::<_, NodeTicket>(FM_IROH_CONNECT_OVERRIDES_ENV)? {
-            s = s.with_connection_override(k, v.into());
-        }
-
-        for (k, v) in parse_kv_list_from_env::<_, NodeTicket>(FM_GW_IROH_CONNECT_OVERRIDES_ENV)? {
-            s = s.with_connection_override(k, v.into());
+        // Overrides are `<node-id>=<socket-addr>` pairs: the node id is the key
+        // and the value is a single direct address. iroh 1.0 no longer ships
+        // the `NodeTicket` format, so we keep the override wire format version
+        // agnostic and build the (legacy) `NodeAddr` from its parts. Pre-0.12
+        // binaries read the `NodeTicket`-format `FM_IROH_CONNECT_OVERRIDES`
+        // instead; devimint emits both side by side.
+        for env_var in [
+            FM_IROH_CONNECT_OVERRIDES_PLAIN_ENV,
+            FM_GW_IROH_CONNECT_OVERRIDES_PLAIN_ENV,
+        ] {
+            for (k, v) in parse_kv_list_from_env::<NodeId, SocketAddr>(env_var)? {
+                s = s.with_connection_override(k, NodeAddr::new(k).with_direct_addresses([v]));
+            }
         }
 
         Ok(s)
@@ -146,7 +149,6 @@ impl IrohConnector {
     pub async fn new_no_overrides(
         iroh_dns: Option<SafeUrl>,
         iroh_enable_dht: bool,
-        iroh_enable_next: bool,
         path_change: Arc<watch::Sender<u64>>,
     ) -> anyhow::Result<Self> {
         let endpoint_stable = Box::pin({
@@ -170,10 +172,7 @@ impl IrohConnector {
                 // installs a publisher.
                 {
                     if is_env_var_set_opt(FM_IROH_PKARR_RESOLVER_ENABLE_ENV).unwrap_or(true) {
-                        #[cfg(target_family = "wasm")]
-                        {
-                            builder = builder.add_discovery(move |_| Some(PkarrResolver::n0_dns()));
-                        }
+                        builder = builder.add_discovery(move |_| Some(PkarrResolver::n0_dns()));
                     } else {
                         warn!(
                             target: LOG_NET_IROH,
@@ -196,7 +195,10 @@ impl IrohConnector {
                     }
                 }
 
-                let endpoint = builder.bind().await?;
+                let endpoint = builder
+                    .transport_config(quic_transport_config())
+                    .bind()
+                    .await?;
                 debug!(
                     target: LOG_NET_IROH,
                     node_id = %endpoint.node_id(),
@@ -207,12 +209,11 @@ impl IrohConnector {
             }
         });
         let endpoint_next = Box::pin(async {
-            let mut builder = iroh_next::Endpoint::builder();
+            let mut builder = iroh_next::Endpoint::builder(iroh_next::endpoint::presets::Minimal);
 
             if let Some(iroh_dns) = iroh_dns.map(SafeUrl::to_unsafe) {
-                builder = builder.address_lookup(
-                    iroh_next::address_lookup::PkarrResolver::builder(iroh_dns).build(),
-                );
+                builder = builder
+                    .address_lookup(iroh_next::address_lookup::PkarrResolver::builder(iroh_dns));
             }
 
             // As a client, we don't need to register on any relays
@@ -220,19 +221,16 @@ impl IrohConnector {
 
             #[cfg(not(target_family = "wasm"))]
             if iroh_enable_dht {
-                builder =
-                    builder.address_lookup(iroh_next::address_lookup::DhtAddressLookup::builder());
+                builder = builder
+                    .address_lookup(iroh_mainline_address_lookup::DhtAddressLookup::builder());
             }
 
-            // Add only resolver services here; the iroh 0.96
-            // `.preset(presets::N0)` convenience also installs a publisher.
+            // Add only resolver services here; the iroh preset convenience also
+            // installs a publisher.
             {
-                // Resolve using HTTPS requests to our DNS server's /pkarr path in browsers
-                #[cfg(target_family = "wasm")]
-                {
-                    builder =
-                        builder.address_lookup(iroh_next::address_lookup::PkarrResolver::n0_dns());
-                }
+                // Resolve using HTTPS requests to our DNS server's /pkarr path.
+                builder =
+                    builder.address_lookup(iroh_next::address_lookup::PkarrResolver::n0_dns());
                 // Resolve using DNS queries outside browsers.
                 #[cfg(not(target_family = "wasm"))]
                 {
@@ -241,7 +239,10 @@ impl IrohConnector {
                 }
             }
 
-            let endpoint = builder.bind().await?;
+            let endpoint = builder
+                .transport_config(quic_transport_config_next())
+                .bind()
+                .await?;
             debug!(
                 target: LOG_NET_IROH,
                 node_id = %endpoint.id(),
@@ -251,12 +252,7 @@ impl IrohConnector {
             Ok(endpoint)
         });
 
-        let (endpoint_stable, endpoint_next) = if iroh_enable_next {
-            let (s, n) = tokio::try_join!(endpoint_stable, endpoint_next)?;
-            (s, Some(n))
-        } else {
-            (endpoint_stable.await?, None)
-        };
+        let (endpoint_stable, endpoint_next) = tokio::try_join!(endpoint_stable, endpoint_next)?;
 
         Ok(Self {
             stable: endpoint_stable,
@@ -329,19 +325,17 @@ impl crate::Connector for IrohConnector {
             }
         }));
 
-        if let Some(endpoint_next) = &self.next {
-            let self_clone = self.clone();
-            let endpoint_next = endpoint_next.clone();
-            futures.push(Box::pin(async move {
-                (
-                    self_clone
-                        .make_new_connection_next(&endpoint_next, node_id, connection_override)
-                        .await
-                        .map(super::IGuardianConnection::into_dyn),
-                    "next",
-                )
-            }));
-        }
+        let self_clone = self.clone();
+        let endpoint_next = self.next.clone();
+        futures.push(Box::pin(async move {
+            (
+                self_clone
+                    .make_new_connection_next(&endpoint_next, node_id, connection_override)
+                    .await
+                    .map(super::IGuardianConnection::into_dyn),
+                "next",
+            )
+        }));
 
         // Remember last error, so we have something to return if
         // neither connection works.
@@ -404,9 +398,99 @@ impl crate::Connector for IrohConnector {
             Ok(iroh::endpoint::ConnectionType::None) | Err(_) => Connectivity::Unknown,
         }
     }
+
+    async fn iroh_peer_info(
+        &self,
+        url: &SafeUrl,
+        path_timeout: Duration,
+    ) -> ServerResult<Option<IrohPeerInfo>> {
+        let node_id =
+            Self::node_id_from_url(url).map_err(|source| ServerError::InvalidPeerUrl {
+                source,
+                url: url.to_owned(),
+            })?;
+        let connection_override = self.connection_overrides.get(&node_id).cloned();
+        let _connection = self
+            .make_new_connection_stable(node_id, connection_override)
+            .await?;
+
+        let mut conn_type_watcher = self
+            .stable
+            .conn_type(node_id)
+            .map_err(ServerError::Connection)?;
+        let mut conn_type = conn_type_watcher
+            .get()
+            .unwrap_or(iroh::endpoint::ConnectionType::None);
+
+        if path_timeout > Duration::ZERO {
+            let timeout = fedimint_core::runtime::sleep(path_timeout);
+            tokio::pin!(timeout);
+
+            while !matches!(
+                conn_type,
+                iroh::endpoint::ConnectionType::Direct(_)
+                    | iroh::endpoint::ConnectionType::Mixed(..)
+            ) {
+                tokio::select! {
+                    () = &mut timeout => break,
+                    updated = conn_type_watcher.updated() => {
+                        match updated {
+                            Ok(updated) => conn_type = updated,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Some(self.iroh_peer_info_from_conn_type(node_id, conn_type)))
+    }
 }
 
 impl IrohConnector {
+    fn iroh_peer_info_from_conn_type(
+        &self,
+        node_id: NodeId,
+        conn_type: iroh::endpoint::ConnectionType,
+    ) -> IrohPeerInfo {
+        let remote_info = self.stable.remote_info(node_id);
+
+        let direct_addr = match &conn_type {
+            iroh::endpoint::ConnectionType::Direct(addr)
+            | iroh::endpoint::ConnectionType::Mixed(addr, _) => Some(*addr),
+            iroh::endpoint::ConnectionType::Relay(_) | iroh::endpoint::ConnectionType::None => None,
+        };
+
+        let mut known_direct_addrs = remote_info
+            .as_ref()
+            .map(|info| {
+                info.addrs
+                    .iter()
+                    .map(|addr_info| addr_info.addr)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(direct_addr) = direct_addr {
+            known_direct_addrs.insert(direct_addr);
+        }
+
+        let relay_url = match &conn_type {
+            iroh::endpoint::ConnectionType::Relay(relay_url)
+            | iroh::endpoint::ConnectionType::Mixed(_, relay_url) => Some(relay_url.to_string()),
+            iroh::endpoint::ConnectionType::Direct(_) | iroh::endpoint::ConnectionType::None => {
+                remote_info.and_then(|info| info.relay_url.map(|relay| relay.relay_url.to_string()))
+            }
+        };
+
+        IrohPeerInfo {
+            node_id: node_id.to_string(),
+            connectivity: connectivity_from_iroh_conn_type(&conn_type),
+            direct_addr,
+            known_direct_addrs: known_direct_addrs.into_iter().collect(),
+            relay_url,
+        }
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn spawn_connection_monitoring_stable(
         endpoint: &Endpoint,
@@ -433,12 +517,14 @@ impl IrohConnector {
         node_id: iroh_next::EndpointId,
         path_change: Arc<watch::Sender<u64>>,
     ) {
-        let mut paths_watcher = conn.paths();
+        let conn = conn.clone();
         #[allow(clippy::let_underscore_future)]
         let _ = spawn("iroh connection (next)", async move {
-            let paths = paths_watcher.get();
-            debug!(target: LOG_NET_IROH, %node_id, ?paths, "Connection paths (initial)");
-            while let Ok(paths) = paths_watcher.updated().await {
+            let mut paths = conn.paths_stream();
+            if let Some(paths) = paths.next().await {
+                debug!(target: LOG_NET_IROH, %node_id, ?paths, "Connection paths (initial)");
+            }
+            while let Some(paths) = paths.next().await {
                 debug!(target: LOG_NET_IROH, %node_id, ?paths, "Connection paths changed");
                 path_change.send_modify(|c| *c = c.wrapping_add(1));
             }
@@ -514,6 +600,41 @@ impl IrohConnector {
         .map_err(ServerError::Connection)?;
 
         Ok(conn)
+    }
+}
+
+/// QUIC transport config with explicit idle timeout and keep-alive
+/// for the stable iroh endpoint.
+fn quic_transport_config() -> iroh::endpoint::TransportConfig {
+    let mut config = iroh::endpoint::TransportConfig::default();
+    config.max_idle_timeout(Some(
+        IROH_IDLE_TIMEOUT
+            .try_into()
+            .expect("idle timeout fits in IdleTimeout"),
+    ));
+    config.keep_alive_interval(Some(IROH_KEEP_ALIVE_INTERVAL));
+    config
+}
+
+/// QUIC transport config with explicit idle timeout and keep-alive
+/// for the next iroh endpoint.
+fn quic_transport_config_next() -> iroh_next::endpoint::QuicTransportConfig {
+    iroh_next::endpoint::QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            IROH_IDLE_TIMEOUT
+                .try_into()
+                .expect("idle timeout fits in IdleTimeout"),
+        ))
+        .keep_alive_interval(IROH_KEEP_ALIVE_INTERVAL)
+        .build()
+}
+
+fn connectivity_from_iroh_conn_type(conn_type: &iroh::endpoint::ConnectionType) -> Connectivity {
+    match conn_type {
+        iroh::endpoint::ConnectionType::Direct(_) => Connectivity::Direct,
+        iroh::endpoint::ConnectionType::Relay(_) => Connectivity::Relay,
+        iroh::endpoint::ConnectionType::Mixed(..) => Connectivity::Mixed,
+        iroh::endpoint::ConnectionType::None => Connectivity::Unknown,
     }
 }
 

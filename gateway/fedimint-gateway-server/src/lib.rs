@@ -73,8 +73,8 @@ use fedimint_core::{
 use fedimint_eventlog::{DBTransactionEventLogExt, EventLogId, StructuredPaymentEvents};
 use fedimint_gateway_common::{
     BackupPayload, ChainSource, CloseChannelsWithPeerRequest, CloseChannelsWithPeerResponse,
-    ConnectFedPayload, ConnectorType, CreateInvoiceForOperatorPayload, CreateOfferPayload,
-    CreateOfferResponse, DepositAddressPayload, DepositAddressRecheckPayload,
+    ConnectFedPayload, ConnectPeerRequest, ConnectorType, CreateInvoiceForOperatorPayload,
+    CreateOfferPayload, CreateOfferResponse, DepositAddressPayload, DepositAddressRecheckPayload,
     FederationBalanceInfo, FederationConfig, FederationInfo, GatewayBalances, GatewayFedConfig,
     GatewayInfo, GetInvoiceRequest, GetInvoiceResponse, LeaveFedPayload, LightningInfo,
     LightningMode, ListTransactionsPayload, ListTransactionsResponse, MnemonicResponse,
@@ -100,8 +100,8 @@ use fedimint_gwv2_client::{
 use fedimint_lightning::lnd::GatewayLndClient;
 use fedimint_lightning::{
     CreateInvoiceRequest, ILnRpcClient, InterceptPaymentRequest, InterceptPaymentResponse,
-    InvoiceDescription, LightningContext, LightningRpcError, LnRpcTracked, PayInvoiceResponse,
-    PaymentAction, RouteHtlcStream, ldk,
+    InvoiceDescription, LightningContext, LightningRpcError, LnRpcTracked, Lnv2HoldInvoiceFilter,
+    PayInvoiceResponse, PaymentAction, RouteHtlcStream, ldk,
 };
 use fedimint_ln_client::pay::PaymentData;
 use fedimint_ln_common::LightningCommonInit;
@@ -425,7 +425,12 @@ async fn withdraw_v2(
     };
 
     let operation_id = wallet_module
-        .send(address.as_unchecked().clone(), withdraw_amount, Some(fee))
+        .send(
+            address.as_unchecked().clone(),
+            withdraw_amount,
+            Some(fee),
+            serde_json::Value::Null,
+        )
         .await
         .map_err(|e| AdminGatewayError::WithdrawError {
             failure_reason: e.to_string(),
@@ -433,7 +438,10 @@ async fn withdraw_v2(
 
     let result = wallet_module
         .await_final_send_operation_state(operation_id)
-        .await;
+        .await
+        .map_err(|e| AdminGatewayError::WithdrawError {
+            failure_reason: e.to_string(),
+        })?;
 
     let fees = PegOutFees::from_amount(fee);
 
@@ -880,6 +888,16 @@ impl Gateway {
                         Ok((stream, ln_client)) => (stream, ln_client),
                         Err(err) => {
                             warn!(target: LOG_GATEWAY, err = %err.fmt_compact(), "Failed to open lightning payment stream");
+                            // `route_htlcs` may have already spawned tasks into the
+                            // subgroup before failing (e.g. the LNv1 interceptor is
+                            // spawned before LNv2 setup, which can fail). Tear the
+                            // subgroup down so no stale task keeps owning the LND HTLC
+                            // stream, which would prevent the retry from taking over and
+                            // could cause it to cancel real HTLCs after `gateway_receiver`
+                            // is dropped.
+                            if let Err(err) = payment_stream_task_group.shutdown_join_all(None).await {
+                                crit!(target: LOG_GATEWAY, err = %err.fmt_compact_anyhow(), "Lightning payment stream task group shutdown");
+                            }
                             sleep(Duration::from_secs(PAYMENT_STREAM_RETRY_SECONDS)).await;
                             continue
                         }
@@ -1563,7 +1581,13 @@ impl Gateway {
                 })?;
 
             if payload.wait {
-                match mint.await_final_receive_operation_state(operation_id).await {
+                let final_state = mint
+                    .await_final_receive_operation_state(operation_id)
+                    .await
+                    .map_err(|e| PublicGatewayError::ReceiveEcashError {
+                        failure_reason: e.to_string(),
+                    })?;
+                match final_state {
                     fedimint_mintv2_client::FinalReceiveOperationState::Success => {}
                     fedimint_mintv2_client::FinalReceiveOperationState::Rejected => {
                         return Err(PublicGatewayError::ReceiveEcashError {
@@ -1885,13 +1909,35 @@ impl Gateway {
                 lnd_tls_cert,
                 lnd_macaroon,
                 lnd_time_pref,
-            } => Box::new(GatewayLndClient::new(
-                lnd_rpc_addr,
-                lnd_tls_cert,
-                lnd_macaroon,
-                lnd_time_pref,
-                None,
-            )),
+                lnd_payment_timeout_secs,
+            } => {
+                // The LND backend uses this to ignore HOLD invoices on the
+                // shared LND node that aren't federation-bound. Returns true
+                // iff there is a registered LNv2 incoming contract for the
+                // given payment hash.
+                let gateway_db = self.gateway_db.clone();
+                let lnv2_filter: Lnv2HoldInvoiceFilter = Arc::new(move |hash| {
+                    let gateway_db = gateway_db.clone();
+                    Box::pin(async move {
+                        gateway_db
+                            .begin_transaction_nc()
+                            .await
+                            .load_registered_incoming_contract(PaymentImage::Hash(hash))
+                            .await
+                            .is_some()
+                    })
+                });
+
+                Box::new(GatewayLndClient::new(
+                    lnd_rpc_addr,
+                    lnd_tls_cert,
+                    lnd_macaroon,
+                    lnd_time_pref,
+                    lnd_payment_timeout_secs,
+                    None,
+                    lnv2_filter,
+                ))
+            }
             LightningMode::Ldk {
                 lightning_port,
                 alias,
@@ -2313,6 +2359,21 @@ impl IAdminGateway for Gateway {
         })
     }
 
+    /// Instructs the Gateway's Lightning node to connect to a peer specified by
+    /// `pubkey`.
+    async fn handle_connect_peer_msg(&self, payload: ConnectPeerRequest) -> AdminResult<()> {
+        info!(
+            target: LOG_GATEWAY,
+            pubkey = %payload.node_address.pubkey,
+            host = %payload.node_address.host_with_port(),
+            "Connecting to Lightning peer..."
+        );
+        let context = self.get_lightning_context().await?;
+        context.lnrpc.connect_peer(payload).await?;
+        info!(target: LOG_GATEWAY, "Connected to Lightning peer");
+        Ok(())
+    }
+
     /// Instructs the Gateway's Lightning node to close all channels with a peer
     /// specified by `pubkey`.
     async fn handle_close_channels_with_peer_msg(
@@ -2516,8 +2577,8 @@ impl IAdminGateway for Gateway {
                 notes: notes.to_string(),
             })
         } else if let Ok(mint_module) = client.get_first_module::<MintV2ClientModule>() {
-            let ecash = mint_module
-                .send(payload.amount, serde_json::Value::Null)
+            let (_, ecash) = mint_module
+                .send(payload.amount, serde_json::Value::Null, true)
                 .await
                 .map_err(|e| AdminGatewayError::Unexpected(e.into()))?;
 
@@ -3039,7 +3100,7 @@ impl Gateway {
             )));
         }
 
-        if payload.contract.commitment.expiration <= duration_since_epoch().as_secs() {
+        if payload.contract.commitment.expiration_or_fee <= duration_since_epoch().as_secs() {
             return Err(PublicGatewayError::LNv2(LNv2Error::IncomingPayment(
                 "The contract has already expired".to_string(),
             )));
@@ -3350,6 +3411,31 @@ impl IGatewayClientV2 for Gateway {
         }
 
         Ok(final_state)
+    }
+
+    async fn claim_payment_image(
+        &self,
+        payment_image: &PaymentImage,
+        operation_id: OperationId,
+    ) -> bool {
+        // `autocommit` retries on write-write conflicts, so concurrent claims for
+        // the same payment image are serialized: exactly one records itself as the
+        // claimer, the rest observe it and forfeit.
+        self.gateway_db
+            .autocommit(
+                |dbtx, _| {
+                    let payment_image = payment_image.clone();
+                    Box::pin(async move {
+                        let claimer = dbtx
+                            .claim_outgoing_payment_image(payment_image, operation_id)
+                            .await;
+                        Ok::<_, std::convert::Infallible>(claimer == operation_id)
+                    })
+                },
+                None,
+            )
+            .await
+            .expect("Retries until the transaction commits")
     }
 }
 

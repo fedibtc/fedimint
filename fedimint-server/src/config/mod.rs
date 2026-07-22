@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, format_err};
 use bitcoin::hashes::sha256;
@@ -11,9 +11,10 @@ pub use fedimint_core::config::{
 };
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::envs::{is_env_var_set, is_running_in_test_env};
+use fedimint_core::module::registry::ModuleRegistry;
 use fedimint_core::module::{
-    ApiAuth, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, MultiApiVersion,
-    SupportedApiVersionsSummary, SupportedCoreApiVersions,
+    ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, MultiApiVersion,
+    SupportedApiVersionsSummary, SupportedCoreApiVersions, SupportedModuleApiVersions,
 };
 use fedimint_core::net::peers::{DynP2PConnections, Recipient};
 use fedimint_core::setup_code::{PeerEndpoints, PeerSetupCode};
@@ -22,7 +23,9 @@ use fedimint_core::util::SafeUrl;
 use fedimint_core::{NumPeersExt, PeerId, secp256k1, timing};
 use fedimint_logging::LOG_NET_PEER_DKG;
 use fedimint_server_core::config::PeerHandleOpsExt as _;
-use fedimint_server_core::{ConfigGenModuleArgs, DynServerModuleInit, ServerModuleInitRegistry};
+use fedimint_server_core::{
+    ConfigGenModuleArgs, DynServerModule, DynServerModuleInit, ServerModuleInitRegistry,
+};
 use futures::future::select_all;
 use hex::{FromHex, ToHex};
 use peer_handle::PeerHandle;
@@ -81,19 +84,21 @@ impl ServerConfig {
 
     pub(crate) fn supported_api_versions_summary(
         modules: &BTreeMap<ModuleInstanceId, ServerModuleConsensusConfig>,
-        module_inits: &ServerModuleInitRegistry,
+        module_registry: &ModuleRegistry<DynServerModule>,
     ) -> SupportedApiVersionsSummary {
         SupportedApiVersionsSummary {
             core: Self::supported_api_versions(),
             modules: modules
                 .iter()
                 .map(|(&id, config)| {
+                    let module = module_registry.get_expect(id);
                     (
                         id,
-                        module_inits
-                            .get(&config.kind)
-                            .expect("missing module kind gen")
-                            .supported_api_versions(),
+                        SupportedModuleApiVersions {
+                            core_consensus: CORE_CONSENSUS_VERSION,
+                            module_consensus: config.version,
+                            api: module.supported_api_versions(),
+                        },
                     )
                 })
                 .collect(),
@@ -103,8 +108,6 @@ impl ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfigPrivate {
-    /// Secret API auth string
-    pub api_auth: ApiAuth,
     /// Optional secret key for our websocket p2p endpoint
     pub tls_key: Option<String>,
     /// Optional secret key for our iroh api endpoint
@@ -121,7 +124,8 @@ pub struct ServerConfigPrivate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encodable)]
 pub struct ServerConfigConsensus {
-    /// The version of the binary code running
+    /// The normalized `x.y.z` release version used for consensus config
+    /// checksums
     pub code_version: String,
     /// Agreed on core consensus version
     pub version: CoreConsensusVersion,
@@ -237,8 +241,6 @@ pub struct ConfigGenParams {
     pub iroh_api_sk: Option<iroh::SecretKey>,
     /// Optional secret key for our iroh p2p endpoint
     pub iroh_p2p_sk: Option<iroh::SecretKey>,
-    /// Secret API auth string
-    pub api_auth: ApiAuth,
     /// Endpoints of all servers
     pub peers: BTreeMap<PeerId, PeerSetupCode>,
     /// Guardian-defined key-value pairs that will be passed to the client
@@ -323,7 +325,7 @@ impl ServerConfig {
         code_version: String,
     ) -> Self {
         let consensus = ServerConfigConsensus {
-            code_version,
+            code_version: fedimint_core::version::release_version(&code_version).to_owned(),
             version: CORE_CONSENSUS_VERSION,
             broadcast_public_keys,
             broadcast_rounds_per_session: if is_running_in_test_env() {
@@ -353,7 +355,6 @@ impl ServerConfig {
         };
 
         let private = ServerConfigPrivate {
-            api_auth: params.api_auth.clone(),
             tls_key: params
                 .tls_key
                 .map(|key| key.secret_der().to_vec().encode_hex()),
@@ -560,7 +561,7 @@ impl ServerConfig {
                 .iter_mut()
                 .filter_map(|(p, r)| {
                     r.mark_unchanged();
-                    r.borrow().is_none().then_some((*p, r.clone()))
+                    r.borrow().connected.is_none().then_some((*p, r.clone()))
                 })
                 .collect();
 
@@ -570,8 +571,12 @@ impl ServerConfig {
 
             let disconnected_peers = pending_connection_receivers
                 .iter()
-                .map(|entry| entry.0)
-                .collect::<Vec<PeerId>>();
+                .map(|(peer, receiver)| {
+                    let last_error = receiver.borrow().last_error.clone();
+
+                    (*peer, last_error)
+                })
+                .collect::<Vec<_>>();
 
             info!(
                 target: LOG_NET_PEER_DKG,
@@ -599,10 +604,12 @@ impl ServerConfig {
             .into_iter()
             .filter(|p| *p != params.identity)
         {
-            let peer_message = connections
-                .receive_from_peer(peer)
-                .await
-                .context("Unexpected shutdown of p2p connections")?;
+            let peer_message = receive_from_peer_with_progress(
+                &connections,
+                peer,
+                "connection code checksum message",
+            )
+            .await?;
 
             if peer_message != P2PMessage::Checksum(checksum) {
                 error!(
@@ -689,10 +696,9 @@ impl ServerConfig {
             .into_iter()
             .filter(|p| *p != params.identity)
         {
-            let peer_message = connections
-                .receive_from_peer(peer)
-                .await
-                .context("Unexpected shutdown of p2p connections")?;
+            let peer_message =
+                receive_from_peer_with_progress(&connections, peer, "consensus config checksum")
+                    .await?;
 
             if peer_message != P2PMessage::Checksum(checksum) {
                 warn!(
@@ -718,6 +724,34 @@ impl ServerConfig {
         );
 
         Ok(cfg)
+    }
+}
+
+async fn receive_from_peer_with_progress(
+    connections: &DynP2PConnections<P2PMessage>,
+    peer: PeerId,
+    message_description: &'static str,
+) -> anyhow::Result<P2PMessage> {
+    let start = Instant::now();
+
+    loop {
+        select! {
+            // Cancel-safe: `receive_from_peer` is backed by
+            // `async_channel::Receiver::recv`, so dropping this future on the
+            // periodic progress-log tick does not lose messages.
+            peer_message = connections.receive_from_peer(peer) => {
+                return peer_message.context("Unexpected shutdown of p2p connections");
+            }
+            () = sleep(Duration::from_secs(10)) => {
+                info!(
+                    target: LOG_NET_PEER_DKG,
+                    %peer,
+                    message = message_description,
+                    elapsed_secs = start.elapsed().as_secs(),
+                    "Still waiting for peer message"
+                );
+            }
+        }
     }
 }
 

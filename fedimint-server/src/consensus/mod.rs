@@ -23,7 +23,9 @@ use fedimint_core::db::{Database, apply_migrations_dbtx, verify_module_db_integr
 use fedimint_core::envs::is_running_in_test_env;
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::module::registry::ModuleRegistry;
-use fedimint_core::module::{ApiEndpoint, ApiError, ApiMethod, FEDIMINT_API_ALPN, IrohApiRequest};
+use fedimint_core::module::{
+    ApiAuth, ApiEndpoint, ApiError, ApiMethod, FEDIMINT_API_ALPN, IrohApiRequest,
+};
 use fedimint_core::net::iroh::build_iroh_endpoint;
 use fedimint_core::net::peers::DynP2PConnections;
 use fedimint_core::task::{TaskGroup, sleep};
@@ -35,13 +37,13 @@ use fedimint_server_core::migration::apply_migrations_server_dbtx;
 use fedimint_server_core::{DynServerModule, ServerModuleInitRegistry};
 use futures::FutureExt;
 use iroh::Endpoint;
-use iroh::endpoint::{Incoming, RecvStream, SendStream};
+use iroh::endpoint::{Incoming, RecvStream, SendStream, VarInt};
 use jsonrpsee::RpcModule;
 use jsonrpsee::server::ServerHandle;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{ServerConfig, ServerConfigLocal};
 use crate::connection_limits::ConnectionLimits;
@@ -49,8 +51,8 @@ use crate::consensus::api::{ConsensusApi, server_endpoints};
 use crate::consensus::engine::ConsensusEngine;
 use crate::db::verify_server_db_integrity_dbtx;
 use crate::metrics::{
-    IROH_API_CONNECTION_DURATION_SECONDS, IROH_API_CONNECTIONS_ACTIVE,
-    IROH_API_REQUEST_DURATION_SECONDS,
+    IROH_API_CONNECTION_DURATION_SECONDS, IROH_API_CONNECTION_IDLE_TIMEOUT_TOTAL,
+    IROH_API_CONNECTIONS_ACTIVE, IROH_API_REQUEST_DURATION_SECONDS, IROH_API_REQUEST_RESPONSE_CODE,
 };
 use crate::net::api::announcement::get_api_urls;
 use crate::net::api::{ApiSecrets, HasApiContext};
@@ -60,9 +62,21 @@ use crate::{DashboardUiRouter, net, update_server_info_version_dbtx};
 /// How many txs can be stored in memory before blocking the API
 const TRANSACTION_BUFFER: usize = 1000;
 
+/// How long an iroh API connection may stay idle before the server closes it.
+const IROH_API_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Application-level QUIC error code for expected idle iroh API connection
+/// reaping.
+const IROH_API_CONNECTION_IDLE_TIMEOUT_ERROR_CODE: u32 = 0;
+
+/// Application-level QUIC close reason for idle iroh API connection reaping.
+const IROH_API_CONNECTION_IDLE_TIMEOUT_ERROR_REASON: &[u8] = b"idle timeout";
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     connectors: ConnectorRegistry,
+    auth_ui: Option<ApiAuth>,
+    auth_api: Option<ApiAuth>,
     connections: DynP2PConnections<P2PMessage>,
     p2p_status_receivers: P2PStatusReceivers,
     api_bind: SocketAddr,
@@ -75,10 +89,12 @@ pub async fn run(
     force_api_secrets: ApiSecrets,
     data_dir: PathBuf,
     code_version_str: String,
+    code_version_hash: String,
     dyn_server_bitcoin_rpc: DynServerBitcoinRpc,
     ui_bind: SocketAddr,
     dashboard_ui_router: DashboardUiRouter,
     db_checkpoint_retention: u64,
+    session_timeout: Duration,
     iroh_api_limits: ConnectionLimits,
 ) -> anyhow::Result<()> {
     cfg.validate_config(&cfg.local.identity, &module_init_registry)?;
@@ -187,25 +203,32 @@ pub async fn run(
         ci_status_receivers.insert(peer, ci_receiver);
     }
 
+    let supported_api_versions =
+        ServerConfig::supported_api_versions_summary(&cfg.consensus.modules, &module_registry);
+    debug!(
+        target: LOG_CONSENSUS,
+        ?supported_api_versions,
+        "Supported API versions",
+    );
+
     let consensus_api = ConsensusApi {
         cfg: cfg.clone(),
-        cfg_dir: data_dir.clone(),
         db: db.clone(),
         modules: module_registry.clone(),
         client_cfg: client_cfg.clone(),
         submission_sender: submission_sender.clone(),
         shutdown_sender,
         shutdown_receiver: shutdown_receiver.clone(),
-        supported_api_versions: ServerConfig::supported_api_versions_summary(
-            &cfg.consensus.modules,
-            &module_init_registry,
-        ),
+        supported_api_versions,
+        auth_ui,
+        auth_api,
         p2p_status_receivers,
         ci_status_receivers,
         ord_latency_receiver,
         bitcoin_rpc_connection: bitcoin_rpc_connection.clone(),
         force_api_secret: force_api_secrets.get_active(),
         code_version_str,
+        code_version_hash,
         task_group: task_group.clone(),
     };
 
@@ -309,6 +332,7 @@ pub async fn run(
         task_group: task_group.clone(),
         data_dir,
         db_checkpoint_retention,
+        session_timeout,
     }
     .run()
     .await?;
@@ -525,7 +549,34 @@ async fn handle_incoming(
     }
 
     loop {
-        let (send_stream, recv_stream) = connection.accept_bi().await?;
+        let accept_result = fedimint_core::runtime::timeout(
+            IROH_API_CONNECTION_IDLE_TIMEOUT,
+            connection.accept_bi(),
+        )
+        .await;
+
+        let (send_stream, recv_stream) = match accept_result {
+            Ok(streams) => streams?,
+            Err(_)
+                if parallel_requests_limit.available_permits()
+                    < iroh_api_max_requests_per_connection =>
+            {
+                continue;
+            }
+            Err(_) => {
+                IROH_API_CONNECTION_IDLE_TIMEOUT_TOTAL.inc();
+                tracing::debug!(
+                    target: LOG_NET_API,
+                    idle_timeout_secs = IROH_API_CONNECTION_IDLE_TIMEOUT.as_secs(),
+                    "Closing idle iroh API connection"
+                );
+                connection.close(
+                    VarInt::from_u32(IROH_API_CONNECTION_IDLE_TIMEOUT_ERROR_CODE),
+                    IROH_API_CONNECTION_IDLE_TIMEOUT_ERROR_REASON,
+                );
+                return Ok(());
+            }
+        };
 
         if parallel_requests_limit.available_permits() == 0 {
             warn!(
@@ -578,6 +629,13 @@ async fn handle_request(
     let response = await_response(consensus_api, core_api, module_api, request).await;
 
     timer.observe_duration();
+
+    let response_code = response
+        .as_ref()
+        .map_or_else(|err| err.code.to_string(), |_| "0".to_string());
+    IROH_API_REQUEST_RESPONSE_CODE
+        .with_label_values(&[method.as_str(), response_code.as_str(), "default"])
+        .inc();
 
     let response = serde_json::to_vec(&response)?;
 

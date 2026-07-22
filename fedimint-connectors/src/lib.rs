@@ -8,6 +8,7 @@ pub mod ws;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Debug};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,8 +55,6 @@ pub struct ConnectorRegistryBuilder {
     iroh_enable: bool,
     /// Override the Iroh DNS server to use
     iroh_dns: Option<SafeUrl>,
-    /// Should start the "next/unstable" Iroh stack
-    iroh_next: bool,
     /// Enable Pkarr DHT discovery
     iroh_pkarr_dht: bool,
 
@@ -140,13 +139,8 @@ impl ConnectorRegistryBuilder {
             bail!("Iroh connector not enabled");
         }
         Ok(Arc::new(
-            iroh::IrohConnector::new(
-                self.iroh_dns.clone(),
-                self.iroh_pkarr_dht,
-                self.iroh_next,
-                path_change,
-            )
-            .await?,
+            iroh::IrohConnector::new(self.iroh_dns.clone(), self.iroh_pkarr_dht, path_change)
+                .await?,
         ) as DynConnector)
     }
 
@@ -184,16 +178,16 @@ impl ConnectorRegistryBuilder {
         }
     }
 
-    pub fn iroh_next(self, enable: bool) -> Self {
+    pub fn ws_force_tor(self, enable: bool) -> Self {
         Self {
-            iroh_next: enable,
+            ws_force_tor: enable,
             ..self
         }
     }
 
-    pub fn ws_force_tor(self, enable: bool) -> Self {
+    pub fn http(self, enable: bool) -> Self {
         Self {
-            ws_force_tor: enable,
+            http_enable: enable,
             ..self
         }
     }
@@ -278,7 +272,6 @@ impl ConnectorRegistry {
             iroh_enable: true,
             iroh_dns: None,
             iroh_pkarr_dht: false,
-            iroh_next: true,
             ws_enable: true,
             ws_force_tor: false,
             http_enable: true,
@@ -294,7 +287,6 @@ impl ConnectorRegistry {
             iroh_enable: true,
             iroh_dns: None,
             iroh_pkarr_dht: true,
-            iroh_next: true,
             ws_enable: true,
             ws_force_tor: false,
             http_enable: false,
@@ -310,7 +302,6 @@ impl ConnectorRegistry {
             iroh_enable: true,
             iroh_dns: None,
             iroh_pkarr_dht: false,
-            iroh_next: false,
             ws_enable: true,
             ws_force_tor: false,
             http_enable: true,
@@ -514,6 +505,36 @@ impl ConnectorRegistry {
         }
     }
 
+    /// Return iroh-specific peer details if `url` is handled by the iroh
+    /// connector.
+    pub async fn iroh_peer_info(
+        &self,
+        url: &SafeUrl,
+        path_timeout: Duration,
+    ) -> ServerResult<Option<IrohPeerInfo>> {
+        let url = match self.inner.connection_overrides.get(url) {
+            Some(replacement) => replacement,
+            None => url,
+        };
+
+        let Some((init_fn, connector_cell)) = self.inner.connectors_lazy.get(url.scheme()) else {
+            return Ok(None);
+        };
+
+        let init_fn = init_fn.clone();
+        connector_cell
+            .get_or_try_init(|| async move { init_fn().await })
+            .await
+            .map_err(|e| {
+                ServerError::Transport(anyhow!(
+                    "Connector failed to initialize: {}",
+                    e.fmt_compact_anyhow()
+                ))
+            })?
+            .iroh_peer_info(url, path_timeout)
+            .await
+    }
+
     /// Subscribe to transport-level connectivity changes across all
     /// connectors managed by this registry.
     ///
@@ -540,6 +561,15 @@ pub trait Connector: Send + Sync + 'static + Debug {
 
     /// Report how a connection to `url` is currently reaching its peer.
     fn connectivity(&self, url: &SafeUrl) -> Connectivity;
+
+    /// Return iroh-specific peer details if this connector supports them.
+    async fn iroh_peer_info(
+        &self,
+        _url: &SafeUrl,
+        _path_timeout: Duration,
+    ) -> ServerResult<Option<IrohPeerInfo>> {
+        Ok(None)
+    }
 }
 
 /// How a connection is currently reaching its peer.
@@ -569,6 +599,16 @@ pub enum Connectivity {
 pub enum PeerStatus {
     Disconnected,
     Connected(Connectivity),
+}
+
+/// Iroh-specific reachability details for a guardian endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrohPeerInfo {
+    pub node_id: String,
+    pub connectivity: Connectivity,
+    pub direct_addr: Option<SocketAddr>,
+    pub known_direct_addrs: Vec<SocketAddr>,
+    pub relay_url: Option<String>,
 }
 
 /// Generic connection trait shared between [`IGuardianConnection`] and

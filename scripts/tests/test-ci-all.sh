@@ -94,7 +94,13 @@ export -f gw_liquidity_test
 function gw_liquidity_test_walletv2() {
   # walletv2 is not supported by older versions, so we skip for backwards-compatibility tests
   if [ -z "${FM_BACKWARDS_COMPATIBILITY_TEST:-}" ]; then
-    fm-run-test "${FUNCNAME[0]}" env FM_ENABLE_MODULE_WALLETV2=true FM_ENABLE_MODULE_WALLET=false ./scripts/tests/gateway-module-test.sh liquidity-test
+    # Keep walletv2 peg-in diagnostics visible for CI flake investigation:
+    # https://github.com/fedimint/fedimint/pull/8702
+    fm-run-test "${FUNCNAME[0]}" env \
+      RUST_LOG="fm::devimint=debug,fm::client::module::walletv2=debug,fm::module::walletv2=debug,${RUST_LOG:-}" \
+      FM_ENABLE_MODULE_WALLETV2=true \
+      FM_ENABLE_MODULE_WALLET=false \
+      ./scripts/tests/gateway-module-test.sh liquidity-test
   fi
 }
 export -f gw_liquidity_test_walletv2
@@ -151,6 +157,11 @@ function lnv2_module_payments() {
   fm-run-test "${FUNCNAME[0]}" env FM_OFFLINE_NODES=0 ./scripts/tests/lnv2-module-test.sh payments
 }
 export -f lnv2_module_payments
+
+function lnv2_module_duplicate_payment() {
+  fm-run-test "${FUNCNAME[0]}" env FM_OFFLINE_NODES=0 ./scripts/tests/lnv2-module-test.sh duplicate-payment
+}
+export -f lnv2_module_duplicate_payment
 
 function lnv2_mintv2_walletv2_lightning_payments() {
   # v2 modules are not supported by older versions, so we skip for backwards-compatibility tests
@@ -220,12 +231,6 @@ function test_client_config_change_detection() {
   fm-run-test "${FUNCNAME[0]}" env FM_OFFLINE_NODES=0 ./scripts/tests/test-client-config-change-detection.sh
 }
 export -f test_client_config_change_detection
-
-function test_guardian_password_change() {
-  # test modifies server configs and restarts, so we need to override FM_OFFLINE_NODES
-  fm-run-test "${FUNCNAME[0]}" env FM_OFFLINE_NODES=0 ./scripts/tests/test-guardian-password-change.sh
-}
-export -f test_guardian_password_change
 
 function test_admin_auth() {
   # test requires v0.11.0-alpha features, skip for backwards-compatibility tests
@@ -302,12 +307,12 @@ function bckn_bitcoind_wallet() {
     fm-run-test "${FUNCNAME[0]}_group_1" env \
       FM_TEST_ONLY=bitcoind \
       FM_BITCOIND_TEST_ONLY=wallet \
-      FM_BITCOIND_WALLET_TEST_GROUP=1 \
+      FM_WALLET_TEST_GROUP=1 \
       ./scripts/tests/backend-test.sh
     fm-run-test "${FUNCNAME[0]}_group_2" env \
       FM_TEST_ONLY=bitcoind \
       FM_BITCOIND_TEST_ONLY=wallet \
-      FM_BITCOIND_WALLET_TEST_GROUP=2 \
+      FM_WALLET_TEST_GROUP=2 \
       ./scripts/tests/backend-test.sh
   fi
 }
@@ -364,7 +369,14 @@ export -f bckn_gw_not_client
 function bckn_esplora() {
   # backend tests don't support different versions, so we skip for backwards-compatibility tests
   if [ -z "${FM_BACKWARDS_COMPATIBILITY_TEST:-}" ]; then
-    fm-run-test "${FUNCNAME[0]}" env FM_TEST_ONLY=esplora ./scripts/tests/backend-test.sh
+    fm-run-test "${FUNCNAME[0]}_group_1" env \
+      FM_TEST_ONLY=esplora \
+      FM_WALLET_TEST_GROUP=1 \
+      ./scripts/tests/backend-test.sh
+    fm-run-test "${FUNCNAME[0]}_group_2" env \
+      FM_TEST_ONLY=esplora \
+      FM_WALLET_TEST_GROUP=2 \
+      ./scripts/tests/backend-test.sh
   fi
 }
 export -f bckn_esplora
@@ -418,10 +430,12 @@ else
       # for dkg we need to use the fedimint-cli version that matches fedimintd
       if [ "$binary" == "fedimintd" ]; then
         var_name=$(nix_binary_version_var_name "fedimint-cli" "$version")
-        export "${var_name}=$(nix_build_binary_for_version "fedimint-cli" "$version")"
+        binary_path=$(nix_build_binary_for_version "fedimint-cli" "$version")
+        export "${var_name}=${binary_path}"
       fi
       var_name=$(nix_binary_version_var_name "$binary" "$version")
-      export "${var_name}=$(nix_build_binary_for_version "$binary" "$version")"
+      binary_path=$(nix_build_binary_for_version "$binary" "$version")
+      export "${var_name}=${binary_path}"
     done
   done
 
@@ -468,6 +482,7 @@ tests_to_run_in_parallel+=(
   "gw_liquidity_test_mintv2"
   "lnv2_module_gateway_registration"
   "lnv2_module_payments"
+  "lnv2_module_duplicate_payment"
   "lnv2_mintv2_walletv2_lightning_payments"
   "lnv2_module_lnurl_pay"
   "lnv2_module_lnurl_recovery"
@@ -486,7 +501,6 @@ tests_to_run_in_parallel+=(
   "cannot_replay_tx"
   "test_offline_client_initialization"
   "test_client_config_change_detection"
-  "test_guardian_password_change"
   "test_admin_auth"
   "circular_deposit"
   "wallet_recovery"
@@ -530,16 +544,18 @@ if [ -z "${CI:-}" ] && [[ -t 1 ]] && [ -z "${FM_TEST_CI_ALL_DISABLE_ETA:-}" ]; t
   parallel_args+=(--eta)
 fi
 
+default_parallel_jobs=$(($(nproc) / 3 + 1))
+
 if [ -n "${FM_TEST_CI_ALL_JOBS:-}" ]; then
   # when specifically set, use the env var
   parallel_args+=(--jobs "${FM_TEST_CI_ALL_JOBS}")
 elif [ -n "${CI:-}" ] || [ "${CARGO_PROFILE:-}" == "ci" ]; then
-  parallel_args+=(--jobs $(($(nproc) / 2 + 1)))
+  # Devimint tests are process-heavy; stay below the machine becoming too overloaded to reliably run tests.
+  parallel_args+=(--jobs "${default_parallel_jobs}")
 else
-  # on dev computers default to `num_cpus / 2 + 1` max parallel jobs
-  parallel_args+=(--jobs "${FM_TEST_CI_ALL_JOBS:-$(($(nproc) / 2 + 1))}")
+  # on dev computers default to `num_cpus / 3 + 1` max parallel jobs
+  parallel_args+=(--jobs "${default_parallel_jobs}")
 fi
-
 parallel_args+=(--timeout "${FM_TEST_CI_ALL_TIMEOUT:-360}")
 
 parallel_args+=(--load "${FM_TEST_CI_ALL_MAX_LOAD:-$(($(nproc)))}")

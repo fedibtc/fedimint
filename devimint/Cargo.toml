@@ -44,6 +44,7 @@ fs-lock = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 iroh-base = { workspace = true, features = [
+    "key",
     "ticket",
 ], default-features = false }
 itertools = { workspace = true }
@@ -54,6 +55,7 @@ semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 substring = { workspace = true }
+tar = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing"] }
 tokio-rustls = { workspace = true }
 tonic_lnd = { workspace = true }

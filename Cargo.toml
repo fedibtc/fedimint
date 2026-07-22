@@ -259,8 +259,11 @@ imbl = "5.0.0"
 impl-tools = "0.10.3"
 iroh = { version = "=0.35.0", default-features = false }
 iroh-base = { version = "=0.35.0", default-features = false }
-iroh-next = { version = "=0.96.1", default-features = false, package = "iroh" }
-iroh-next-base = { version = "=0.96.1", default-features = false, package = "iroh-base" }
+iroh-mainline-address-lookup = "0.4.0"
+iroh-next = { version = "=1.0.0", default-features = false, features = [
+    "tls-ring",
+], package = "iroh" }
+iroh-next-base = { version = "=1.0.0", default-features = false, package = "iroh-base" }
 iroh-relay = { version = "=0.35.0", default-features = false }
 itertools = "0.14.0"
 jaq-core = "2.1.1"
@@ -328,7 +331,7 @@ strum_macros = "0.27"
 substring = "1.4.5"
 subtle = "2.6.1"
 syn = "2.0"
-tar = "0.4.45"
+tar = "0.4.46"
 tbs = { package = "fedimint-tbs", path = "./crypto/tbs", version = "=0.12.0-alpha" }
 tempfile = "3.20.0"
 test-log = { version = "0.2", features = ["trace"], default-features = false }

@@ -11,7 +11,11 @@ use bitcoin::Txid;
 use clap::Subcommand;
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::envs::{FM_DISABLE_BASE_FEES_ENV, FM_ENABLE_MODULE_LNV2_ENV, is_env_var_set};
+use fedimint_core::envs::{
+    FM_DISABLE_BASE_FEES_ENV, FM_ENABLE_MODULE_LNV1_ENV, FM_ENABLE_MODULE_LNV2_ENV,
+    FM_ENABLE_MODULE_MINT_ENV, FM_ENABLE_MODULE_MINTV2_ENV, FM_ENABLE_MODULE_WALLET_ENV,
+    FM_ENABLE_MODULE_WALLETV2_ENV, is_env_var_set,
+};
 use fedimint_core::module::registry::ModuleRegistry;
 use fedimint_core::net::api_announcement::SignedApiAnnouncement;
 use fedimint_core::task::block_in_place;
@@ -28,15 +32,14 @@ use futures::future::try_join_all;
 use serde_json::json;
 use substring::Substring;
 use tokio::net::TcpStream;
-use tokio::time::timeout;
 use tokio::{fs, try_join};
 use tracing::{debug, error, info};
 
 use crate::cli::{CommonArgs, cleanup_on_exit, exec_user_command, setup};
-use crate::envs::{FM_DATA_DIR_ENV, FM_DEVIMINT_RUN_DEPRECATED_TESTS_ENV, FM_PASSWORD_ENV};
+use crate::envs::{FM_DATA_DIR_ENV, FM_DEVIMINT_RUN_DEPRECATED_TESTS_ENV};
 use crate::federation::Client;
 use crate::util::{LoadTestTool, ProcessManager, almost_equal, poll};
-use crate::version_constants::{VERSION_0_10_0_ALPHA, VERSION_0_11_0_ALPHA};
+use crate::version_constants::{VERSION_0_10_0_ALPHA, VERSION_0_11_0_ALPHA, VERSION_0_12_0_ALPHA};
 use crate::{DevFed, Gatewayd, LightningNode, Lnd, cmd, dev_fed};
 
 pub struct Stats {
@@ -345,6 +348,268 @@ pub async fn latency_tests(
     Ok(())
 }
 
+pub async fn lnurl_recovery_test(dev_fed: DevFed) -> Result<()> {
+    let DevFed {
+        fed,
+        gw_lnd,
+        recurringd,
+        ..
+    } = dev_fed;
+
+    const LNURL_AMOUNT: Amount = Amount::from_msats(500_000);
+    const PRE_RECOVERY_RECEIVES: u64 = 3;
+    const POST_RECOVERY_RECEIVES: u64 = 2;
+
+    let receiver = fed.new_joined_client("lnurl-recovery-receiver").await?;
+    if !client_has_module(&receiver, "ln").await? {
+        info!("ln module is not present, skipping LNv1 LNURL recovery test");
+        return Ok(());
+    }
+
+    let payer = fed.new_joined_client("lnurl-recovery-payer").await?;
+    fed.pegin_client(100_000, &payer).await?;
+    fed.pegin_gateways(100_000, vec![&gw_lnd]).await?;
+
+    let lnurl = register_lnv1_lnurl(&receiver, recurringd.api_url().as_str()).await?;
+
+    for invoice_idx in 1..=PRE_RECOVERY_RECEIVES {
+        pay_lnv1_lnurl(&payer, &lnurl, LNURL_AMOUNT, &gw_lnd.gateway_id).await?;
+        let operation_id = await_lnv1_lnurl_invoice(&receiver, invoice_idx).await?;
+        await_lnv1_lnurl_invoice_paid(&receiver, operation_id).await?;
+    }
+
+    let pre_recovery_balance = receiver.balance().await?;
+    let mnemonic = cmd!(receiver, "print-secret").out_json().await?["secret"]
+        .as_str()
+        .context("secret must be a string")?
+        .to_owned();
+
+    let restored = Client::create("lnurl-recovery-restored").await?;
+    restored
+        .restore_federation(fed.invite_code()?, mnemonic)
+        .await?;
+
+    poll(
+        "waiting for LNURL recovery client balance to be restored",
+        || async {
+            let restored_balance = restored.balance().await.map_err(ControlFlow::Break)?;
+            if almost_equal(restored_balance, pre_recovery_balance, 2_000).is_ok() {
+                return Ok(());
+            }
+
+            info!("Waiting for LNURL recovery client balance to be restored");
+            cmd!(restored, "dev", "wait", "1")
+                .out_json()
+                .await
+                .map_err(ControlFlow::Break)?;
+
+            Err(ControlFlow::Continue(anyhow!(
+                "LNURL recovery client balance is not restored yet"
+            )))
+        },
+    )
+    .await?;
+
+    assert!(
+        list_lnv1_lnurl_codes(&restored)
+            .await?
+            .as_object()
+            .context("codes must be an object")?
+            .is_empty(),
+        "LN module recovery should not restore recurring payment code registrations"
+    );
+
+    let restored_lnurl = register_lnv1_lnurl(&restored, recurringd.api_url().as_str()).await?;
+    assert_eq!(
+        restored_lnurl, lnurl,
+        "LNURL registration should be idempotent for a recovered deterministic root key"
+    );
+
+    let mut old_operation_ids = Vec::with_capacity(PRE_RECOVERY_RECEIVES as usize);
+    for invoice_idx in 1..=PRE_RECOVERY_RECEIVES {
+        old_operation_ids.push(await_lnv1_lnurl_invoice(&restored, invoice_idx).await?);
+    }
+
+    for operation_id in &old_operation_ids {
+        assert_lnv1_operation_has_no_outcome(&restored, *operation_id).await?;
+    }
+
+    let post_recovery_balance = restored.balance().await?;
+    let mut post_recovery_operation_ids = Vec::with_capacity(POST_RECOVERY_RECEIVES as usize);
+    for invoice_idx in PRE_RECOVERY_RECEIVES + 1..=PRE_RECOVERY_RECEIVES + POST_RECOVERY_RECEIVES {
+        pay_lnv1_lnurl(&payer, &restored_lnurl, LNURL_AMOUNT, &gw_lnd.gateway_id).await?;
+        let operation_id = await_lnv1_lnurl_invoice(&restored, invoice_idx).await?;
+        await_lnv1_lnurl_invoice_paid(&restored, operation_id).await?;
+        post_recovery_operation_ids.push(operation_id);
+    }
+
+    let expected_final_balance =
+        post_recovery_balance + LNURL_AMOUNT.msats * POST_RECOVERY_RECEIVES;
+    let final_balance = restored.balance().await?;
+    almost_equal(final_balance, expected_final_balance, 2_000).map_err(|error| {
+        anyhow!(
+            "restored client balance {final_balance} did not include post-recovery LNURL receives: {error}"
+        )
+    })?;
+
+    for operation_id in post_recovery_operation_ids {
+        assert_lnv1_recurring_receive_operation_logged(&restored, operation_id).await?;
+    }
+
+    Ok(())
+}
+
+async fn client_has_module(client: &Client, kind: &str) -> Result<bool> {
+    let modules = cmd!(client, "module").out_json().await?;
+    let modules = modules["list"]
+        .as_array()
+        .context("module list must be an array")?;
+
+    Ok(modules
+        .iter()
+        .any(|module| module["kind"].as_str() == Some(kind)))
+}
+
+async fn register_lnv1_lnurl(client: &Client, recurringd_api: &str) -> Result<String> {
+    cmd!(client, "module", "ln", "lnurl", "register", recurringd_api)
+        .out_json()
+        .await?["lnurl"]
+        .as_str()
+        .context("lnurl must be a string")
+        .map(ToOwned::to_owned)
+}
+
+async fn list_lnv1_lnurl_codes(client: &Client) -> Result<serde_json::Value> {
+    Ok(cmd!(client, "module", "ln", "lnurl", "list")
+        .out_json()
+        .await?["codes"]
+        .clone())
+}
+
+async fn pay_lnv1_lnurl(
+    client: &Client,
+    lnurl: &str,
+    amount: Amount,
+    gateway_id: &str,
+) -> Result<()> {
+    let value = cmd!(
+        client,
+        "module",
+        "ln",
+        "pay",
+        lnurl,
+        "--amount",
+        amount.msats,
+        "--gateway-id",
+        gateway_id,
+    )
+    .out_json()
+    .await?;
+    let outcome = serde_json::from_value::<LightningPaymentOutcome>(value)
+        .context("could not deserialize Lightning payment outcome")?;
+    match outcome {
+        LightningPaymentOutcome::Success { .. } => Ok(()),
+        LightningPaymentOutcome::Failure { error_message } => {
+            Err(anyhow!("failed to pay LNURL invoice: {error_message}"))
+        }
+    }
+}
+
+async fn await_lnv1_lnurl_invoice(client: &Client, invoice_idx: u64) -> Result<OperationId> {
+    poll("waiting for LNv1 LNURL invoice operation", || async {
+        cmd!(client, "dev", "wait", "1")
+            .out_json()
+            .await
+            .map_err(ControlFlow::Break)?;
+
+        let invoices = cmd!(client, "module", "ln", "lnurl", "invoices", "0")
+            .out_json()
+            .await
+            .map_err(ControlFlow::Break)?;
+        let Some(operation_id) = invoices["invoices"][invoice_idx.to_string()]["operation_id"]
+            .as_str()
+            .map(ToOwned::to_owned)
+        else {
+            return Err(ControlFlow::Continue(anyhow!(
+                "LNURL invoice index {invoice_idx} not found"
+            )));
+        };
+
+        serde_json::from_value::<OperationId>(json!(operation_id))
+            .map_err(anyhow::Error::from)
+            .map_err(ControlFlow::Break)
+    })
+    .await
+}
+
+async fn await_lnv1_lnurl_invoice_paid(client: &Client, operation_id: OperationId) -> Result<()> {
+    cmd!(
+        client,
+        "module",
+        "ln",
+        "lnurl",
+        "await-invoice-paid",
+        operation_id.fmt_full()
+    )
+    .run()
+    .await
+}
+
+async fn assert_lnv1_operation_has_no_outcome(
+    client: &Client,
+    operation_id: OperationId,
+) -> Result<()> {
+    let operation = get_lnv1_operation_from_log(client, operation_id).await?;
+
+    assert_eq!(
+        operation["operation_kind"].as_str(),
+        Some("ln"),
+        "replayed LNURL invoice operation must be an ln operation"
+    );
+    assert!(
+        operation.get("outcome").is_none(),
+        "replayed pre-recovery LNURL invoice operation should not have a terminal outcome"
+    );
+
+    Ok(())
+}
+
+async fn assert_lnv1_recurring_receive_operation_logged(
+    client: &Client,
+    operation_id: OperationId,
+) -> Result<()> {
+    let operation = get_lnv1_operation_from_log(client, operation_id).await?;
+
+    assert_eq!(
+        operation["operation_kind"].as_str(),
+        Some("ln"),
+        "post-recovery LNURL invoice operation must be an ln operation"
+    );
+    assert!(
+        operation["operation_meta"]["variant"]["recurring_payment_receive"].is_object(),
+        "post-recovery LNURL receive must be logged as recurring_payment_receive"
+    );
+
+    Ok(())
+}
+
+async fn get_lnv1_operation_from_log(
+    client: &Client,
+    operation_id: OperationId,
+) -> Result<serde_json::Value> {
+    let operation_id = operation_id.fmt_full().to_string();
+    let operations = cmd!(client, "list-operations", "--limit", "100")
+        .out_json()
+        .await?;
+    operations["operations"]
+        .as_array()
+        .context("operations must be an array")?
+        .iter()
+        .find(|operation| operation["id"].as_str() == Some(operation_id.as_str()))
+        .cloned()
+        .with_context(|| format!("operation {operation_id} not found"))
+}
+
 #[allow(clippy::struct_field_names)]
 /// Clients reused for upgrade tests
 pub struct UpgradeClients {
@@ -578,8 +843,6 @@ pub async fn upgrade_tests(process_mgr: &ProcessManager, binary: UpgradeTest) ->
 
 pub async fn cli_tests(dev_fed: DevFed) -> Result<()> {
     log_binary_versions().await?;
-    let data_dir = env::var(FM_DATA_DIR_ENV)?;
-
     let DevFed {
         bitcoind,
         lnd,
@@ -593,52 +856,6 @@ pub async fn cli_tests(dev_fed: DevFed) -> Result<()> {
 
     let client = fed.new_joined_client("cli-tests-client").await?;
     let lnd_gw_id = gw_lnd.gateway_id.clone();
-
-    cmd!(
-        client,
-        "dev",
-        "config-decrypt",
-        "--in-file={data_dir}/fedimintd-default-0/private.encrypt",
-        "--out-file={data_dir}/fedimintd-default-0/config-plaintext.json"
-    )
-    .env(FM_PASSWORD_ENV, "pass")
-    .run()
-    .await?;
-
-    cmd!(
-        client,
-        "dev",
-        "config-encrypt",
-        "--in-file={data_dir}/fedimintd-default-0/config-plaintext.json",
-        "--out-file={data_dir}/fedimintd-default-0/config-2"
-    )
-    .env(FM_PASSWORD_ENV, "pass-foo")
-    .run()
-    .await?;
-
-    cmd!(
-        client,
-        "dev",
-        "config-decrypt",
-        "--in-file={data_dir}/fedimintd-default-0/config-2",
-        "--out-file={data_dir}/fedimintd-default-0/config-plaintext-2.json"
-    )
-    .env(FM_PASSWORD_ENV, "pass-foo")
-    .run()
-    .await?;
-
-    let plaintext_one = fs::read_to_string(format!(
-        "{data_dir}/fedimintd-default-0/config-plaintext.json"
-    ))
-    .await?;
-    let plaintext_two = fs::read_to_string(format!(
-        "{data_dir}/fedimintd-default-0/config-plaintext-2.json"
-    ))
-    .await?;
-    anyhow::ensure!(
-        plaintext_one == plaintext_two,
-        "config-decrypt/encrypt failed"
-    );
 
     fed.pegin_gateways(10_000_000, vec![&gw_lnd]).await?;
 
@@ -1083,8 +1300,14 @@ pub async fn cli_tests(dev_fed: DevFed) -> Result<()> {
 }
 
 pub async fn guardian_metadata_tests(dev_fed: DevFed) -> Result<()> {
+    use fedimint_api_client::api::{DynGlobalApi, FederationApiExt};
+    use fedimint_connectors::ConnectorRegistry;
     use fedimint_core::PeerId;
+    use fedimint_core::endpoint_constants::INVITE_CODE_ENDPOINT;
+    use fedimint_core::invite_code::InviteCode;
+    use fedimint_core::module::ApiRequestErased;
     use fedimint_core::net::guardian_metadata::SignedGuardianMetadata;
+    use fedimint_core::util::SafeUrl;
 
     log_binary_versions().await?;
 
@@ -1194,6 +1417,40 @@ pub async fn guardian_metadata_tests(dev_fed: DevFed) -> Result<()> {
     assert_eq!(
         metadata.pkarr_id_z32, TEST_PKARR_ID,
         "Pkarr ID did not propagate correctly"
+    );
+
+    // `invite_code` only honors overridden API URLs since 0.12.0-alpha; skip
+    // against older fedimintd in backwards-compatibility tests.
+    if fedimintd_version < *VERSION_0_12_0_ALPHA {
+        info!("Skipping invite_code endpoint assertion: fedimintd < 0.12.0-alpha");
+        return Ok(());
+    }
+
+    info!("Checking invite_code endpoint reflects overridden guardian metadata URL...");
+    // Query peer 0 directly: the client's peer-URL map now points at the fake
+    // override URL, so `dev api --peer-id 0` would fail to connect.
+    let peer_id = PeerId::from(0);
+    let peer0_real_url: SafeUrl = fed
+        .vars
+        .get(&0)
+        .expect("peer 0 vars must exist")
+        .FM_API_URL
+        .parse()
+        .expect("FM_API_URL must be a valid SafeUrl");
+    let connectors = ConnectorRegistry::build_from_testing_env()?.bind().await?;
+    let admin_api = DynGlobalApi::new_admin(connectors, peer_id, peer0_real_url, None)?;
+    let invite: InviteCode = admin_api
+        .request_single_peer(
+            INVITE_CODE_ENDPOINT.to_string(),
+            ApiRequestErased::default(),
+            peer_id,
+        )
+        .await
+        .expect("invite_code RPC request should succeed");
+    assert_eq!(
+        invite.url().to_string(),
+        TEST_API_URL,
+        "invite_code endpoint did not reflect overridden guardian metadata URL"
     );
 
     Ok(())
@@ -1642,20 +1899,42 @@ async fn lnv2_send(client: &Client, gateway: &String, invoice: &String) -> anyho
         .await?,
     )?;
 
-    assert_eq!(
-        cmd!(
-            client,
-            "module",
-            "lnv2",
-            "await-send",
-            serde_json::to_string(&send_op)?.substring(1, 65)
-        )
-        .out_json()
-        .await?,
-        serde_json::to_value(FinalSendOperationState::Success).expect("JSON serialization failed"),
+    let send_state = lnv2_await_send(client, send_op).await?;
+    assert!(
+        matches!(send_state, FinalSendOperationState::Success(_)),
+        "unexpected send state: {send_state:?}"
     );
 
     Ok(())
+}
+
+/// Run `await-send` and parse the JSON, tolerating the pre-0.12 CLI output
+/// shape so this works across the backwards-compatibility test matrix.
+///
+/// Pre-0.12 binaries serialize `FinalSendOperationState::Success` as the bare
+/// string `"Success"` (unit variant); 0.12+ serializes it as `{"Success":
+/// "<hex preimage>"}` (tuple variant carrying the preimage). Coerce the old
+/// shape to a synthetic `Success(zero-preimage)` so callers can match
+/// uniformly regardless of which CLI produced the output.
+async fn lnv2_await_send(
+    client: &Client,
+    send_op: OperationId,
+) -> anyhow::Result<FinalSendOperationState> {
+    let raw = cmd!(
+        client,
+        "module",
+        "lnv2",
+        "await-send",
+        serde_json::to_string(&send_op)?.substring(1, 65)
+    )
+    .out_json()
+    .await?;
+
+    Ok(if raw.as_str() == Some("Success") {
+        FinalSendOperationState::Success([0; 32])
+    } else {
+        serde_json::from_value(raw)?
+    })
 }
 
 pub async fn reconnect_test(dev_fed: DevFed, process_mgr: &ProcessManager) -> Result<()> {
@@ -1779,7 +2058,6 @@ pub async fn recoverytool_test(dev_fed: DevFed) -> Result<()> {
         "--db",
         "{data_dir}/fedimintd-default-0/database"
     )
-    .env(FM_PASSWORD_ENV, "pass")
     .out_json()
     .await?;
     let outputs = output.as_array().context("expected an array")?;
@@ -1845,7 +2123,6 @@ pub async fn recoverytool_test(dev_fed: DevFed) -> Result<()> {
         "--db",
         "{data_dir}/fedimintd-default-0/database"
     )
-    .env(FM_PASSWORD_ENV, "pass")
     .out_json()
     .await?
     .as_array()
@@ -1937,16 +2214,12 @@ pub async fn guardian_backup_test(dev_fed: DevFed, process_mgr: &ProcessManager)
     };
 
     write_file("backup.tar", &backup_tar);
-    write_file(
-        fedimint_server::config::io::PLAINTEXT_PASSWORD,
-        "pass".as_bytes(),
-    );
 
     assert_eq!(
         std::process::Command::new("tar")
             .arg("-xf")
             .arg("backup.tar")
-            .current_dir(data_dir)
+            .current_dir(&data_dir)
             .spawn()
             .expect("error spawning tar")
             .wait()
@@ -1955,6 +2228,12 @@ pub async fn guardian_backup_test(dev_fed: DevFed, process_mgr: &ProcessManager)
         Some(0),
         "tar failed"
     );
+
+    // If the backup contains encrypted config (from old fedimintd), write the
+    // password file so the current fedimintd can read it
+    if data_dir.join("private.encrypt").exists() {
+        write_file("password.private", "pass".as_bytes());
+    }
 
     fed.start_server(process_mgr, PEER_TO_TEST.into())
         .await
@@ -2143,6 +2422,18 @@ pub async fn test_client_config_change_detection(
 ) -> Result<()> {
     log_binary_versions().await?;
 
+    // This test edits the guardians' on-disk config out-of-band and restarts
+    // them. Since v0.12.0-alpha the private config is stored as plaintext
+    // `private.json`; older fedimintd only reads the encrypted `private.encrypt`
+    // format, so the rewritten config would be invisible to it on restart.
+    let fedimintd_version = crate::util::FedimintdCmd::version_or_default().await;
+    if fedimintd_version < *VERSION_0_12_0_ALPHA {
+        info!(
+            "Skipping test_client_config_change_detection - requires fedimintd v0.12.0-alpha or later"
+        );
+        return Ok(());
+    }
+
     let DevFed { mut fed, .. } = dev_fed;
     let peer_ids: Vec<_> = fed.member_ids().collect();
 
@@ -2248,7 +2539,6 @@ async fn modify_server_configs(config_dir: &Path, peer_ids: &[PeerId]) -> Result
 /// Modify configuration files for a single peer to add a new meta module
 /// instance
 async fn modify_single_peer_config(config_dir: &Path, peer_id: PeerId) -> Result<()> {
-    use fedimint_aead::{encrypted_write, get_encryption_key};
     use fedimint_core::core::ModuleInstanceId;
     use fedimint_server::config::io::read_server_config;
     use serde_json::Value;
@@ -2265,9 +2555,8 @@ async fn modify_single_peer_config(config_dir: &Path, peer_id: PeerId) -> Result
     let mut consensus_config: Value = serde_json::from_str(&consensus_config_content)
         .with_context(|| format!("Failed to parse consensus config for peer {peer_id}"))?;
 
-    // Read the encrypted private config using the server config reader
-    let password = "pass"; // Default password used in devimint
-    let server_config = read_server_config(password, &peer_dir)
+    // Read the private config using the server config reader
+    let server_config = read_server_config(&peer_dir)
         .with_context(|| format!("Failed to read server config for peer {peer_id}"))?;
 
     // Find existing meta module in configs to use as template
@@ -2338,25 +2627,14 @@ async fn modify_single_peer_config(config_dir: &Path, peer_id: PeerId) -> Result
         .await
         .with_context(|| format!("Failed to write consensus config for peer {peer_id}"))?;
 
-    // Write back the modified private config using direct encryption
-    let salt = std::fs::read_to_string(peer_dir.join("private.salt"))
-        .with_context(|| format!("Failed to read salt file for peer {peer_id}"))?;
-    let key = get_encryption_key(password, &salt)
-        .with_context(|| format!("Failed to get encryption key for peer {peer_id}"))?;
+    // Write back the modified private config as plaintext JSON
+    let private_json_path = peer_dir.join("private.json");
+    let private_config_content = serde_json::to_string_pretty(&updated_private_config)
+        .with_context(|| format!("Failed to serialize private config for peer {peer_id}"))?;
 
-    let private_config_bytes = serde_json::to_string(&updated_private_config)
-        .with_context(|| format!("Failed to serialize private config for peer {peer_id}"))?
-        .into_bytes();
-
-    // Remove the existing encrypted file first
-    let encrypted_private_path = peer_dir.join("private.encrypt");
-    if encrypted_private_path.exists() {
-        std::fs::remove_file(&encrypted_private_path)
-            .with_context(|| format!("Failed to remove old private config for peer {peer_id}"))?;
-    }
-
-    encrypted_write(private_config_bytes, &key, encrypted_private_path)
-        .with_context(|| format!("Failed to write encrypted private config for peer {peer_id}"))?;
+    write_overwrite_async(&private_json_path, private_config_content)
+        .await
+        .with_context(|| format!("Failed to write private config for peer {peer_id}"))?;
 
     info!("Successfully modified configs for peer {}", peer_id);
     Ok(())
@@ -2463,82 +2741,6 @@ pub async fn admin_auth_tests(dev_fed: DevFed) -> Result<()> {
     Ok(())
 }
 
-pub async fn test_guardian_password_change(
-    dev_fed: DevFed,
-    process_mgr: &ProcessManager,
-) -> Result<()> {
-    log_binary_versions().await?;
-
-    let DevFed { mut fed, .. } = dev_fed;
-    fed.await_all_peers().await?;
-
-    let client = fed.new_joined_client("config-change-test-client").await?;
-
-    let peer_id = 0;
-    let data_dir: PathBuf = fed
-        .vars
-        .get(&peer_id)
-        .expect("peer not found")
-        .FM_DATA_DIR
-        .clone();
-    let file_exists = |file: &str| {
-        let path = data_dir.join(file);
-        path.exists()
-    };
-    let pre_password_file_exists = file_exists("password.secret");
-
-    info!(target: LOG_DEVIMINT, "Changing password");
-    cmd!(
-        client,
-        "--our-id",
-        &peer_id.to_string(),
-        "--password",
-        "pass",
-        "admin",
-        "change-password",
-        "foobar"
-    )
-    .run()
-    .await
-    .context("Failed to change guardian password")?;
-
-    info!(target: LOG_DEVIMINT, "Waiting for fedimintd to be shut down");
-    timeout(
-        Duration::from_secs(30),
-        fed.await_server_terminated(peer_id),
-    )
-    .await
-    .context("Fedimintd didn't shut down in time after password change")??;
-
-    info!(target: LOG_DEVIMINT, "Restarting fedimintd");
-    fed.start_server(process_mgr, peer_id).await?;
-
-    info!(target: LOG_DEVIMINT, "Wait for fedimintd to come online again");
-    fed.await_peer(peer_id).await?;
-
-    info!(target: LOG_DEVIMINT, "Testing password change worked");
-    cmd!(
-        client,
-        "--our-id",
-        &peer_id.to_string(),
-        "--password",
-        "foobar",
-        "admin",
-        "backup-statistics"
-    )
-    .run()
-    .await
-    .context("Failed to run guardian command with new password")?;
-
-    assert!(!file_exists("private.bak"));
-    assert!(!file_exists("password.bak"));
-    assert!(!file_exists("private.new"));
-    assert!(!file_exists("password.new"));
-    assert_eq!(file_exists("password.secret"), pre_password_file_exists);
-
-    Ok(())
-}
-
 #[derive(Subcommand)]
 pub enum LatencyTest {
     Reissue,
@@ -2595,6 +2797,8 @@ pub enum TestCmd {
     GatewayRebootTest,
     /// `devfed` then tests if the recovery tool is able to do a basic recovery
     RecoverytoolTests,
+    /// `devfed` then tests LNv1 LNURL receive behavior after client recovery
+    LnurlRecoveryTest,
     /// `devfed` then spawns faucet for wasm tests
     WasmTestSetup {
         #[arg(long, trailing_var_arg = true, allow_hyphen_values = true, num_args=1..)]
@@ -2610,9 +2814,6 @@ pub enum TestCmd {
     /// Tests that client can detect federation config changes when servers
     /// restart with new module configurations
     TestClientConfigChangeDetection,
-    /// Tests that guardian password change works and the guardian can restart
-    /// afterwards
-    TestGuardianPasswordChange,
     /// `devfed` then tests admin auth credential storage
     TestAdminAuth,
     /// Test upgrade paths for a given binary
@@ -2714,6 +2915,11 @@ pub async fn handle_command(cmd: TestCmd, common_args: CommonArgs) -> Result<()>
             let dev_fed = dev_fed(&process_mgr).await?;
             recoverytool_test(dev_fed).await?;
         }
+        TestCmd::LnurlRecoveryTest => {
+            let (process_mgr, _) = setup(common_args).await?;
+            let dev_fed = dev_fed(&process_mgr).await?;
+            lnurl_recovery_test(dev_fed).await?;
+        }
         TestCmd::GuardianBackup => {
             let (process_mgr, _) = setup(common_args).await?;
             let dev_fed = dev_fed(&process_mgr).await?;
@@ -2734,11 +2940,6 @@ pub async fn handle_command(cmd: TestCmd, common_args: CommonArgs) -> Result<()>
             let dev_fed = dev_fed(&process_mgr).await?;
             test_client_config_change_detection(dev_fed, &process_mgr).await?;
         }
-        TestCmd::TestGuardianPasswordChange => {
-            let (process_mgr, _) = setup(common_args).await?;
-            let dev_fed = dev_fed(&process_mgr).await?;
-            test_guardian_password_change(dev_fed, &process_mgr).await?;
-        }
         TestCmd::TestAdminAuth => {
             // Check versions early before starting infrastructure
             let fedimint_cli_version = crate::util::FedimintCli::version_or_default().await;
@@ -2757,7 +2958,17 @@ pub async fn handle_command(cmd: TestCmd, common_args: CommonArgs) -> Result<()>
         }
         TestCmd::UpgradeTests { binary, lnv2 } => {
             // TODO: Audit that the environment access only happens in single-threaded code.
-            unsafe { std::env::set_var(FM_ENABLE_MODULE_LNV2_ENV, lnv2) };
+            unsafe {
+                std::env::set_var(FM_ENABLE_MODULE_LNV2_ENV, lnv2);
+                // fedimintd now defaults to the v2 module set; pin the upgrade
+                // federation to the v1 modules (matching the previous default)
+                // so upgrade paths starting from older versions stay consistent.
+                std::env::set_var(FM_ENABLE_MODULE_LNV1_ENV, "1");
+                std::env::set_var(FM_ENABLE_MODULE_MINT_ENV, "1");
+                std::env::set_var(FM_ENABLE_MODULE_MINTV2_ENV, "0");
+                std::env::set_var(FM_ENABLE_MODULE_WALLET_ENV, "1");
+                std::env::set_var(FM_ENABLE_MODULE_WALLETV2_ENV, "0");
+            }
             let (process_mgr, _) = setup(common_args).await?;
             Box::pin(upgrade_tests(&process_mgr, binary)).await?;
         }

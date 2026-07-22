@@ -1,20 +1,20 @@
 use std::collections::BTreeSet;
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Multipart, State};
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum_extra::extract::Form;
 use axum_extra::extract::cookie::CookieJar;
 use fedimint_core::core::ModuleKind;
-use fedimint_core::module::ApiAuth;
 use fedimint_server_core::setup_ui::DynSetupApi;
 use fedimint_ui_common::assets::WithStaticRoutesExt;
 use fedimint_ui_common::auth::UserAuth;
 use fedimint_ui_common::{
     CONNECTIVITY_CHECK_ROUTE, LOGIN_ROUTE, LoginInput, ROOT_ROUTE, UiState,
     connectivity_check_handler, copiable_text, login_form, login_submit_response,
-    single_card_layout,
+    single_card_layout, single_card_layout_with_version,
 };
 use maud::{Markup, PreEscaped, html};
 use qrcode::QrCode;
@@ -25,10 +25,12 @@ pub const FEDERATION_SETUP_ROUTE: &str = "/federation_setup";
 pub const ADD_SETUP_CODE_ROUTE: &str = "/add_setup_code";
 pub const RESET_SETUP_CODES_ROUTE: &str = "/reset_setup_codes";
 pub const START_DKG_ROUTE: &str = "/start_dkg";
+pub const START_FEDERATION_ROUTE: &str = "/start_federation";
+pub const RESTORE_GUARDIAN_ROUTE: &str = "/restore_guardian";
+const RESTORE_BACKUP_UPLOAD_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct SetupInput {
-    pub password: String,
     pub name: String,
     #[serde(default)]
     pub is_lead: bool,
@@ -143,6 +145,68 @@ fn setup_error_message(error: &str) -> Markup {
     }
 }
 
+fn setup_choice_content(error: Option<&str>) -> Markup {
+    html! {
+        @if let Some(error) = error {
+            (setup_error_message(error))
+        }
+
+        div class="d-grid gap-3" {
+            a href=(START_FEDERATION_ROUTE) class="btn btn-primary w-100 py-2" {
+                "Start new Federation"
+            }
+
+            a href=(RESTORE_GUARDIAN_ROUTE) class="btn btn-outline-secondary w-100 py-2" {
+                "Restore from backup"
+            }
+        }
+    }
+}
+
+fn restore_form_content(error: Option<&str>) -> Markup {
+    html! {
+        @if let Some(error) = error {
+            (setup_error_message(error))
+        }
+
+        p class="text-muted" {
+            "Upload a guardian backup tar file. The password is only required for older, encrypted backups; leave it blank otherwise."
+        }
+
+        form method="post" action=(RESTORE_GUARDIAN_ROUTE) enctype="multipart/form-data" {
+            div class="form-group mb-3" {
+                input type="password" class="form-control" name="password" placeholder="Guardian Password (only for encrypted backups)";
+            }
+            div class="form-group mb-3" {
+                input type="file" class="form-control" name="backup" accept="application/x-tar,.tar" required;
+            }
+            button type="submit" class="btn btn-primary w-100 py-2" {
+                "Restore Guardian"
+            }
+        }
+
+        div class="text-center mt-3" {
+            a href=(ROOT_ROUTE) class="btn btn-link text-muted text-decoration-none" {
+                "Back"
+            }
+        }
+    }
+}
+
+fn restore_error_response(error: impl AsRef<str>) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Html(
+            single_card_layout(
+                "Restore Guardian",
+                restore_form_content(Some(error.as_ref())),
+            )
+            .into_string(),
+        ),
+    )
+        .into_response()
+}
+
 fn setup_form_content(
     available_modules: &BTreeSet<ModuleKind>,
     default_modules: &BTreeSet<ModuleKind>,
@@ -192,10 +256,6 @@ fn setup_form_content(
 
             div class="form-group mb-4" {
                 input type="text" class="form-control" id="name" name="name" placeholder="Your Guardian Name" required;
-            }
-
-            div class="form-group mb-4" {
-                input type="password" class="form-control" id="password" name="password" placeholder="Your Password" required;
             }
 
             div class="alert alert-warning mb-3" style="font-size: 0.875rem;" {
@@ -298,8 +358,21 @@ fn setup_form_content(
     }
 }
 
-// GET handler for the /setup route (display the setup form)
-async fn setup_form(State(state): State<UiState<DynSetupApi>>) -> impl IntoResponse {
+// GET handler for the / route (choose setup or restore)
+async fn setup_form(
+    State(state): State<UiState<DynSetupApi>>,
+    _auth: UserAuth,
+) -> impl IntoResponse {
+    if state.api.setup_code().await.is_some() {
+        return Redirect::to(FEDERATION_SETUP_ROUTE).into_response();
+    }
+
+    Html(single_card_layout("Guardian Setup", setup_choice_content(None)).into_string())
+        .into_response()
+}
+
+// GET handler for starting a new federation
+async fn start_federation_form(State(state): State<UiState<DynSetupApi>>) -> impl IntoResponse {
     if state.api.setup_code().await.is_some() {
         return Redirect::to(FEDERATION_SETUP_ROUTE).into_response();
     }
@@ -307,13 +380,25 @@ async fn setup_form(State(state): State<UiState<DynSetupApi>>) -> impl IntoRespo
     let available_modules = state.api.available_modules();
     let default_modules = state.api.default_modules();
     let content = setup_form_content(&available_modules, &default_modules);
+    let version = state.api.fedimintd_version().await;
+    let version_hash = state.api.fedimintd_version_hash().await;
 
-    Html(single_card_layout("Guardian Setup", content).into_string()).into_response()
+    Html(
+        single_card_layout_with_version(
+            "Guardian Setup",
+            content,
+            &version,
+            version_hash.as_deref(),
+        )
+        .into_string(),
+    )
+    .into_response()
 }
 
 // POST handler for the /setup route (process the setup form)
 async fn setup_submit(
     State(state): State<UiState<DynSetupApi>>,
+    _auth: UserAuth,
     Form(input): Form<SetupInput>,
 ) -> impl IntoResponse {
     // Only use these settings if is_lead is true
@@ -361,7 +446,6 @@ async fn setup_submit(
     match state
         .api
         .set_local_parameters(
-            ApiAuth::new(input.password),
             input.name,
             federation_name,
             disable_base_fees,
@@ -379,34 +463,118 @@ async fn setup_submit(
     }
 }
 
-// GET handler for the /login route (display the login form)
-async fn login_form_handler(State(state): State<UiState<DynSetupApi>>) -> impl IntoResponse {
-    if state.api.setup_code().await.is_none() {
-        return Redirect::to(ROOT_ROUTE).into_response();
+// GET handler for restoring from backup
+async fn restore_form(State(state): State<UiState<DynSetupApi>>) -> impl IntoResponse {
+    if state.api.setup_code().await.is_some() {
+        return Redirect::to(FEDERATION_SETUP_ROUTE).into_response();
     }
 
-    Html(single_card_layout("Enter Password", login_form(None)).into_string()).into_response()
+    Html(single_card_layout("Restore Guardian", restore_form_content(None)).into_string())
+        .into_response()
 }
 
-// POST handler for the /login route (authenticate and set session cookie)
+async fn restore_submit(
+    State(state): State<UiState<DynSetupApi>>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut password = None;
+    let mut backup = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => return restore_error_response(format!("Failed to read upload: {e}")),
+        };
+
+        match field.name() {
+            Some("password") => match field.text().await {
+                Ok(value) => password = Some(value),
+                Err(e) => return restore_error_response(format!("Failed to read password: {e}")),
+            },
+            Some("backup") => match field.bytes().await {
+                // The setup UI is a local guardian-owner interface. We cap the upload size to
+                // catch accidental oversized requests, but treat malicious tar expansion by the
+                // uploading user as out of scope: they already control this guardian instance.
+                Ok(value) => backup = Some(value.to_vec()),
+                Err(e) => return restore_error_response(format!("Failed to read backup: {e}")),
+            },
+            _ => {}
+        }
+    }
+
+    // An empty password field means the user left it blank, which is the
+    // expected case for current plaintext backups.
+    let password = password.filter(|password| !password.is_empty());
+    let Some(backup) = backup else {
+        return restore_error_response("Missing guardian backup file");
+    };
+
+    match state.api.restore_from_backup(password, backup).await {
+        Ok(()) => {
+            let content = html! {
+                div class="alert alert-success mb-3" {
+                    "Guardian backup restored. The server is starting consensus."
+                }
+                div class="text-center mt-4" {
+                    div class="spinner-border text-primary" role="status" {
+                        span class="visually-hidden" { "Loading..." }
+                    }
+                    p class="mt-2 text-muted" { "Waiting for dashboard..." }
+                }
+                div
+                    hx-get=(ROOT_ROUTE)
+                    hx-trigger="every 2s"
+                    hx-swap="none"
+                    hx-on--after-request={
+                        "if (event.detail.xhr.status === 200) { window.location.href = '" (ROOT_ROUTE) "'; }"
+                    }
+                    style="display: none;"
+                {}
+            };
+            Html(single_card_layout("Guardian Restored", content).into_string()).into_response()
+        }
+        // Render the full error chain so the underlying cause (e.g. an
+        // incorrect password for an encrypted backup) is surfaced rather than
+        // just the outermost "Reading restored config" context.
+        Err(e) => restore_error_response(format!("{e:#}")),
+    }
+}
+
+// GET handler for the /login route (display the login form)
+async fn login_form_handler(State(state): State<UiState<DynSetupApi>>) -> impl IntoResponse {
+    let version = state.api.fedimintd_version().await;
+    let version_hash = state.api.fedimintd_version_hash().await;
+    Html(
+        single_card_layout_with_version(
+            "Enter Password",
+            login_form(None),
+            &version,
+            version_hash.as_deref(),
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+// POST handler for the /login route (authenticate and set session cookie).
+// Only mounted when the guardian has a password configured, so `auth()` is
+// always `Some` here.
 async fn login_submit(
     State(state): State<UiState<DynSetupApi>>,
     jar: CookieJar,
     Form(input): Form<LoginInput>,
 ) -> impl IntoResponse {
-    let auth = match state.api.auth().await {
-        Some(auth) => auth,
-        None => return Redirect::to(ROOT_ROUTE).into_response(),
-    };
-
     login_submit_response(
-        auth,
+        state
+            .api
+            .auth_ui()
+            .expect("login route is mounted only when auth is configured"),
         state.auth_cookie_name,
         state.auth_cookie_value,
         jar,
         input,
     )
-    .into_response()
 }
 
 // GET handler for the /federation-setup route (main federation management page)
@@ -420,6 +588,8 @@ async fn federation_setup(
         .await
         .expect("Successful authentication ensures that the local parameters have been set");
 
+    let version = state.api.fedimintd_version().await;
+    let version_hash = state.api.fedimintd_version_hash().await;
     let connected_peers = state.api.connected_peers().await;
     let federation_size = state.api.federation_size().await;
     let cfg_federation_name = state.api.cfg_federation_name().await;
@@ -550,7 +720,16 @@ async fn federation_setup(
         }
     };
 
-    Html(single_card_layout("Federation Setup", content).into_string()).into_response()
+    Html(
+        single_card_layout_with_version(
+            "Federation Setup",
+            content,
+            &version,
+            version_hash.as_deref(),
+        )
+        .into_string(),
+    )
+    .into_response()
 }
 
 // POST handler for adding peer connection info
@@ -587,6 +766,8 @@ async fn post_start_dkg(
     _auth: UserAuth,
 ) -> impl IntoResponse {
     let our_connection_info = state.api.setup_code().await;
+    let version = state.api.fedimintd_version().await;
+    let version_hash = state.api.fedimintd_version_hash().await;
 
     match state.api.start_dkg().await {
         Ok(()) => {
@@ -623,7 +804,15 @@ async fn post_start_dkg(
 
             (
                 [("HX-Retarget", "body"), ("HX-Reswap", "innerHTML")],
-                Html(single_card_layout("DKG Started", content).into_string()),
+                Html(
+                    single_card_layout_with_version(
+                        "DKG Started",
+                        content,
+                        &version,
+                        version_hash.as_deref(),
+                    )
+                    .into_string(),
+                ),
             )
                 .into_response()
         }
@@ -661,9 +850,17 @@ async fn post_reset_setup_codes(
 }
 
 pub fn router(api: DynSetupApi) -> Router {
-    Router::new()
+    let requires_auth = api.auth_ui().is_some();
+
+    let mut router = Router::new()
         .route(ROOT_ROUTE, get(setup_form).post(setup_submit))
-        .route(LOGIN_ROUTE, get(login_form_handler).post(login_submit))
+        .route(START_FEDERATION_ROUTE, get(start_federation_form))
+        .route(
+            RESTORE_GUARDIAN_ROUTE,
+            get(restore_form)
+                .post(restore_submit)
+                .layer(DefaultBodyLimit::max(RESTORE_BACKUP_UPLOAD_LIMIT_BYTES)),
+        )
         .route(FEDERATION_SETUP_ROUTE, get(federation_setup))
         .route(ADD_SETUP_CODE_ROUTE, post(post_add_setup_code))
         .route(RESET_SETUP_CODES_ROUTE, post(post_reset_setup_codes))
@@ -671,9 +868,15 @@ pub fn router(api: DynSetupApi) -> Router {
         .route(
             CONNECTIVITY_CHECK_ROUTE,
             get(connectivity_check_handler::<DynSetupApi>),
-        )
+        );
+
+    if requires_auth {
+        router = router.route(LOGIN_ROUTE, get(login_form_handler).post(login_submit));
+    }
+
+    router
         .with_static_routes()
-        .with_state(UiState::new(api))
+        .with_state(UiState::new(api, requires_auth))
 }
 
 #[cfg(test)]
@@ -694,5 +897,23 @@ mod tests {
 
         assert!(content.contains("Invalid federation size"));
         assert!(!content.contains("setup-form"));
+    }
+
+    #[test]
+    fn setup_choice_has_start_and_restore_options() {
+        let content = setup_choice_content(None).into_string();
+
+        assert!(content.contains("Start new Federation"));
+        assert!(content.contains("Restore from backup"));
+        assert!(!content.contains("multipart/form-data"));
+    }
+
+    #[test]
+    fn restore_form_has_upload_fields() {
+        let content = restore_form_content(None).into_string();
+
+        assert!(content.contains("multipart/form-data"));
+        assert!(content.contains("Guardian Password"));
+        assert!(content.contains("Restore Guardian"));
     }
 }

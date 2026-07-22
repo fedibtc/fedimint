@@ -17,8 +17,9 @@ pub trait ISetupApi {
     /// Get our guardian name
     async fn guardian_name(&self) -> Option<String>;
 
-    /// Get the auth token for API calls
-    async fn auth(&self) -> Option<ApiAuth>;
+    /// Password protecting the setup UI login form. `None` means the UI is
+    /// served without a login form.
+    fn auth_ui(&self) -> Option<ApiAuth>;
 
     /// Get list of names of connected peers
     async fn connected_peers(&self) -> Vec<String>;
@@ -35,7 +36,6 @@ pub trait ISetupApi {
     /// Set local guardian parameters
     async fn set_local_parameters(
         &self,
-        auth: ApiAuth,
         name: String,
         federation_name: Option<String>,
         disable_base_fees: Option<bool>,
@@ -49,6 +49,11 @@ pub trait ISetupApi {
     /// Start the distributed key generation process
     async fn start_dkg(&self) -> Result<()>;
 
+    /// Restore this guardian from a config backup archive. The password is
+    /// only required for legacy encrypted backups; current plaintext backups
+    /// restore without one.
+    async fn restore_from_backup(&self, password: Option<String>, backup: Vec<u8>) -> Result<()>;
+
     /// Returns the expected federation size if any setup code (ours or a
     /// peer's) has set it
     async fn federation_size(&self) -> Option<u32>;
@@ -61,6 +66,13 @@ pub trait ISetupApi {
 
     /// Returns the enabled modules, if set by any setup code
     async fn cfg_enabled_modules(&self) -> Option<BTreeSet<ModuleKind>>;
+
+    /// Get the fedimintd version
+    async fn fedimintd_version(&self) -> String;
+
+    /// Get the git hash of the fedimintd binary, or `None` if it is not
+    /// available (e.g. it was built outside a git checkout).
+    async fn fedimintd_version_hash(&self) -> Option<String>;
 
     /// Create a trait object
     fn into_dyn(self) -> DynSetupApi

@@ -3,6 +3,7 @@ use std::{ffi, iter};
 use bitcoin::Address;
 use bitcoin::address::NetworkUnchecked;
 use clap::{Parser, Subcommand};
+use fedimint_eventlog::EventLogId;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -15,6 +16,8 @@ enum Opts {
     Info(InfoOpts),
     /// Fetch the current fee required to send an onchain payment.
     SendFee,
+    /// Fetch the current fee required to claim an onchain deposit (peg-in).
+    ReceiveFee,
     /// Send an onchain payment.
     Send {
         address: Address<NetworkUnchecked>,
@@ -23,7 +26,19 @@ enum Opts {
         fee: Option<bitcoin::Amount>,
     },
     /// Return the next unused receive address.
+    ///
+    /// To wait for a payment to this address, read the current event log
+    /// position with `dev next-event-log-id` *before* running this, then pass
+    /// that position to `await-receive`.
     Receive,
+    /// Block until the next payment is received, starting from the given event
+    /// log position. Returns the receive's final state and the event log
+    /// position to pass to the following `await-receive`.
+    AwaitReceive {
+        /// Event log position to start scanning from, as returned by
+        /// `dev next-event-log-id` or a prior `await-receive`.
+        position: EventLogId,
+    },
 }
 
 #[derive(Clone, Subcommand, Serialize)]
@@ -55,16 +70,22 @@ pub(crate) async fn handle_cli_command(
             InfoOpts::TxChain => json(wallet.tx_chain().await?),
         },
         Opts::SendFee => json(wallet.send_fee().await?),
+        Opts::ReceiveFee => json(wallet.receive_fee().await?),
         Opts::Send {
             address,
             value,
             fee,
         } => json(
             wallet
-                .await_final_send_operation_state(wallet.send(address, value, fee).await?)
-                .await,
+                .await_final_send_operation_state(
+                    wallet
+                        .send(address, value, fee, serde_json::Value::Null)
+                        .await?,
+                )
+                .await?,
         ),
         Opts::Receive => json(wallet.receive().await),
+        Opts::AwaitReceive { position } => json(wallet.await_receive(position).await?),
     };
 
     Ok(value)

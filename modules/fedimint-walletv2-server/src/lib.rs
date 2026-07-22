@@ -40,12 +40,13 @@ use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::envs::{FM_ENABLE_MODULE_WALLETV2_ENV, is_env_var_set_opt};
+use fedimint_core::envs::{
+    FM_ENABLE_MODULE_WALLETV2_ENV, is_env_var_set_opt, is_running_in_test_env,
+};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    Amounts, ApiEndpoint, ApiVersion, CORE_CONSENSUS_VERSION, CoreConsensusVersion, InputMeta,
-    ModuleConsensusVersion, ModuleInit, SupportedModuleApiVersions, TransactionItemAmounts,
-    api_endpoint,
+    Amounts, ApiEndpoint, ApiVersion, CoreConsensusVersion, InputMeta, ModuleConsensusVersion,
+    ModuleInit, MultiApiVersion, TransactionItemAmounts, api_endpoint,
 };
 #[cfg(not(target_family = "wasm"))]
 use fedimint_core::task::TaskGroup;
@@ -96,6 +97,10 @@ pub const CONFIRMATION_FINALITY_DELAY: u64 = 6;
 /// Maximum number of blocks the consensus block count can advance in a single
 /// consensus item to limit the work done in one `process_consensus_item` step.
 const MAX_BLOCK_COUNT_INCREMENT: u64 = 5;
+
+/// Devimint tests can mine many regtest blocks at once, so use a larger cap in
+/// test environments to avoid waiting on several consensus sessions.
+const TEST_MAX_BLOCK_COUNT_INCREMENT: u64 = 100;
 
 /// Minimum fee rate vote of 1 sat/vB to ensure we never propose a fee rate
 /// below what Bitcoin Core will relay.
@@ -267,25 +272,14 @@ impl ServerModuleInit for WalletInit {
         &[MODULE_CONSENSUS_VERSION]
     }
 
-    fn supported_api_versions(&self) -> SupportedModuleApiVersions {
-        SupportedModuleApiVersions::from_raw(
-            (CORE_CONSENSUS_VERSION.major, CORE_CONSENSUS_VERSION.minor),
-            (
-                MODULE_CONSENSUS_VERSION.major,
-                MODULE_CONSENSUS_VERSION.minor,
-            ),
-            &[(0, 1)],
-        )
-    }
-
     fn is_enabled_by_default(&self) -> bool {
-        is_env_var_set_opt(FM_ENABLE_MODULE_WALLETV2_ENV).unwrap_or(false)
+        is_env_var_set_opt(FM_ENABLE_MODULE_WALLETV2_ENV).unwrap_or(true)
     }
 
     fn get_documented_env_vars(&self) -> Vec<EnvVarDoc> {
         vec![EnvVarDoc {
             name: FM_ENABLE_MODULE_WALLETV2_ENV,
-            description: "Set to 1/true to enable the WalletV2 module (experimental). Disabled by default.",
+            description: "Set to 0/false to disable the WalletV2 module. Enabled by default.",
         }]
     }
 
@@ -436,9 +430,15 @@ impl ServerModule for Wallet {
 
             let consensus_block_count = self.consensus_block_count(dbtx).await;
 
+            let max_block_count_increment = if is_running_in_test_env() {
+                TEST_MAX_BLOCK_COUNT_INCREMENT
+            } else {
+                MAX_BLOCK_COUNT_INCREMENT
+            };
+
             let block_count_vote = match consensus_block_count {
                 0 => block_count_vote,
-                _ => block_count_vote.min(consensus_block_count + MAX_BLOCK_COUNT_INCREMENT),
+                _ => block_count_vote.min(consensus_block_count + max_block_count_increment),
             };
 
             items.push(WalletConsensusItem::BlockCount(block_count_vote));
@@ -878,6 +878,11 @@ impl ServerModule for Wallet {
             },
         ]
     }
+
+    fn supported_api_versions(&self) -> MultiApiVersion {
+        MultiApiVersion::try_from_iter([ApiVersion::new(0, 1)])
+            .expect("walletv2 declares one API version per major version")
+    }
 }
 
 #[derive(Debug)]
@@ -966,8 +971,12 @@ impl Wallet {
             "Processed block count vote"
         );
 
-        // We do not sync blocks that predate the federation itself.
-        if old_consensus_block_count == 0 {
+        // Outside regtest, do not sync blocks that predate the federation itself.
+        // Regtest starts from scratch, so scan from genesis to avoid races where
+        // test deposits are mined before the first walletv2 block count
+        // transition is processed.
+        let scan_from_genesis = self.cfg.consensus.network == bitcoin::Network::Regtest;
+        if old_consensus_block_count == 0 && !scan_from_genesis {
             return Ok(());
         }
 
@@ -1040,7 +1049,7 @@ impl Wallet {
                             %outpoint,
                             value_sat = tx_out.value.to_sat(),
                             height,
-                            "Recorded potential receive"
+                            "Recorded potential walletv2 receive"
                         );
 
                         potential_receives_num += 1;
@@ -1354,6 +1363,7 @@ impl Wallet {
                     script: entry.1.1.script_pubkey,
                     value: entry.1.1.value,
                     spent: spent.contains(&entry.0.0),
+                    outpoint: Some(entry.1.0),
                 }))
             })
             .collect()

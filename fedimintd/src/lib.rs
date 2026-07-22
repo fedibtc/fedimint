@@ -17,13 +17,15 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use bitcoin::Network;
+use clap::builder::BoolishValueParser;
 use clap::{ArgGroup, CommandFactory, FromArgMatches, Parser};
 use fedimint_core::db::Database;
 use fedimint_core::envs::{
     FM_IROH_DNS_ENV, FM_IROH_RELAY_ENV, FM_USE_UNKNOWN_MODULE_ENV, is_env_var_set,
+    is_running_in_test_env,
 };
-use fedimint_core::module::CORE_CONSENSUS_VERSION;
 use fedimint_core::module::registry::ModuleRegistry;
+use fedimint_core::module::{ApiAuth, CORE_CONSENSUS_VERSION};
 use fedimint_core::rustls::install_crypto_provider;
 use fedimint_core::task::TaskGroup;
 use fedimint_core::timing;
@@ -34,7 +36,7 @@ use fedimint_meta_server::MetaInit;
 use fedimint_mint_server::MintInit;
 use fedimint_rocksdb::RocksDb;
 use fedimint_server::config::ConfigGenSettings;
-use fedimint_server::config::io::DB_FILE;
+use fedimint_server::config::io::{DB_FILE, PLAINTEXT_PASSWORD};
 use fedimint_server::core::ServerModuleInitRegistry;
 use fedimint_server::net::api::ApiSecrets;
 use fedimint_server_bitcoin_rpc::BitcoindClientWithFallback;
@@ -51,7 +53,9 @@ use fedimintd_envs::{
     FM_BITCOIND_URL_ENV, FM_BITCOIND_URL_PASSWORD_FILE_ENV, FM_BITCOIND_USERNAME_ENV,
     FM_DATA_DIR_ENV, FM_DB_CHECKPOINT_RETENTION_ENV, FM_DISABLE_META_MODULE_ENV,
     FM_ENABLE_IROH_ENV, FM_ESPLORA_URL_ENV, FM_FORCE_API_SECRETS_ENV,
-    FM_IROH_API_MAX_CONNECTIONS_ENV, FM_IROH_API_MAX_REQUESTS_PER_CONNECTION_ENV, FM_P2P_URL_ENV,
+    FM_IROH_API_MAX_CONNECTIONS_ENV, FM_IROH_API_MAX_REQUESTS_PER_CONNECTION_ENV,
+    FM_IROH_P2P_RELAY_ENV, FM_P2P_URL_ENV, FM_PASSWORD_API_ENV, FM_PASSWORD_UI_ENV,
+    FM_SESSION_TIMEOUT_SECS_ENV,
 };
 use futures::FutureExt as _;
 #[cfg(all(
@@ -91,6 +95,20 @@ struct ServerOpts {
     /// Path to folder containing federation config files
     #[arg(long = "data-dir", env = FM_DATA_DIR_ENV)]
     data_dir: PathBuf,
+
+    /// Password gating the guardian admin UI on bind-ui. Optional: falls
+    /// back to reading password.private from data-dir, and if neither is
+    /// present the UI is served without a login form. Only safe when
+    /// bind-ui stays on a trusted interface (the default 127.0.0.1).
+    #[arg(long, env = FM_PASSWORD_UI_ENV)]
+    password_ui: Option<String>,
+
+    /// Password gating admin RPCs on the public API (WebSocket on bind-api
+    /// and iroh). Optional and never falls back to disk: when unset, admin
+    /// RPCs return 401 unconditionally, since the public API is always
+    /// network-reachable and must be enabled explicitly.
+    #[arg(long, env = FM_PASSWORD_API_ENV)]
+    password_api: Option<String>,
 
     /// The bitcoin network of the federation
     #[arg(long, env = FM_BITCOIN_NETWORK_ENV, default_value = "regtest")]
@@ -162,8 +180,14 @@ struct ServerOpts {
     #[arg(long, env = FM_API_URL_ENV)]
     api_url: Option<SafeUrl>,
 
-    #[arg(long, env = FM_ENABLE_IROH_ENV)]
-    enable_iroh: bool,
+    /// Whether to use the Iroh networking stack instead of the legacy
+    /// TCP/TLS/websocket stack. Defaults to Iroh in production and to the
+    /// legacy stack in test environments (`cargo test` / `devimint`). Only
+    /// consulted at DKG / config generation time; existing federations keep the
+    /// stack baked into their config. Pass `--enable-iroh true/false` (or
+    /// `FM_ENABLE_IROH=true/false`) to override.
+    #[arg(long, env = FM_ENABLE_IROH_ENV, value_parser = BoolishValueParser::new())]
+    enable_iroh: Option<bool>,
 
     /// Optional URL of the Iroh DNS server
     #[arg(long, env = FM_IROH_DNS_ENV, requires = "enable_iroh")]
@@ -173,9 +197,19 @@ struct ServerOpts {
     #[arg(long, env = FM_IROH_RELAY_ENV, requires = "enable_iroh", value_delimiter = ',')]
     iroh_relays: Vec<SafeUrl>,
 
+    /// Optional Iroh 1.0 relay URLs to use for guardian P2P
+    #[arg(long, env = FM_IROH_P2P_RELAY_ENV, value_delimiter = ',')]
+    iroh_p2p_relays: Vec<SafeUrl>,
+
     /// Number of checkpoints from the current session to retain on disk
     #[arg(long, env = FM_DB_CHECKPOINT_RETENTION_ENV, default_value = "1")]
     db_checkpoint_retention: u64,
+
+    /// Exit the process if a consensus session is not completed within this
+    /// many seconds, relying on the process supervisor to restart fedimintd.
+    /// Restarting guardians has been observed to resolve stuck sessions.
+    #[arg(long, env = FM_SESSION_TIMEOUT_SECS_ENV, default_value = "3600")]
+    session_timeout_secs: u64,
 
     /// Enable tokio console logging
     #[arg(long, env = FM_BIND_TOKIO_CONSOLE_ENV)]
@@ -251,9 +285,9 @@ impl ServerOpts {
 ///
 /// * `code_version_vendor_suffix` - An optional suffix that will be appended to
 ///   the internal fedimint release version, to distinguish binaries built by
-///   different vendors, usually with a different set of modules. Currently DKG
-///   will enforce that the combined `code_version` is the same between all
-///   peers.
+///   different vendors, usually with a different set of modules. The suffix is
+///   informational in setup/DKG: compatibility and consensus config generation
+///   use the normalized `x.y.z` release version.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     module_init_registry: ServerModuleInitRegistry,
@@ -315,15 +349,7 @@ pub async fn run(
         core_consensus = %CORE_CONSENSUS_VERSION,
         "Supported core consensus version",
     );
-    for (kind, module) in module_init_registry.iter() {
-        let supported = module.supported_api_versions();
-        debug!(
-            target: LOG_SERVER,
-            module = %kind,
-            supported = %supported,
-            "Supported module versions",
-        );
-    }
+
     let code_version_str = code_version_vendor_suffix.map_or_else(
         || fedimint_version.to_string(),
         |suffix| format!("{fedimint_version}+{suffix}"),
@@ -348,7 +374,7 @@ pub async fn run(
         ui_bind: server_opts.bind_ui,
         p2p_url: server_opts.p2p_url.clone(),
         api_url: server_opts.api_url.clone(),
-        enable_iroh: server_opts.enable_iroh,
+        enable_iroh: server_opts.enable_iroh.unwrap_or(!is_running_in_test_env()),
         iroh_dns: server_opts.iroh_dns.clone(),
         iroh_relays: server_opts.iroh_relays.clone(),
         network: server_opts.bitcoin_network,
@@ -409,24 +435,43 @@ pub async fn run(
 
     install_crypto_provider().await;
 
+    // The UI password falls back to the legacy password.private file on disk
+    // if its env var is not set, since the UI defaults to a loopback bind.
+    // The API password never falls back: the public admin API is always
+    // network-reachable, so it must be enabled explicitly via its env var or
+    // else admin RPCs return 401. Absence of a password for a given plane opts
+    // that plane into passwordless mode (UI) or disabled admin RPCs (API).
+    let password_file = std::fs::read_to_string(server_opts.data_dir.join(PLAINTEXT_PASSWORD))
+        .ok()
+        .map(|s| s.trim().to_owned());
+
+    let auth_ui = server_opts.password_ui.or(password_file).map(ApiAuth::new);
+    let auth_api = server_opts.password_api.map(ApiAuth::new);
+
     let task_group = root_task_group.clone();
+    let code_version_hash = code_version_hash.to_string();
     root_task_group.spawn_cancellable("main", async move {
-        fedimint_server::run(
+        fedimint_server::run_with_iroh_p2p_relays(
             server_opts.data_dir,
+            auth_ui,
+            auth_api,
             server_opts.force_api_secrets,
             settings,
             db,
             code_version_str,
+            code_version_hash,
             module_init_registry,
             task_group,
             dyn_server_bitcoin_rpc,
             Box::new(fedimint_server_ui::setup::router),
             Box::new(fedimint_server_ui::dashboard::router),
             server_opts.db_checkpoint_retention,
+            Duration::from_secs(server_opts.session_timeout_secs),
             fedimint_server::ConnectionLimits::new(
                 server_opts.iroh_api_max_connections,
                 server_opts.iroh_api_max_requests_per_connection,
             ),
+            server_opts.iroh_p2p_relays,
         )
         .await
         .unwrap_or_else(|err| panic!("Main task returned error: {}", err.fmt_compact_anyhow()));
@@ -477,4 +522,75 @@ pub fn default_modules() -> ServerModuleInitRegistry {
     }
 
     server_gens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_server_opts_with_enable_iroh_env(value: &str) -> ServerOpts {
+        let previous = std::env::var_os(FM_ENABLE_IROH_ENV);
+        // This test does not spawn threads while mutating the process
+        // environment.
+        unsafe {
+            std::env::set_var(FM_ENABLE_IROH_ENV, value);
+        }
+
+        let opts = ServerOpts::try_parse_from([
+            "fedimintd",
+            "--data-dir",
+            "/tmp/fedimintd-test",
+            "--bitcoind-url",
+            "http://127.0.0.1:18443",
+            "--bitcoind-username",
+            "user",
+            "--bitcoind-password",
+            "pass",
+        ]);
+
+        // This test does not spawn threads while mutating the process
+        // environment.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var(FM_ENABLE_IROH_ENV, previous);
+            } else {
+                std::env::remove_var(FM_ENABLE_IROH_ENV);
+            }
+        }
+
+        opts.expect("server opts should parse")
+    }
+
+    #[test]
+    fn enable_iroh_env_accepts_numeric_booleans() {
+        assert_eq!(
+            parse_server_opts_with_enable_iroh_env("1").enable_iroh,
+            Some(true)
+        );
+        assert_eq!(
+            parse_server_opts_with_enable_iroh_env("0").enable_iroh,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn p2p_relay_does_not_require_enable_iroh_or_change_api_relays() {
+        let opts = ServerOpts::try_parse_from([
+            "fedimintd",
+            "--data-dir",
+            "/tmp/fedimintd-test",
+            "--bitcoind-url",
+            "http://127.0.0.1:18443",
+            "--bitcoind-username",
+            "user",
+            "--bitcoind-password",
+            "pass",
+            "--iroh-p2p-relays",
+            "https://relay.example.com/",
+        ])
+        .expect("P2P relay should parse independently");
+
+        assert!(opts.iroh_relays.is_empty());
+        assert_eq!(opts.iroh_p2p_relays.len(), 1);
+    }
 }

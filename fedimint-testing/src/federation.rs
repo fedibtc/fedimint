@@ -380,6 +380,8 @@ impl FederationTestBuilder {
                         .bind()
                         .await
                         .unwrap(),
+                    Some(ApiAuth::new("pass".to_string())),
+                    Some(ApiAuth::new("pass".to_string())),
                     connections,
                     p2p_status_receivers,
                     api_bind,
@@ -392,10 +394,12 @@ impl FederationTestBuilder {
                     ApiSecrets::default(),
                     checkpoint_dir,
                     code_version_str.to_string(),
+                    String::new(),
                     bitcoin_rpc_connection,
                     ui_bind,
                     Box::new(|_| axum::Router::new()),
                     1,
+                    Duration::from_secs(3600),
                     ConnectionLimits {
                         max_connections: 1000,
                         max_requests_per_connection: 100,
