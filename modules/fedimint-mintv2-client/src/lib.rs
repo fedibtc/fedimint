@@ -62,7 +62,7 @@ use fedimint_mintv2_common::config::{FeeConsensus, MintClientConfig, client_deno
 use fedimint_mintv2_common::{
     Denomination, KIND, MintCommonInit, MintInput, MintModuleTypes, MintOutput, Note, RecoveryItem,
 };
-use futures::{StreamExt, pin_mut};
+use futures::{StreamExt, TryFutureExt, pin_mut};
 use itertools::Itertools;
 use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
@@ -898,7 +898,7 @@ impl MintClientModule {
     }
 
     /// Receive the `ECash` by reissuing the notes and return the total amount
-    /// of the ecash reissued. This method is idempotent.
+    /// of the ecash reissued.
     pub async fn receive(
         &self,
         ecash: ECash,
@@ -907,7 +907,7 @@ impl MintClientModule {
         let operation_id = OperationId::from_encodable(&ecash);
 
         if self.client_ctx.operation_exists(operation_id).await {
-            return Ok(operation_id);
+            return Err(ReceiveECashError::AlreadyReceived);
         }
 
         if ecash.mint() != Some(self.federation_id) {
@@ -938,8 +938,14 @@ impl MintClientModule {
                 },
                 TransactionBuilder::new().with_inputs(input),
             )
-            .await
-            .map_err(|_| ReceiveECashError::InsufficientFunds)?;
+            .or_else(|_| async {
+                if self.client_ctx.operation_exists(operation_id).await {
+                    Err(ReceiveECashError::AlreadyReceived)
+                } else {
+                    Err(ReceiveECashError::InsufficientFunds)
+                }
+            })
+            .await?;
 
         let mut dbtx = self.client_ctx.module_db().begin_transaction().await;
 
@@ -1108,6 +1114,8 @@ pub enum ReceiveECashError {
     UneconomicalDenomination,
     #[error("Receiving ecash requires additional funds")]
     InsufficientFunds,
+    #[error("The ECash was already received")]
+    AlreadyReceived,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
