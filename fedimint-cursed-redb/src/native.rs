@@ -28,7 +28,7 @@ impl MemAndRedb {
                 }
                 Err(e) => {
                     return Err(anyhow::Error::from(e))
-                        .context("Failed to create/open redb database")
+                        .context("Failed to create/open redb database");
                 }
             };
             Self::new_from_redb(db).map_err(|e| anyhow::Error::msg(e.to_string()))

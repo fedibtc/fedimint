@@ -365,8 +365,12 @@ mod tests {
             let tx = db.begin_write().unwrap();
             {
                 let mut table = tx.open_table(table_def).unwrap();
-                table.insert(b"key1".as_slice(), b"value1".as_slice()).unwrap();
-                table.insert(b"key2".as_slice(), b"value2".as_slice()).unwrap();
+                table
+                    .insert(b"key1".as_slice(), b"value1".as_slice())
+                    .unwrap();
+                table
+                    .insert(b"key2".as_slice(), b"value2".as_slice())
+                    .unwrap();
             }
             tx.commit().unwrap();
         }
