@@ -113,15 +113,14 @@ pub async fn run(
 
     let mut modules = BTreeMap::new();
 
-    // TODO: make it work with all transports and federation secrets
+    // Resolve peer URLs the same way the consensus engine does, so a guardian
+    // that moved its API endpoint stays reachable for modules too. Snapshotted
+    // at startup like every other server-side API client: a peer that announces
+    // a new URL later is only picked up once we restart.
     let global_api = DynGlobalApi::new(
         connectors.clone(),
-        cfg.consensus
-            .api_endpoints()
-            .iter()
-            .map(|(&peer_id, url)| (peer_id, url.url.clone()))
-            .collect(),
-        None,
+        get_api_urls(&db, &cfg.consensus).await,
+        force_api_secrets.get_active().as_deref(),
     )?;
 
     let bitcoin_rpc_connection = ServerBitcoinRpcMonitor::new(
