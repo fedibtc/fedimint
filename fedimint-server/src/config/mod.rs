@@ -564,6 +564,7 @@ impl ServerConfig {
 
         info!(
             target: LOG_NET_PEER_DKG,
+            safe_to_share = true,
             "Waiting for all p2p connections to open..."
         );
 
@@ -587,6 +588,7 @@ impl ServerConfig {
 
             info!(
                 target: LOG_NET_PEER_DKG,
+                safe_to_share = true,
                 pending = ?disconnected_peers,
                 "Waiting for all p2p connections to open..."
             );
@@ -629,12 +631,14 @@ impl ServerConfig {
 
             info!(
                 target: LOG_NET_PEER_DKG,
+                safe_to_share = true,
                 "Peer {peer} has sent valid connection code checksum message"
             );
         }
 
         info!(
             target: LOG_NET_PEER_DKG,
+            safe_to_share = true,
             "Running config generation..."
         );
 
@@ -720,12 +724,14 @@ impl ServerConfig {
 
             info!(
                 target: LOG_NET_PEER_DKG,
+                safe_to_share = true,
                 "Peer {peer} has sent valid consensus config checksum message"
             );
         }
 
         info!(
             target: LOG_NET_PEER_DKG,
+            safe_to_share = true,
             "Config generation has completed successfully!"
         );
 

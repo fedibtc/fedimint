@@ -23,6 +23,7 @@ impl PeerHandleOps for PeerHandle<'_> {
     async fn run_dkg_g1(&self) -> anyhow::Result<(Vec<G1Projective>, Scalar)> {
         info!(
             target: LOG_NET_PEER_DKG,
+            safe_to_share = true,
             "Running distributed key generation for group G1..."
         );
 
@@ -32,6 +33,7 @@ impl PeerHandleOps for PeerHandle<'_> {
     async fn run_dkg_g2(&self) -> anyhow::Result<(Vec<G2Projective>, Scalar)> {
         info!(
             target: LOG_NET_PEER_DKG,
+            safe_to_share = true,
             "Running distributed key generation for group G2..."
         );
 
@@ -41,6 +43,7 @@ impl PeerHandleOps for PeerHandle<'_> {
     async fn exchange_bytes(&self, bytes: Vec<u8>) -> anyhow::Result<BTreeMap<PeerId, Vec<u8>>> {
         info!(
             target: LOG_NET_PEER_DKG,
+            safe_to_share = true,
             "Exchanging raw bytes..."
         );
 

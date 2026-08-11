@@ -169,7 +169,7 @@ pub async fn run(
     start_guardian_metadata_service(&db, &task_group, &cfg, force_api_secrets.get_active()).await?;
     start_pkarr_publish_service(&db, &task_group, &cfg).await?;
 
-    info!(target: LOG_CONSENSUS, "Starting consensus...");
+    info!(target: LOG_CONSENSUS, safe_to_share = true, "Starting consensus...");
 
     let connectors = ConnectorRegistry::build_from_server_defaults()
         .bind()
@@ -197,7 +197,7 @@ pub async fn run(
     ))
     .await?;
 
-    info!(target: LOG_CONSENSUS, "Shutting down tasks...");
+    info!(target: LOG_CONSENSUS, safe_to_share = true, "Shutting down tasks...");
 
     task_group.shutdown();
 
@@ -246,7 +246,7 @@ pub async fn run_config_gen(
     DynP2PConnections<P2PMessage>,
     P2PStatusReceivers,
 )> {
-    info!(target: LOG_CONSENSUS, "Starting config gen");
+    info!(target: LOG_CONSENSUS, safe_to_share = true, "Starting config gen");
 
     initialize_gauge_metrics(task_group, &db).await;
 
