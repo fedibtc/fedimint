@@ -27,7 +27,7 @@ use fedimint_core::task::TaskGroup;
 use fedimint_core::timing;
 use fedimint_core::util::{FmtCompactAnyhow as _, SafeUrl, handle_version_hash_command};
 use fedimint_ln_server::LightningInit;
-use fedimint_logging::{LOG_CORE, LOG_SERVER, TracingSetup};
+use fedimint_logging::{ExtraTracingLayer, LOG_CORE, LOG_SERVER, TracingSetup};
 use fedimint_meta_server::MetaInit;
 use fedimint_mint_server::MintInit;
 use fedimint_rocksdb::RocksDb;
@@ -258,6 +258,42 @@ pub async fn run(
     code_version_hash: &str,
     code_version_vendor_suffix: Option<&str>,
 ) -> anyhow::Result<Infallible> {
+    run_inner(
+        module_init_registry,
+        code_version_hash,
+        code_version_vendor_suffix,
+        None,
+    )
+    .await
+}
+
+/// Run fedimintd with an additional process-wide tracing layer.
+///
+/// Fedimint's normal stderr, filtering, console, and OpenTelemetry setup is
+/// retained. This is primarily useful for binaries that bundle fedimintd and
+/// need to attach their own structured logging sink.
+pub async fn run_with_extra_logging_layer(
+    module_init_registry: ServerModuleInitRegistry,
+    code_version_hash: &str,
+    code_version_vendor_suffix: Option<&str>,
+    layer: ExtraTracingLayer,
+) -> anyhow::Result<Infallible> {
+    run_inner(
+        module_init_registry,
+        code_version_hash,
+        code_version_vendor_suffix,
+        Some(layer),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_inner(
+    module_init_registry: ServerModuleInitRegistry,
+    code_version_hash: &str,
+    code_version_vendor_suffix: Option<&str>,
+    extra_logging_layer: Option<ExtraTracingLayer>,
+) -> anyhow::Result<Infallible> {
     assert_eq!(
         env!("FEDIMINT_BUILD_CODE_VERSION").len(),
         code_version_hash.len(),
@@ -280,7 +316,12 @@ pub async fn run(
         .tokio_console_bind(server_opts.bind_tokio_console)
         .with_jaeger(server_opts.with_jaeger);
 
-    tracing_builder.init().unwrap();
+    if let Some(layer) = extra_logging_layer {
+        tracing_builder.with_boxed_extra_layer(layer);
+    }
+    tracing_builder
+        .init()
+        .expect("logging initialization succeeds");
 
     info!(
         safe_to_share = true,
