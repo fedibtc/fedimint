@@ -282,7 +282,10 @@ pub async fn run(
 
     tracing_builder.init().unwrap();
 
-    info!("Starting fedimintd (version: {fedimint_version} version_hash: {code_version_hash})");
+    info!(
+        safe_to_share = true,
+        "Starting fedimintd (version: {fedimint_version} version_hash: {code_version_hash})"
+    );
 
     #[cfg(all(
         not(feature = "jemalloc"),
@@ -290,6 +293,7 @@ pub async fn run(
     ))]
     warn!(
         target: LOG_SERVER,
+        safe_to_share = true,
         "fedimintd was built without the `jemalloc` feature. rocksdb is prone to memory \
          fragmentation with the default allocator; consider rebuilding with `--features jemalloc`."
     );
@@ -406,18 +410,18 @@ pub async fn run(
         .make_handle()
         .make_shutdown_rx()
         .then(|()| async {
-            info!(target: LOG_CORE, "Shutdown called");
+            info!(target: LOG_CORE, safe_to_share = true, "Shutdown called");
         });
 
     shutdown_future.await;
 
-    debug!(target: LOG_CORE, "Terminating main task");
+    debug!(target: LOG_CORE, safe_to_share = true, "Terminating main task");
 
     if let Err(err) = root_task_group.join_all(Some(SHUTDOWN_TIMEOUT)).await {
         error!(target: LOG_CORE, err = %err.fmt_compact_anyhow(), "Error while shutting down task group");
     }
 
-    debug!(target: LOG_CORE, "Shutdown complete");
+    debug!(target: LOG_CORE, safe_to_share = true, "Shutdown complete");
 
     fedimint_logging::shutdown();
 

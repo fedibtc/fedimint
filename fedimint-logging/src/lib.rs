@@ -13,6 +13,12 @@
 //! This makes it easier to filter interesting calls when
 //! running e.g. `devimint`, that will run both server and client
 //! side.
+//!
+//! An event may carry `safe_to_share = true` only when its complete rendered
+//! message, fields, formatting/error chains, and occurrence contain no secrets,
+//! personal data, operator identity, or operator/private free-form payloads.
+//! Opaque protocol identifiers and operational correlation are allowed; the
+//! marker is not an anonymity guarantee or authorization to collect the event.
 
 use std::fs::File;
 use std::{env, io};
