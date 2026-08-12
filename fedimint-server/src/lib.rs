@@ -51,7 +51,7 @@ use net::api::ApiSecrets;
 use net::p2p::P2PStatusReceivers;
 use net::p2p_connector::IrohConnector;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::config::ConfigGenSettings;
 use crate::config::io::{
@@ -139,19 +139,32 @@ pub async fn run(
 
             (cfg, connections, p2p_status_receivers)
         }
-        None => {
-            Box::pin(run_config_gen(
-                data_dir.clone(),
-                settings.clone(),
-                db.clone(),
-                &task_group,
-                code_version_str.clone(),
-                force_api_secrets.clone(),
-                setup_ui_router,
-                module_init_registry.clone(),
-            ))
-            .await?
-        }
+        None => Box::pin(run_config_gen(
+            data_dir.clone(),
+            settings.clone(),
+            db.clone(),
+            &task_group,
+            code_version_str.clone(),
+            force_api_secrets.clone(),
+            setup_ui_router,
+            module_init_registry.clone(),
+        ))
+        .await
+        .map_err(|err| {
+            error!(
+                target: LOG_CONSENSUS,
+                error = format_args!("{err:#}"),
+                "configuration generation failed"
+            );
+            warn!(
+                target: LOG_CONSENSUS,
+                safe_to_share = true,
+                stage = "configuration_generation",
+                failure_kind = "fatal",
+                "Configuration generation failed"
+            );
+            err
+        })?,
     };
 
     let decoders = module_init_registry.decoders_strict(
@@ -274,21 +287,44 @@ pub async fn run_config_gen(
 
     let ui_listener = TcpListener::bind(settings.ui_bind)
         .await
-        .expect("Failed to bind setup UI");
+        .context("Failed to bind setup UI")?;
 
     ui_task_group.spawn("setup-ui", move |handle| async move {
-        axum::serve(ui_listener, ui_service)
+        if let Err(err) = axum::serve(ui_listener, ui_service)
             .with_graceful_shutdown(handle.make_shutdown_rx())
             .await
-            .expect("Failed to serve setup UI");
+        {
+            error!(error = %err, "setup UI server failed");
+            warn!(
+                safe_to_share = true,
+                stage = "setup_ui",
+                failure_kind = "server_failed",
+                "Configuration generation failed"
+            );
+            panic!("Failed to serve setup UI");
+        }
     });
 
     info!(target: LOG_CONSENSUS, "Setup UI running at http://{} 🚀", settings.ui_bind);
+    info!(
+        target: LOG_CONSENSUS,
+        safe_to_share = true,
+        stage = "setup_services",
+        "Configuration setup services are ready"
+    );
 
     let cg_params = cgp_receiver
         .recv()
         .await
-        .expect("Config gen params receiver closed unexpectedly");
+        .context("Config gen params receiver closed unexpectedly")?;
+
+    info!(
+        target: LOG_CONSENSUS,
+        safe_to_share = true,
+        stage = "setup_parameters",
+        peer_count = cg_params.peer_ids().len(),
+        "Configuration generation parameters accepted"
+    );
 
     // HACK: The `start-dkg` API call needs to have some time to finish
     // before we shut down api handling. There's no easy and good way to do
@@ -297,7 +333,7 @@ pub async fn run_config_gen(
 
     api_handler
         .stop()
-        .expect("Config api should still be running");
+        .map_err(|err| anyhow::anyhow!("Config API stopped before DKG: {err}"))?;
 
     api_handler.stopped().await;
 
@@ -330,6 +366,14 @@ pub async fn run_config_gen(
         .await?
         .into_dyn()
     };
+
+    info!(
+        target: LOG_CONSENSUS,
+        safe_to_share = true,
+        stage = "p2p_connector",
+        transport = if cg_params.iroh_endpoints().is_empty() { "tcp_tls" } else { "iroh" },
+        "Configuration-generation peer connector is ready"
+    );
 
     let (p2p_status_senders, p2p_status_receivers) = p2p_status_channels(connector.peers());
 
@@ -368,6 +412,13 @@ pub async fn run_config_gen(
         &module_init_registry,
         api_secrets.get_active(),
     )?;
+
+    info!(
+        target: LOG_CONSENSUS,
+        safe_to_share = true,
+        stage = "configuration_persistence",
+        "Generated server configuration was persisted"
+    );
 
     Ok((cfg, connections, p2p_status_receivers))
 }

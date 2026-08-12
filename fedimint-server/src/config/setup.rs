@@ -31,6 +31,7 @@ use rand::rngs::OsRng;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Sender;
 use tokio_rustls::rustls;
+use tracing::{info, warn};
 
 use crate::config::{ConfigGenParams, ConfigGenSettings, PeerSetupCode};
 use crate::net::api::HasApiContext;
@@ -514,6 +515,31 @@ impl HasApiContext<SetupApi> for SetupApi {
     }
 }
 
+fn trace_setup_result<T>(
+    operation: &'static str,
+    result: Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    match &result {
+        Ok(_) => info!(
+            safe_to_share = true,
+            stage = "setup_api",
+            operation,
+            "Setup API operation completed"
+        ),
+        Err(error) => {
+            warn!(operation, ?error, "Setup API operation failed");
+            warn!(
+                safe_to_share = true,
+                stage = "setup_api",
+                operation,
+                failure_kind = "request_rejected",
+                "Config generation request failed"
+            );
+        }
+    }
+    result
+}
+
 pub fn server_endpoints() -> Vec<ApiEndpoint<SetupApi>> {
     vec![
         api_endpoint! {
@@ -527,24 +553,32 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<SetupApi>> {
             SET_LOCAL_PARAMS_ENDPOINT,
             ApiVersion::new(0, 0),
             async |config: &SetupApi, context, request: SetLocalParamsRequest| -> String {
-                let auth = context
-                    .request_auth()
-                    .ok_or(ApiError::bad_request("Missing password".to_string()))?;
+                let result = async {
+                    let auth = context
+                        .request_auth()
+                        .ok_or(ApiError::bad_request("Missing password".to_string()))?;
 
-                 config.set_local_parameters(auth, request.name, request.federation_name, request.disable_base_fees, request.enabled_modules, request.federation_size)
-                    .await
-                    .map_err(|e| ApiError::bad_request(e.to_string()))
+                    config.set_local_parameters(auth, request.name, request.federation_name, request.disable_base_fees, request.enabled_modules, request.federation_size)
+                        .await
+                        .map_err(|e| ApiError::bad_request(e.to_string()))
+                }
+                .await;
+                trace_setup_result("set_local_parameters", result)
             }
         },
         api_endpoint! {
             ADD_PEER_SETUP_CODE_ENDPOINT,
             ApiVersion::new(0, 0),
             async |config: &SetupApi, context, info: String| -> String {
-                check_auth(context)?;
+                let result = async {
+                    check_auth(context)?;
 
-                config.add_peer_setup_code(info.clone())
-                    .await
-                    .map_err(|e|ApiError::bad_request(e.to_string()))
+                    config.add_peer_setup_code(info)
+                        .await
+                        .map_err(|e|ApiError::bad_request(e.to_string()))
+                }
+                .await;
+                trace_setup_result("add_peer_setup_code", result)
             }
         },
         api_endpoint! {
@@ -571,9 +605,13 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<SetupApi>> {
             START_DKG_ENDPOINT,
             ApiVersion::new(0, 0),
             async |config: &SetupApi, context, _v: ()| -> () {
-                check_auth(context)?;
+                let result = async {
+                    check_auth(context)?;
 
-                config.start_dkg().await.map_err(|e| ApiError::server_error(e.to_string()))
+                    config.start_dkg().await.map_err(|e| ApiError::server_error(e.to_string()))
+                }
+                .await;
+                trace_setup_result("start_dkg", result)
             }
         },
     ]
