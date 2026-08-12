@@ -257,8 +257,8 @@ impl ISetupApi for SetupApi {
                 federation_size,
             }
         } else {
-            let (tls_cert, tls_key) =
-                gen_cert_and_key(&name).expect("Failed to generate TLS for given guardian name");
+            let (tls_cert, tls_key) = gen_cert_and_key(&name)
+                .context("Failed to generate TLS for given guardian name")?;
 
             LocalParams {
                 auth,
@@ -304,7 +304,7 @@ impl ISetupApi for SetupApi {
         let local_params = state
             .local_params
             .clone()
-            .expect("The endpoint is authenticated.");
+            .context("The endpoint is authenticated but local parameters are absent")?;
 
         ensure!(
             info != local_params.setup_code(),
@@ -375,7 +375,7 @@ impl ISetupApi for SetupApi {
         let local_params = state
             .local_params
             .clone()
-            .expect("The endpoint is authenticated.");
+            .context("The endpoint is authenticated but local parameters are absent")?;
 
         let our_setup_code = local_params.setup_code();
 
