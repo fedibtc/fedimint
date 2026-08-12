@@ -85,6 +85,25 @@ pub type DashboardUiRouter = Box<dyn Fn(DynDashboardApi) -> axum::Router + Send>
 /// A function/closure type for handling setup UI
 pub type SetupUiRouter = Box<dyn Fn(DynSetupApi) -> axum::Router + Send>;
 
+fn config_gen_failure(
+    stage: &'static str,
+    failure_kind: &'static str,
+    error: impl Into<anyhow::Error>,
+) -> anyhow::Error {
+    let error = error.into();
+    tracing::error!(
+        error = format_args!("{error:#}"),
+        "configuration generation stage failed"
+    );
+    tracing::warn!(
+        safe_to_share = true,
+        stage,
+        failure_kind,
+        "Configuration generation failed"
+    );
+    error
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     data_dir: PathBuf,
@@ -287,7 +306,8 @@ pub async fn run_config_gen(
 
     let ui_listener = TcpListener::bind(settings.ui_bind)
         .await
-        .context("Failed to bind setup UI")?;
+        .context("Failed to bind setup UI")
+        .map_err(|error| config_gen_failure("setup_ui_bind", "bind_failed", error))?;
 
     ui_task_group.spawn("setup-ui", move |handle| async move {
         if let Err(err) = axum::serve(ui_listener, ui_service)
@@ -313,10 +333,13 @@ pub async fn run_config_gen(
         "Configuration setup services are ready"
     );
 
-    let cg_params = cgp_receiver
-        .recv()
-        .await
-        .context("Config gen params receiver closed unexpectedly")?;
+    let cg_params = cgp_receiver.recv().await.ok_or_else(|| {
+        config_gen_failure(
+            "setup_parameters",
+            "channel_closed",
+            anyhow::anyhow!("Config gen params receiver closed unexpectedly"),
+        )
+    })?;
 
     info!(
         target: LOG_CONSENSUS,
@@ -333,14 +356,16 @@ pub async fn run_config_gen(
 
     api_handler
         .stop()
-        .map_err(|err| anyhow::anyhow!("Config API stopped before DKG: {err}"))?;
+        .map_err(|error| anyhow::anyhow!("Config API stopped before DKG: {error}"))
+        .map_err(|error| config_gen_failure("setup_api_shutdown", "stop_failed", error))?;
 
     api_handler.stopped().await;
 
     ui_task_group
         .shutdown_join_all(None)
         .await
-        .context("Failed to shutdown UI server after config gen")?;
+        .context("Failed to shutdown UI server after config gen")
+        .map_err(|error| config_gen_failure("setup_ui_shutdown", "task_join_failed", error))?;
 
     let connector = if cg_params.iroh_endpoints().is_empty() {
         TlsTcpConnector::new(
@@ -363,7 +388,8 @@ pub async fn run_config_gen(
                 .map(|(peer, endpoints)| (*peer, endpoints.p2p_pk))
                 .collect(),
         )
-        .await?
+        .await
+        .map_err(|error| config_gen_failure("p2p_connector", "initialization_failed", error))?
         .into_dyn()
     };
 
@@ -403,15 +429,27 @@ pub async fn run_config_gen(
     write_new(
         data_dir.join(PLAINTEXT_PASSWORD),
         cfg.private.api_auth.as_str(),
-    )?;
-    write_new(data_dir.join(SALT_FILE), random_salt())?;
+    )
+    .map_err(|error| {
+        config_gen_failure("configuration_persistence", "password_write_failed", error)
+    })?;
+    write_new(data_dir.join(SALT_FILE), random_salt()).map_err(|error| {
+        config_gen_failure("configuration_persistence", "salt_write_failed", error)
+    })?;
     write_server_config(
         &cfg,
         &data_dir,
         cfg.private.api_auth.as_str(),
         &module_init_registry,
         api_secrets.get_active(),
-    )?;
+    )
+    .map_err(|error| {
+        config_gen_failure(
+            "configuration_persistence",
+            "server_config_write_failed",
+            error,
+        )
+    })?;
 
     info!(
         target: LOG_CONSENSUS,

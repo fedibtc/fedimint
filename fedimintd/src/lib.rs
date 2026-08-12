@@ -230,7 +230,7 @@ impl ServerOpts {
             let password = self
                 .bitcoind_password
                 .clone()
-                .expect("FM_BITCOIND_URL is set but FM_BITCOIND_PASSWORD is not");
+                .context("FM_BITCOIND_URL is set but FM_BITCOIND_PASSWORD is not")?;
             Ok((url, password))
         }
     }
