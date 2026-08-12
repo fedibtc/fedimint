@@ -96,6 +96,14 @@ impl<M: Send + 'static> ReconnectP2PConnections<M> {
                     },
                     Err(err) => {
                         warn!(target: LOG_NET_PEER, our_id = %identity, err = %err.fmt_compact_anyhow(), "Error while opening incoming connection");
+                        warn!(
+                            target: LOG_NET_PEER,
+                            safe_to_share = true,
+                            stage = "p2p_accept",
+                            failure_kind = "accept_failed",
+                            own_peer_id = %identity,
+                            "Peer connection failed"
+                        );
                     }
                 }
             }
@@ -272,9 +280,18 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                 Some(self.send_message(connection, message.ok()?).await)
             },
             connection = self.incoming_connections.recv() => {
+                let connection = connection.ok()?;
                 info!(target: LOG_NET_PEER, "Connected to peer");
+                info!(
+                    target: LOG_NET_PEER,
+                    safe_to_share = true,
+                    stage = "p2p_connection",
+                    direction = "incoming_replacement",
+                    peer_id = %self.peer_id,
+                    "Connected to DKG peer"
+                );
 
-                Some(P2PConnectionSMState::Connected(connection.ok()?))
+                Some(P2PConnectionSMState::Connected(connection))
             },
             message = connection.receive() => {
                 let mut message = match message {
@@ -302,6 +319,14 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
 
     fn disconnect(&self, error: anyhow::Error) -> P2PConnectionSMState<M> {
         info!(target: LOG_NET_PEER, "Disconnected from peer: {}",  error);
+        warn!(
+            target: LOG_NET_PEER,
+            safe_to_share = true,
+            stage = "p2p_connection",
+            failure_kind = "disconnected",
+            peer_id = %self.peer_id,
+            "Disconnected from DKG peer"
+        );
 
         PEER_DISCONNECT_COUNT
             .with_label_values(&[&self.our_id_str, &self.peer_id_str])
@@ -336,13 +361,22 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
     ) -> Option<P2PConnectionSMState<M>> {
         tokio::select! {
             connection = self.incoming_connections.recv() => {
+                let connection = connection.ok()?;
                 PEER_CONNECT_COUNT
                     .with_label_values(&[self.our_id_str.as_str(), self.peer_id_str.as_str(), "incoming"])
                     .inc();
 
                 info!(target: LOG_NET_PEER, "Connected to peer");
+                info!(
+                    target: LOG_NET_PEER,
+                    safe_to_share = true,
+                    stage = "p2p_connection",
+                    direction = "incoming",
+                    peer_id = %self.peer_id,
+                    "Connected to DKG peer"
+                );
 
-                Some(P2PConnectionSMState::Connected(connection.ok()?))
+                Some(P2PConnectionSMState::Connected(connection))
             },
             // to prevent "reconnection ping-pongs", only the side with lower PeerId reconnects
             () = sleep(backoff.next().expect("Unlimited retries")), if self.our_id < self.peer_id => {
@@ -357,10 +391,28 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                             .inc();
 
                         info!(target: LOG_NET_PEER, "Connected to peer");
+                        info!(
+                            target: LOG_NET_PEER,
+                            safe_to_share = true,
+                            stage = "p2p_connection",
+                            direction = "outgoing",
+                            peer_id = %self.peer_id,
+                            "Connected to DKG peer"
+                        );
 
                         return Some(P2PConnectionSMState::Connected(connection));
                     }
-                    Err(e) => warn!(target: LOG_CONSENSUS, "Failed to connect to peer: {e}")
+                    Err(e) => {
+                        warn!(target: LOG_CONSENSUS, "Failed to connect to peer: {e}");
+                        warn!(
+                            target: LOG_CONSENSUS,
+                            safe_to_share = true,
+                            stage = "p2p_connection",
+                            failure_kind = "connect_failed",
+                            peer_id = %self.peer_id,
+                            "Peer connection failed"
+                        );
+                    }
                 }
 
                 Some(P2PConnectionSMState::Disconnected(backoff))

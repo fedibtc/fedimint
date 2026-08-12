@@ -354,7 +354,23 @@ async fn run_inner(
             url = %format!("http://{}/metrics", bind_metrics),
             "Initializing metrics server",
         );
-        fedimint_metrics::spawn_api_server(*bind_metrics, root_task_group.clone()).await?;
+        if let Err(err) =
+            fedimint_metrics::spawn_api_server(*bind_metrics, root_task_group.clone()).await
+        {
+            error!(
+                target: LOG_SERVER,
+                error = format_args!("{err:#}"),
+                "metrics server startup failed"
+            );
+            error!(
+                target: LOG_SERVER,
+                safe_to_share = true,
+                stage = "metrics_server",
+                failure_kind = "startup_failed",
+                "fedimintd startup failed"
+            );
+            return Err(err);
+        }
     }
 
     let settings = ConfigGenSettings {
@@ -371,51 +387,87 @@ async fn run_inner(
         default_modules: module_init_registry.default_modules(),
     };
 
-    let db = Database::new(
-        RocksDb::build(server_opts.data_dir.join(DB_FILE))
-            .open()
-            .await
-            .unwrap(),
-        ModuleRegistry::default(),
-    );
+    let rocks_db = match RocksDb::build(server_opts.data_dir.join(DB_FILE))
+        .open()
+        .await
+    {
+        Ok(db) => db,
+        Err(err) => {
+            error!(
+                target: LOG_SERVER,
+                error = format_args!("{err:#}"),
+                "fedimintd database open failed"
+            );
+            error!(
+                target: LOG_SERVER,
+                safe_to_share = true,
+                stage = "database_open",
+                failure_kind = "open_failed",
+                "fedimintd startup failed"
+            );
+            return Err(err.into());
+        }
+    };
+    let db = Database::new(rocks_db, ModuleRegistry::default());
 
-    let dyn_server_bitcoin_rpc = match (
-        server_opts.bitcoind_url.as_ref(),
-        server_opts.esplora_url.as_ref(),
-    ) {
-        (Some(_), None) => {
-            let bitcoind_username = server_opts
-                .bitcoind_username
-                .clone()
-                .expect("FM_BITCOIND_URL is set but FM_BITCOIND_USERNAME is not");
-            let (bitcoind_url, bitcoind_password) = server_opts
-                .get_bitcoind_url_and_password()
-                .await
-                .expect("Failed to get bitcoind url");
-            BitcoindClient::new(bitcoind_username, bitcoind_password, &bitcoind_url)
-                .unwrap()
-                .into_dyn()
+    let dyn_server_bitcoin_rpc = async {
+        Ok::<_, anyhow::Error>(
+            match (
+                server_opts.bitcoind_url.as_ref(),
+                server_opts.esplora_url.as_ref(),
+            ) {
+                (Some(_), None) => {
+                    let bitcoind_username = server_opts
+                        .bitcoind_username
+                        .clone()
+                        .context("FM_BITCOIND_URL is set but FM_BITCOIND_USERNAME is not")?;
+                    let (bitcoind_url, bitcoind_password) = server_opts
+                        .get_bitcoind_url_and_password()
+                        .await
+                        .context("Failed to get bitcoind url")?;
+                    BitcoindClient::new(bitcoind_username, bitcoind_password, &bitcoind_url)?
+                        .into_dyn()
+                }
+                (None, Some(url)) => EsploraClient::new(url)?.into_dyn(),
+                (Some(_), Some(esplora_url)) => {
+                    let bitcoind_username = server_opts
+                        .bitcoind_username
+                        .clone()
+                        .context("FM_BITCOIND_URL is set but FM_BITCOIND_USERNAME is not")?;
+                    let (bitcoind_url, bitcoind_password) = server_opts
+                        .get_bitcoind_url_and_password()
+                        .await
+                        .context("Failed to get bitcoind url")?;
+                    BitcoindClientWithFallback::new(
+                        bitcoind_username,
+                        bitcoind_password,
+                        &bitcoind_url,
+                        esplora_url,
+                    )?
+                    .into_dyn()
+                }
+                _ => unreachable!("ArgGroup already enforced XOR relation"),
+            },
+        )
+    }
+    .await;
+    let dyn_server_bitcoin_rpc = match dyn_server_bitcoin_rpc {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                target: LOG_SERVER,
+                error = format_args!("{err:#}"),
+                "bitcoin RPC client initialization failed"
+            );
+            error!(
+                target: LOG_SERVER,
+                safe_to_share = true,
+                stage = "bitcoin_rpc_client",
+                failure_kind = "initialization_failed",
+                "fedimintd startup failed"
+            );
+            return Err(err);
         }
-        (None, Some(url)) => EsploraClient::new(url).unwrap().into_dyn(),
-        (Some(_), Some(esplora_url)) => {
-            let bitcoind_username = server_opts
-                .bitcoind_username
-                .clone()
-                .expect("FM_BITCOIND_URL is set but FM_BITCOIND_USERNAME is not");
-            let (bitcoind_url, bitcoind_password) = server_opts
-                .get_bitcoind_url_and_password()
-                .await
-                .expect("Failed to get bitcoind url");
-            BitcoindClientWithFallback::new(
-                bitcoind_username,
-                bitcoind_password,
-                &bitcoind_url,
-                esplora_url,
-            )
-            .unwrap()
-            .into_dyn()
-        }
-        _ => unreachable!("ArgGroup already enforced XOR relation"),
     };
     let dyn_server_bitcoin_rpc =
         ServerBitcoinRpcTracked::new(dyn_server_bitcoin_rpc, "server").into_dyn();
@@ -444,7 +496,21 @@ async fn run_inner(
             ),
         )
         .await
-        .unwrap_or_else(|err| panic!("Main task returned error: {}", err.fmt_compact_anyhow()));
+        .unwrap_or_else(|err| {
+            error!(
+                target: LOG_SERVER,
+                error = format_args!("{err:#}"),
+                "fedimintd main task failed"
+            );
+            error!(
+                target: LOG_SERVER,
+                safe_to_share = true,
+                stage = "server_main",
+                failure_kind = "fatal",
+                "fedimintd main task failed"
+            );
+            panic!("fedimintd main task failed");
+        });
     });
 
     let shutdown_future = root_task_group
@@ -460,6 +526,13 @@ async fn run_inner(
 
     if let Err(err) = root_task_group.join_all(Some(SHUTDOWN_TIMEOUT)).await {
         error!(target: LOG_CORE, err = %err.fmt_compact_anyhow(), "Error while shutting down task group");
+        error!(
+            target: LOG_CORE,
+            safe_to_share = true,
+            stage = "shutdown",
+            failure_kind = "task_join_failed",
+            "fedimintd shutdown failed"
+        );
     }
 
     debug!(target: LOG_CORE, safe_to_share = true, "Shutdown complete");
