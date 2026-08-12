@@ -559,6 +559,13 @@ impl ServerConfig {
                 &code_version_str,
             );
 
+            info!(
+                target: LOG_NET_PEER_DKG,
+                safe_to_share = true,
+                mode = "single_guardian_trusted_dealer",
+                "Config generation has completed successfully!"
+            );
+
             return Ok(server[&params.identity].clone());
         }
 
@@ -599,6 +606,14 @@ impl ServerConfig {
             }
         }
 
+        info!(
+            target: LOG_NET_PEER_DKG,
+            safe_to_share = true,
+            stage = "p2p_connections",
+            peer_count = params.peer_ids().len(),
+            "All DKG peer connections are open"
+        );
+
         let checksum = params.peers.consensus_hash_sha256();
 
         info!(
@@ -616,7 +631,24 @@ impl ServerConfig {
             let peer_message = connections
                 .receive_from_peer(peer)
                 .await
-                .context("Unexpected shutdown of p2p connections")?;
+                .context("Unexpected shutdown of p2p connections")
+                .map_err(|err| {
+                    error!(
+                        target: LOG_NET_PEER_DKG,
+                        peer_id = %peer,
+                        error = format_args!("{err:#}"),
+                        "connection-code checksum exchange failed"
+                    );
+                    warn!(
+                        target: LOG_NET_PEER_DKG,
+                        safe_to_share = true,
+                        stage = "connection_code_checksum",
+                        failure_kind = "connection_closed",
+                        peer_id = %peer,
+                        "Config generation failed"
+                    );
+                    err
+                })?;
 
             if peer_message != P2PMessage::Checksum(checksum) {
                 error!(
@@ -624,6 +656,14 @@ impl ServerConfig {
                     expected = ?P2PMessage::Checksum(checksum),
                     received = ?peer_message,
                     "Peer {peer} has sent invalid connection code checksum message"
+                );
+                warn!(
+                    target: LOG_NET_PEER_DKG,
+                    safe_to_share = true,
+                    stage = "connection_code_checksum",
+                    failure_kind = "mismatch",
+                    peer_id = %peer,
+                    "Config generation failed"
                 );
 
                 bail!("Peer {peer} has sent invalid connection code checksum message");
@@ -639,6 +679,13 @@ impl ServerConfig {
         info!(
             target: LOG_NET_PEER_DKG,
             safe_to_share = true,
+            stage = "connection_code_checksum",
+            "All connection-code checksums agree"
+        );
+
+        info!(
+            target: LOG_NET_PEER_DKG,
+            safe_to_share = true,
             "Running config generation..."
         );
 
@@ -650,7 +697,32 @@ impl ServerConfig {
 
         let (broadcast_sk, broadcast_pk) = secp256k1::generate_keypair(&mut OsRng);
 
-        let broadcast_public_keys = handle.exchange_encodable(broadcast_pk).await?;
+        let broadcast_public_keys =
+            handle
+                .exchange_encodable(broadcast_pk)
+                .await
+                .map_err(|err| {
+                    error!(
+                        target: LOG_NET_PEER_DKG,
+                        error = format_args!("{err:#}"),
+                        "broadcast public-key exchange failed"
+                    );
+                    warn!(
+                        target: LOG_NET_PEER_DKG,
+                        safe_to_share = true,
+                        stage = "broadcast_public_key_exchange",
+                        failure_kind = "exchange_failed",
+                        "Config generation failed"
+                    );
+                    err
+                })?;
+
+        info!(
+            target: LOG_NET_PEER_DKG,
+            safe_to_share = true,
+            stage = "broadcast_public_key_exchange",
+            "Broadcast public-key exchange completed"
+        );
 
         let args = ConfigGenModuleArgs {
             network: params.network,
@@ -677,7 +749,43 @@ impl ServerConfig {
                 "Running config generation for module of kind {kind}..."
             );
 
-            let cfg = module_init.distributed_gen(&handle, &args).await?;
+            info!(
+                target: LOG_NET_PEER_DKG,
+                safe_to_share = true,
+                stage = "module_config_generation",
+                module_instance = module_id,
+                "Module config generation started"
+            );
+
+            let cfg = module_init
+                .distributed_gen(&handle, &args)
+                .await
+                .map_err(|err| {
+                    error!(
+                        target: LOG_NET_PEER_DKG,
+                        module_instance = module_id,
+                        module_kind = %kind,
+                        error = format_args!("{err:#}"),
+                        "module config generation failed"
+                    );
+                    warn!(
+                        target: LOG_NET_PEER_DKG,
+                        safe_to_share = true,
+                        stage = "module_config_generation",
+                        failure_kind = "module_failed",
+                        module_instance = module_id,
+                        "Config generation failed"
+                    );
+                    err
+                })?;
+
+            info!(
+                target: LOG_NET_PEER_DKG,
+                safe_to_share = true,
+                stage = "module_config_generation",
+                module_instance = module_id,
+                "Module config generation completed"
+            );
 
             module_cfgs.insert(module_id as ModuleInstanceId, cfg);
         }
@@ -708,7 +816,24 @@ impl ServerConfig {
             let peer_message = connections
                 .receive_from_peer(peer)
                 .await
-                .context("Unexpected shutdown of p2p connections")?;
+                .context("Unexpected shutdown of p2p connections")
+                .map_err(|err| {
+                    error!(
+                        target: LOG_NET_PEER_DKG,
+                        peer_id = %peer,
+                        error = format_args!("{err:#}"),
+                        "consensus-config checksum exchange failed"
+                    );
+                    warn!(
+                        target: LOG_NET_PEER_DKG,
+                        safe_to_share = true,
+                        stage = "consensus_config_checksum",
+                        failure_kind = "connection_closed",
+                        peer_id = %peer,
+                        "Config generation failed"
+                    );
+                    err
+                })?;
 
             if peer_message != P2PMessage::Checksum(checksum) {
                 warn!(
@@ -717,6 +842,14 @@ impl ServerConfig {
                     received = ?peer_message,
                     config = ?cfg.consensus,
                     "Peer {peer} has sent invalid consensus config checksum message"
+                );
+                warn!(
+                    target: LOG_NET_PEER_DKG,
+                    safe_to_share = true,
+                    stage = "consensus_config_checksum",
+                    failure_kind = "mismatch",
+                    peer_id = %peer,
+                    "Config generation failed"
                 );
 
                 bail!("Peer {peer} has sent invalid consensus config checksum message");
