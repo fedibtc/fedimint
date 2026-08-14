@@ -10,7 +10,8 @@ use fedimint_core::admin_client::{SetLocalParamsRequest, SetupStatus};
 use fedimint_core::base32::FEDIMINT_PREFIX;
 use fedimint_core::config::META_FEDERATION_NAME_KEY;
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
-use fedimint_core::db::Database;
+use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped as _};
+use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::endpoint_constants::{
     ADD_PEER_SETUP_CODE_ENDPOINT, GET_SETUP_CODE_ENDPOINT, RESET_PEER_SETUP_CODES_ENDPOINT,
     SET_LOCAL_PARAMS_ENDPOINT, SETUP_STATUS_ENDPOINT, START_DKG_ENDPOINT,
@@ -24,7 +25,7 @@ use fedimint_core::module::{
 };
 use fedimint_core::net::auth::check_auth;
 use fedimint_core::setup_code::PeerEndpoints;
-use fedimint_core::{PeerId, base32};
+use fedimint_core::{PeerId, base32, impl_db_record};
 use fedimint_server_core::setup_ui::ISetupApi;
 use iroh::SecretKey;
 use rand::rngs::OsRng;
@@ -34,6 +35,7 @@ use tokio_rustls::rustls;
 use tracing::{info, warn};
 
 use crate::config::{ConfigGenParams, ConfigGenSettings, PeerSetupCode};
+use crate::db::DbKeyPrefix;
 use crate::net::api::HasApiContext;
 use crate::net::p2p_connector::gen_cert_and_key;
 
@@ -47,6 +49,36 @@ pub struct SetupState {
     /// Current phase of the setup process
     phase: SetupPhase,
 }
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+struct PersistedSetupState {
+    local_params: Option<PersistedLocalParams>,
+    setup_codes: BTreeSet<PeerSetupCode>,
+}
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+struct PersistedLocalParams {
+    auth: String,
+    tls_key: Option<Vec<u8>>,
+    iroh_api_sk: Option<iroh::SecretKey>,
+    iroh_p2p_sk: Option<iroh::SecretKey>,
+    endpoints: PeerEndpoints,
+    name: String,
+    federation_name: Option<String>,
+    disable_base_fees: Option<bool>,
+    enabled_modules: Option<BTreeSet<ModuleKind>>,
+    federation_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Encodable, Decodable)]
+struct SetupStateKey;
+
+impl_db_record!(
+    key = SetupStateKey,
+    value = PersistedSetupState,
+    db_prefix = DbKeyPrefix::SetupState,
+    notify_on_modify = false,
+);
 
 #[derive(Debug, Clone, Default)]
 enum SetupPhase {
@@ -94,6 +126,45 @@ impl LocalParams {
             federation_size: self.federation_size,
         }
     }
+
+    fn persisted(&self) -> PersistedLocalParams {
+        PersistedLocalParams {
+            auth: self.auth.as_str().to_string(),
+            tls_key: self.tls_key.as_ref().map(|key| key.secret_der().to_vec()),
+            iroh_api_sk: self.iroh_api_sk.clone(),
+            iroh_p2p_sk: self.iroh_p2p_sk.clone(),
+            endpoints: self.endpoints.clone(),
+            name: self.name.clone(),
+            federation_name: self.federation_name.clone(),
+            disable_base_fees: self.disable_base_fees,
+            enabled_modules: self.enabled_modules.clone(),
+            federation_size: self.federation_size,
+        }
+    }
+}
+
+impl PersistedLocalParams {
+    fn into_local_params(self) -> anyhow::Result<LocalParams> {
+        Ok(LocalParams {
+            auth: ApiAuth::new(self.auth),
+            tls_key: self
+                .tls_key
+                .map(rustls::pki_types::PrivateKeyDer::try_from)
+                .transpose()
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to parse persisted setup TLS key: {error}")
+                })?
+                .map(Arc::new),
+            iroh_api_sk: self.iroh_api_sk,
+            iroh_p2p_sk: self.iroh_p2p_sk,
+            endpoints: self.endpoints,
+            name: self.name,
+            federation_name: self.federation_name,
+            disable_base_fees: self.disable_base_fees,
+            enabled_modules: self.enabled_modules,
+            federation_size: self.federation_size,
+        })
+    }
 }
 
 /// Serves the config gen API endpoints
@@ -110,13 +181,34 @@ pub struct SetupApi {
 }
 
 impl SetupApi {
-    pub fn new(settings: ConfigGenSettings, db: Database, sender: Sender<ConfigGenParams>) -> Self {
-        Self {
+    pub async fn new(
+        settings: ConfigGenSettings,
+        db: Database,
+        sender: Sender<ConfigGenParams>,
+    ) -> anyhow::Result<Self> {
+        let persisted = db
+            .begin_transaction_nc()
+            .await
+            .get_value(&SetupStateKey)
+            .await;
+        let state = match persisted {
+            Some(state) => SetupState {
+                local_params: state
+                    .local_params
+                    .map(PersistedLocalParams::into_local_params)
+                    .transpose()?,
+                setup_codes: state.setup_codes,
+                phase: SetupPhase::Setup,
+            },
+            None => SetupState::default(),
+        };
+
+        Ok(Self {
             settings,
-            state: Arc::new(Mutex::new(SetupState::default())),
+            state: Arc::new(Mutex::new(state)),
             db,
             sender,
-        }
+        })
     }
 
     pub async fn setup_status(&self) -> SetupStatus {
@@ -148,7 +240,21 @@ impl SetupApi {
     async fn reset_setup_codes_if_setup(&self) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         Self::ensure_setup_phase(&state)?;
-        state.setup_codes.clear();
+        let mut updated = state.clone();
+        updated.setup_codes.clear();
+        self.persist_state(&updated).await?;
+        *state = updated;
+        Ok(())
+    }
+
+    async fn persist_state(&self, state: &SetupState) -> anyhow::Result<()> {
+        let persisted = PersistedSetupState {
+            local_params: state.local_params.as_ref().map(LocalParams::persisted),
+            setup_codes: state.setup_codes.clone(),
+        };
+        let mut dbtx = self.db.begin_transaction().await;
+        dbtx.insert_entry(&SetupStateKey, &persisted).await;
+        dbtx.commit_tx_result().await?;
         Ok(())
     }
 }
@@ -328,7 +434,10 @@ impl ISetupApi for SetupApi {
             }
         };
 
-        state.local_params = Some(lp.clone());
+        let mut updated = state.clone();
+        updated.local_params = Some(lp.clone());
+        self.persist_state(&updated).await?;
+        *state = updated;
 
         Ok(base32::encode_prefixed(FEDIMINT_PREFIX, &lp.setup_code()))
     }
@@ -407,7 +516,10 @@ impl ISetupApi for SetupApi {
             );
         }
 
-        state.setup_codes.insert(info.clone());
+        let mut updated = state.clone();
+        updated.setup_codes.insert(info.clone());
+        self.persist_state(&updated).await?;
+        *state = updated;
 
         Ok(info.name)
     }

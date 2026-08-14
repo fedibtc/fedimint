@@ -283,7 +283,7 @@ pub async fn run_config_gen(
 
     let (cgp_sender, mut cgp_receiver) = tokio::sync::mpsc::channel(1);
 
-    let setup_api = SetupApi::new(settings.clone(), db.clone(), cgp_sender);
+    let setup_api = SetupApi::new(settings.clone(), db.clone(), cgp_sender).await?;
 
     let mut rpc_module = RpcModule::new(setup_api.clone());
 
