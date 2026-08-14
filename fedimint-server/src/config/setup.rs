@@ -525,6 +525,13 @@ impl ISetupApi for SetupApi {
     }
 
     async fn start_dkg(&self) -> anyhow::Result<()> {
+        self.start_dkg_with_expected_assignment(None).await
+    }
+
+    async fn start_dkg_with_expected_assignment(
+        &self,
+        expected_assignment: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
         let mut shared_state = self.state.lock().await;
         Self::ensure_setup_phase(&shared_state)?;
         let mut state = shared_state.clone();
@@ -537,6 +544,33 @@ impl ISetupApi for SetupApi {
         let our_setup_code = local_params.setup_code();
 
         state.setup_codes.insert(our_setup_code.clone());
+
+        if let Some(expected_assignment) = expected_assignment {
+            let expected_assignment: Vec<PeerSetupCode> = expected_assignment
+                .into_iter()
+                .map(|code| base32::decode_prefixed(FEDIMINT_PREFIX, &code))
+                .collect::<Result<_, _>>()
+                .context("Invalid setup code in expected peer assignment")?;
+
+            ensure!(
+                expected_assignment.len() == state.setup_codes.len(),
+                "Peer assignment contains {} setup codes, but the server has {}",
+                expected_assignment.len(),
+                state.setup_codes.len()
+            );
+            for (peer_index, (expected, assigned)) in expected_assignment
+                .iter()
+                .zip(state.setup_codes.iter())
+                .enumerate()
+            {
+                ensure!(
+                    expected == assigned,
+                    "Peer assignment mismatch at peer id {peer_index}: expected guardian '{}', but the server assigned '{}'",
+                    expected.name,
+                    assigned.name
+                );
+            }
+        }
 
         ensure!(
             state.setup_codes.len() == 1 || 4 <= state.setup_codes.len(),
@@ -770,11 +804,14 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<SetupApi>> {
         api_endpoint! {
             START_DKG_ENDPOINT,
             ApiVersion::new(0, 0),
-            async |config: &SetupApi, context, _v: ()| -> () {
+            async |config: &SetupApi, context, expected_assignment: Option<Vec<String>>| -> () {
                 let result = async {
                     check_auth(context)?;
 
-                    config.start_dkg().await.map_err(|e| ApiError::server_error(e.to_string()))
+                    config
+                        .start_dkg_with_expected_assignment(expected_assignment)
+                        .await
+                        .map_err(|e| ApiError::server_error(e.to_string()))
                 }
                 .await;
                 trace_setup_result("start_dkg", result)

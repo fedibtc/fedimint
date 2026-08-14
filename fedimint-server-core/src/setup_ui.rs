@@ -49,6 +49,17 @@ pub trait ISetupApi {
     /// Start the distributed key generation process
     async fn start_dkg(&self) -> Result<()>;
 
+    /// Start DKG after optionally verifying the ordered peer assignment
+    async fn start_dkg_with_expected_assignment(
+        &self,
+        expected_assignment: Option<Vec<String>>,
+    ) -> Result<()> {
+        if expected_assignment.is_some() {
+            anyhow::bail!("Expected peer assignment verification is not supported");
+        }
+        self.start_dkg().await
+    }
+
     /// Returns the expected federation size if any setup code (ours or a
     /// peer's) has set it
     async fn federation_size(&self) -> Option<u32>;
