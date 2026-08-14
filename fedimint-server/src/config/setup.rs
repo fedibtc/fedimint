@@ -29,8 +29,8 @@ use fedimint_core::{PeerId, base32, impl_db_record};
 use fedimint_server_core::setup_ui::ISetupApi;
 use iroh::SecretKey;
 use rand::rngs::OsRng;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::{Mutex, oneshot};
 use tokio_rustls::rustls;
 use tracing::{info, warn};
 
@@ -174,17 +174,25 @@ pub struct SetupApi {
     settings: ConfigGenSettings,
     /// In-memory state machine
     state: Arc<Mutex<SetupState>>,
-    /// DB not really used
+    /// Persistent setup storage
     db: Database,
     /// Triggers the distributed key generation
-    sender: Sender<ConfigGenParams>,
+    sender: Sender<ConfigGenRequest>,
+}
+
+/// Parameters for starting DKG and a signal acknowledging its commencement.
+pub struct ConfigGenRequest {
+    /// Parameters consumed by distributed config generation.
+    pub params: ConfigGenParams,
+    /// Signal sent from the first line of distributed config generation.
+    pub started: oneshot::Sender<()>,
 }
 
 impl SetupApi {
     pub async fn new(
         settings: ConfigGenSettings,
         db: Database,
-        sender: Sender<ConfigGenParams>,
+        sender: Sender<ConfigGenRequest>,
     ) -> anyhow::Result<Self> {
         let persisted = db
             .begin_transaction_nc()
@@ -635,12 +643,30 @@ impl ISetupApi for SetupApi {
         shared_state.phase = SetupPhase::DkgRunning;
         drop(shared_state);
 
-        if let Err(error) = self.sender.send(params).await {
+        let (started_sender, started_receiver) = oneshot::channel();
+        if let Err(error) = self
+            .sender
+            .send(ConfigGenRequest {
+                params,
+                started: started_sender,
+            })
+            .await
+        {
             let mut shared_state = self.state.lock().await;
             if matches!(shared_state.phase, SetupPhase::DkgRunning) {
                 shared_state.phase = SetupPhase::Setup;
             }
             return Err(error).context("Failed to send config gen params");
+        }
+
+        if started_receiver.await.is_err() {
+            let mut shared_state = self.state.lock().await;
+            if matches!(shared_state.phase, SetupPhase::DkgRunning) {
+                shared_state.phase = SetupPhase::Setup;
+            }
+            anyhow::bail!(
+                "DKG parameters were accepted, but the config generation task stopped before DKG started"
+            );
         }
 
         Ok(())

@@ -548,7 +548,9 @@ impl ServerConfig {
         code_version_str: String,
         connections: DynP2PConnections<P2PMessage>,
         mut p2p_status_receivers: P2PStatusReceivers,
+        dkg_started: impl FnOnce(),
     ) -> anyhow::Result<Self> {
+        dkg_started();
         let _timing /* logs on drop */ = timing::TimeReporter::new("distributed-gen").info();
 
         // in case we are running by ourselves, avoid DKG

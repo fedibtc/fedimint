@@ -332,13 +332,15 @@ pub async fn run_config_gen(
         "Configuration setup services are ready"
     );
 
-    let cg_params = cgp_receiver.recv().await.ok_or_else(|| {
+    let config_gen_request = cgp_receiver.recv().await.ok_or_else(|| {
         config_gen_failure(
             "setup_parameters",
             "channel_closed",
             anyhow::anyhow!("Config gen params receiver closed unexpectedly"),
         )
     })?;
+    let cg_params = config_gen_request.params;
+    let dkg_started_sender = config_gen_request.started;
 
     info!(
         target: LOG_CONSENSUS,
@@ -348,11 +350,9 @@ pub async fn run_config_gen(
         "Configuration generation parameters accepted"
     );
 
-    ui_task_group
-        .shutdown_join_all(None)
-        .await
-        .context("Failed to shutdown UI server after config gen started")
-        .map_err(|error| config_gen_failure("setup_ui_shutdown", "task_join_failed", error))?;
+    // Stop accepting setup UI requests now, but do not wait for active requests:
+    // the request that started DKG is waiting for the acknowledgement below.
+    ui_task_group.shutdown();
 
     let connector = if cg_params.iroh_endpoints().is_empty() {
         TlsTcpConnector::new(
@@ -404,6 +404,9 @@ pub async fn run_config_gen(
         code_version_str.clone(),
         connections.clone(),
         p2p_status_receivers.clone(),
+        move || {
+            let _ = dkg_started_sender.send(());
+        },
     )
     .await
     {
@@ -459,6 +462,12 @@ pub async fn run_config_gen(
         stage = "configuration_persistence",
         "Generated server configuration was persisted"
     );
+
+    ui_task_group
+        .join_all(None)
+        .await
+        .context("Failed to shutdown UI server after config gen started")
+        .map_err(|error| config_gen_failure("setup_ui_shutdown", "task_join_failed", error))?;
 
     api_handler
         .stop()
