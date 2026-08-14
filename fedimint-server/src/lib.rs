@@ -26,7 +26,6 @@ pub mod db;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::Context;
 use config::ServerConfig;
@@ -38,7 +37,7 @@ use fedimint_core::config::P2PMessage;
 use fedimint_core::db::{Database, DatabaseTransaction, IDatabaseTransactionOpsCoreTyped as _};
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::net::peers::DynP2PConnections;
-use fedimint_core::task::{TaskGroup, sleep};
+use fedimint_core::task::TaskGroup;
 use fedimint_core::util::write_new;
 use fedimint_logging::LOG_CONSENSUS;
 pub use fedimint_server_core as core;
@@ -300,7 +299,7 @@ pub async fn run_config_gen(
     )
     .await;
 
-    let ui_task_group = TaskGroup::new();
+    let ui_task_group = task_group.make_subgroup();
 
     let ui_service = setup_ui_handler(setup_api.clone().into_dyn()).into_make_service();
 
@@ -349,22 +348,10 @@ pub async fn run_config_gen(
         "Configuration generation parameters accepted"
     );
 
-    // HACK: The `start-dkg` API call needs to have some time to finish
-    // before we shut down api handling. There's no easy and good way to do
-    // that other than just giving it some grace period.
-    sleep(Duration::from_millis(100)).await;
-
-    api_handler
-        .stop()
-        .map_err(|error| anyhow::anyhow!("Config API stopped before DKG: {error}"))
-        .map_err(|error| config_gen_failure("setup_api_shutdown", "stop_failed", error))?;
-
-    api_handler.stopped().await;
-
     ui_task_group
         .shutdown_join_all(None)
         .await
-        .context("Failed to shutdown UI server after config gen")
+        .context("Failed to shutdown UI server after config gen started")
         .map_err(|error| config_gen_failure("setup_ui_shutdown", "task_join_failed", error))?;
 
     let connector = if cg_params.iroh_endpoints().is_empty() {
@@ -411,14 +398,29 @@ pub async fn run_config_gen(
     )
     .into_dyn();
 
-    let cfg = ServerConfig::distributed_gen(
+    let cfg = match ServerConfig::distributed_gen(
         &cg_params,
         module_init_registry.clone(),
         code_version_str.clone(),
         connections.clone(),
         p2p_status_receivers.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            error!(
+                target: LOG_CONSENSUS,
+                error = format_args!("{error:#}"),
+                "distributed key generation failed"
+            );
+            setup_api
+                .set_dkg_failed("distributed key generation failed; see server logs".to_string())
+                .await;
+            task_group.make_handle().make_shutdown_rx().await;
+            return Err(error);
+        }
+    };
 
     assert_ne!(
         cfg.consensus.iroh_endpoints.is_empty(),
@@ -457,6 +459,13 @@ pub async fn run_config_gen(
         stage = "configuration_persistence",
         "Generated server configuration was persisted"
     );
+
+    api_handler
+        .stop()
+        .map_err(|error| anyhow::anyhow!("Config API stopped after DKG: {error}"))
+        .map_err(|error| config_gen_failure("setup_api_shutdown", "stop_failed", error))?;
+
+    api_handler.stopped().await;
 
     Ok((cfg, connections, p2p_status_receivers))
 }

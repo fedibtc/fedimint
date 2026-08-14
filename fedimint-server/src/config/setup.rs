@@ -44,6 +44,16 @@ pub struct SetupState {
     local_params: Option<LocalParams>,
     /// Connection info received from other guardians
     setup_codes: BTreeSet<PeerSetupCode>,
+    /// Current phase of the setup process
+    phase: SetupPhase,
+}
+
+#[derive(Debug, Clone, Default)]
+enum SetupPhase {
+    #[default]
+    Setup,
+    DkgRunning,
+    DkgFailed(String),
 }
 
 #[derive(Clone, Debug)]
@@ -110,10 +120,36 @@ impl SetupApi {
     }
 
     pub async fn setup_status(&self) -> SetupStatus {
-        match self.state.lock().await.local_params {
-            Some(..) => SetupStatus::SharingConnectionCodes,
-            None => SetupStatus::AwaitingLocalParams,
+        let state = self.state.lock().await;
+        match &state.phase {
+            SetupPhase::DkgRunning => SetupStatus::DkgRunning,
+            SetupPhase::DkgFailed(reason) => SetupStatus::DkgFailed {
+                reason: reason.clone(),
+            },
+            SetupPhase::Setup => match state.local_params {
+                Some(..) => SetupStatus::SharingConnectionCodes,
+                None => SetupStatus::AwaitingLocalParams,
+            },
         }
+    }
+
+    fn ensure_setup_phase(state: &SetupState) -> anyhow::Result<()> {
+        ensure!(
+            matches!(state.phase, SetupPhase::Setup),
+            "Distributed key generation has already started"
+        );
+        Ok(())
+    }
+
+    pub async fn set_dkg_failed(&self, reason: String) {
+        self.state.lock().await.phase = SetupPhase::DkgFailed(reason);
+    }
+
+    async fn reset_setup_codes_if_setup(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        Self::ensure_setup_phase(&state)?;
+        state.setup_codes.clear();
+        Ok(())
     }
 }
 
@@ -166,7 +202,7 @@ impl ISetupApi for SetupApi {
     }
 
     async fn reset_setup_codes(&self) {
-        self.state.lock().await.setup_codes.clear();
+        let _ = self.reset_setup_codes_if_setup().await;
     }
 
     async fn set_local_parameters(
@@ -178,7 +214,9 @@ impl ISetupApi for SetupApi {
         enabled_modules: Option<BTreeSet<ModuleKind>>,
         federation_size: Option<u32>,
     ) -> anyhow::Result<String> {
-        if let Some(existing_local_parameters) = self.state.lock().await.local_params.clone()
+        let state = self.state.lock().await;
+        Self::ensure_setup_phase(&state)?;
+        if let Some(existing_local_parameters) = state.local_params.clone()
             && existing_local_parameters.auth.as_str() == auth.as_str()
             && existing_local_parameters.name == name
             && existing_local_parameters.federation_name == federation_name
@@ -191,6 +229,7 @@ impl ISetupApi for SetupApi {
                 &existing_local_parameters.setup_code(),
             ));
         }
+        drop(state);
 
         ensure!(!name.is_empty(), "The guardian name is empty");
 
@@ -220,6 +259,8 @@ impl ISetupApi for SetupApi {
         }
 
         let mut state = self.state.lock().await;
+
+        Self::ensure_setup_phase(&state)?;
 
         ensure!(
             state.local_params.is_none(),
@@ -297,6 +338,8 @@ impl ISetupApi for SetupApi {
 
         let mut state = self.state.lock().await;
 
+        Self::ensure_setup_phase(&state)?;
+
         if state.setup_codes.contains(&info) {
             return Ok(info.name.clone());
         }
@@ -370,7 +413,9 @@ impl ISetupApi for SetupApi {
     }
 
     async fn start_dkg(&self) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await.clone();
+        let mut shared_state = self.state.lock().await;
+        Self::ensure_setup_phase(&shared_state)?;
+        let mut state = shared_state.clone();
 
         let local_params = state
             .local_params
@@ -441,10 +486,16 @@ impl ISetupApi for SetupApi {
             network: self.settings.network,
         };
 
-        self.sender
-            .send(params)
-            .await
-            .context("Failed to send config gen params")?;
+        shared_state.phase = SetupPhase::DkgRunning;
+        drop(shared_state);
+
+        if let Err(error) = self.sender.send(params).await {
+            let mut shared_state = self.state.lock().await;
+            if matches!(shared_state.phase, SetupPhase::DkgRunning) {
+                shared_state.phase = SetupPhase::Setup;
+            }
+            return Err(error).context("Failed to send config gen params");
+        }
 
         Ok(())
     }
@@ -587,7 +638,10 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<SetupApi>> {
             async |config: &SetupApi, context, _v: ()| -> () {
                 check_auth(context)?;
 
-                config.reset_setup_codes().await;
+                config
+                    .reset_setup_codes_if_setup()
+                    .await
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
                 Ok(())
             }

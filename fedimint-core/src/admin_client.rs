@@ -37,6 +37,13 @@ pub enum SetupStatus {
     AwaitingLocalParams,
     /// Sharing the connection codes with our peers
     SharingConnectionCodes,
+    /// Distributed key generation is in progress
+    DkgRunning,
+    /// Distributed key generation failed
+    DkgFailed {
+        /// Human-readable description of the failure
+        reason: String,
+    },
     /// Consensus is running
     ConsensusIsRunning,
 }
