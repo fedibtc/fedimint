@@ -41,6 +41,7 @@ use crate::net::p2p_connector::TlsConfig;
 pub mod dkg;
 pub mod dkg_g1;
 pub mod dkg_g2;
+pub mod driven;
 pub mod io;
 pub mod peer_handle;
 pub mod setup;

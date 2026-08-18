@@ -45,42 +45,55 @@ impl TlsTcpConnector {
         peers: BTreeMap<PeerId, PeerUrl>,
         identity: PeerId,
     ) -> TlsTcpConnector {
+        Self::try_new(cfg, p2p_bind_addr, peers, identity)
+            .await
+            .expect("Failed to construct TLS P2P connector")
+    }
+
+    /// Construct a TLS connector without panicking on invalid input or bind
+    /// failure.
+    pub async fn try_new(
+        cfg: TlsConfig,
+        p2p_bind_addr: SocketAddr,
+        peers: BTreeMap<PeerId, PeerUrl>,
+        identity: PeerId,
+    ) -> anyhow::Result<TlsTcpConnector> {
         let mut root_cert_store = RootCertStore::empty();
 
         for cert in cfg.certificates.values() {
             root_cert_store
                 .add(cert.clone())
-                .expect("Could not add peer certificate");
+                .context("Could not add peer certificate")?;
         }
 
         let verifier = WebPkiClientVerifier::builder(root_cert_store.into())
             .build()
-            .expect("Failed to create client verifier");
+            .context("Failed to create client verifier")?;
 
         let certificate = cfg
             .certificates
             .get(&identity)
-            .expect("No certificate for ourself found")
+            .context("No certificate for ourself found")?
             .clone();
 
         let config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(vec![certificate], cfg.private_key.clone_key())
-            .expect("Failed to create TLS config");
+            .context("Failed to create TLS config")?;
 
         let listener = TcpListener::bind(p2p_bind_addr)
             .await
-            .expect("Could not bind to port");
+            .context("Could not bind P2P port")?;
 
         let acceptor = TlsAcceptor::from(Arc::new(config.clone()));
 
-        TlsTcpConnector {
+        Ok(TlsTcpConnector {
             cfg,
             peers: peers.into_iter().map(|(id, peer)| (id, peer.url)).collect(),
             identity,
             listener,
             acceptor,
-        }
+        })
     }
 }
 

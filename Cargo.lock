@@ -4613,6 +4613,7 @@ dependencies = [
  "bitcoin",
  "bls12_381",
  "bytes",
+ "ciborium",
  "fedimint-aead",
  "fedimint-aleph-bft",
  "fedimint-api-client",
@@ -4632,6 +4633,7 @@ dependencies = [
  "iroh-relay 0.35.0",
  "itertools 0.14.0",
  "jsonrpsee",
+ "nix",
  "parity-scale-codec",
  "pin-project",
  "pkarr",
@@ -4647,6 +4649,7 @@ dependencies = [
  "strum_macros 0.27.1",
  "subtle",
  "tar",
+ "tempfile",
  "test-log",
  "tokio",
  "tokio-rustls 0.26.4",
@@ -7805,6 +7808,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "merlin"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8291,6 +8303,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

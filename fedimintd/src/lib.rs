@@ -9,7 +9,6 @@
 mod metrics;
 
 use std::convert::Infallible;
-use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -32,6 +31,7 @@ use fedimint_meta_server::MetaInit;
 use fedimint_mint_server::MintInit;
 use fedimint_rocksdb::RocksDb;
 use fedimint_server::config::ConfigGenSettings;
+use fedimint_server::config::driven::FM_DKG_CTRL_ENV;
 use fedimint_server::config::io::DB_FILE;
 use fedimint_server::core::ServerModuleInitRegistry;
 use fedimint_server::net::api::ApiSecrets;
@@ -387,28 +387,30 @@ async fn run_inner(
         default_modules: module_init_registry.default_modules(),
     };
 
-    let rocks_db = match RocksDb::build(server_opts.data_dir.join(DB_FILE))
-        .open()
-        .await
-    {
-        Ok(db) => db,
-        Err(err) => {
-            error!(
-                target: LOG_SERVER,
-                error = format_args!("{err:#}"),
-                "fedimintd database open failed"
-            );
-            error!(
-                target: LOG_SERVER,
-                safe_to_share = true,
-                stage = "database_open",
-                failure_kind = "open_failed",
-                "fedimintd startup failed"
-            );
-            return Err(err.into());
-        }
+    let driven_dkg = is_env_var_set(FM_DKG_CTRL_ENV);
+    let db = if driven_dkg {
+        None
+    } else {
+        Some(
+            open_server_database(server_opts.data_dir.clone())
+                .await
+                .map_err(|err| {
+                    error!(
+                        target: LOG_SERVER,
+                        error = format_args!("{err:#}"),
+                        "fedimintd database open failed"
+                    );
+                    error!(
+                        target: LOG_SERVER,
+                        safe_to_share = true,
+                        stage = "database_open",
+                        failure_kind = "open_failed",
+                        "fedimintd startup failed"
+                    );
+                    err
+                })?,
+        )
     };
-    let db = Database::new(rocks_db, ModuleRegistry::default());
 
     let dyn_server_bitcoin_rpc = async {
         Ok::<_, anyhow::Error>(
@@ -478,25 +480,43 @@ async fn run_inner(
 
     let task_group = root_task_group.clone();
     root_task_group.spawn_cancellable("main", async move {
-        fedimint_server::run(
-            server_opts.data_dir,
-            server_opts.force_api_secrets,
-            settings,
-            db,
-            code_version_str,
-            module_init_registry,
-            task_group,
-            dyn_server_bitcoin_rpc,
-            Box::new(fedimint_server_ui::setup::router),
-            Box::new(fedimint_server_ui::dashboard::router),
-            server_opts.db_checkpoint_retention,
-            fedimint_server::ConnectionLimits::new(
-                server_opts.iroh_api_max_connections,
-                server_opts.iroh_api_max_requests_per_connection,
-            ),
-        )
-        .await
-        .unwrap_or_else(|err| {
+        let connection_limits = fedimint_server::ConnectionLimits::new(
+            server_opts.iroh_api_max_connections,
+            server_opts.iroh_api_max_requests_per_connection,
+        );
+        let result = if driven_dkg {
+            fedimint_server::run_driven(
+                server_opts.data_dir,
+                server_opts.force_api_secrets,
+                settings,
+                Box::new(|data_dir| Box::pin(open_server_database(data_dir))),
+                code_version_str,
+                module_init_registry,
+                task_group,
+                dyn_server_bitcoin_rpc,
+                Box::new(fedimint_server_ui::dashboard::router),
+                server_opts.db_checkpoint_retention,
+                connection_limits,
+            )
+            .await
+        } else {
+            fedimint_server::run(
+                server_opts.data_dir,
+                server_opts.force_api_secrets,
+                settings,
+                db.expect("database is opened outside driven-DKG mode"),
+                code_version_str,
+                module_init_registry,
+                task_group,
+                dyn_server_bitcoin_rpc,
+                Box::new(fedimint_server_ui::setup::router),
+                Box::new(fedimint_server_ui::dashboard::router),
+                server_opts.db_checkpoint_retention,
+                connection_limits,
+            )
+            .await
+        };
+        result.unwrap_or_else(|err| {
             error!(
                 target: LOG_SERVER,
                 error = format_args!("{err:#}"),
@@ -542,6 +562,11 @@ async fn run_inner(
     drop(timing_total_runtime);
 
     std::process::exit(-1);
+}
+
+async fn open_server_database(data_dir: PathBuf) -> anyhow::Result<Database> {
+    let rocks_db = RocksDb::build(data_dir.join(DB_FILE)).open().await?;
+    Ok(Database::new(rocks_db, ModuleRegistry::default()))
 }
 
 pub fn default_modules() -> ServerModuleInitRegistry {
