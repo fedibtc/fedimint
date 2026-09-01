@@ -45,6 +45,21 @@ pub mod io;
 pub mod peer_handle;
 pub mod setup;
 
+fn dkg_consensus_code_version(code_version: String) -> String {
+    // This 0.11 branch predates version fields in setup codes. Compatibility
+    // therefore cannot be checked while guardians exchange setup codes: they
+    // run module DKG first and incompatible versions fail only at the final
+    // consensus-config checksum comparison. Keep this projection identical to
+    // the value stored in every newly generated consensus config.
+    //
+    // Runtime callers validate semantic versions before config generation.
+    // Preserve opaque values used by historical test helpers. Restored configs
+    // bypass this path and retain their historical full version string.
+    fedimint_core::version::DkgVersion::parse(&code_version).map_or(code_version, |version| {
+        version.compatibility_version().to_string()
+    })
+}
+
 /// The default maximum open connections the API can handle
 pub const DEFAULT_MAX_CLIENT_CONNECTIONS: u32 = 1000;
 
@@ -122,7 +137,11 @@ pub struct ServerConfigPrivate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encodable)]
 pub struct ServerConfigConsensus {
-    /// The version of the binary code running
+    /// The DKG-compatible version of the binary code running
+    ///
+    /// Newly generated configs store `major.minor` plus an exact optional
+    /// vendor suffix. The string type and encoding remain unchanged for
+    /// compatibility with persisted 0.11 configurations.
     pub code_version: String,
     /// Agreed on core consensus version
     pub version: CoreConsensusVersion,
@@ -323,6 +342,7 @@ impl ServerConfig {
         modules: BTreeMap<ModuleInstanceId, ServerModuleConfig>,
         code_version: String,
     ) -> Self {
+        let code_version = dkg_consensus_code_version(code_version);
         let consensus = ServerConfigConsensus {
             code_version,
             version: CORE_CONSENSUS_VERSION,
@@ -687,6 +707,9 @@ impl ServerConfig {
             code_version_str,
         );
 
+        // `code_version` is the only version-compatibility gate on this branch:
+        // setup codes do not carry a version. Different major/minor/vendor
+        // projections produce different checksums and fail here, after DKG.
         let checksum = cfg.consensus.consensus_hash_sha256();
 
         info!(
@@ -851,3 +874,6 @@ impl ConfigGenParams {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;
