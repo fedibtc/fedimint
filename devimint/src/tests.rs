@@ -41,6 +41,7 @@ use crate::federation::Client;
 use crate::util::{LoadTestTool, ProcessManager, almost_equal, poll};
 use crate::version_constants::{
     VERSION_0_8_2, VERSION_0_9_0_ALPHA, VERSION_0_10_0_ALPHA, VERSION_0_11_0_ALPHA,
+    ensure_expected_fedimintd_version,
 };
 use crate::{DevFed, Gatewayd, LightningNode, Lnd, cmd, dev_fed};
 
@@ -1025,10 +1026,8 @@ pub async fn cli_tests(dev_fed: DevFed) -> Result<()> {
         .unwrap()
         .to_owned();
 
-    assert_eq!(
-        semver::Version::parse(&peer_0_fedimintd_version)?,
-        fedimintd_version
-    );
+    ensure_expected_fedimintd_version(&peer_0_fedimintd_version, fedimintd_version)
+        .expect("peer should report the expected fedimintd version");
 
     info!("Checking initial announcements...");
 
