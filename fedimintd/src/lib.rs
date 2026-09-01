@@ -249,9 +249,10 @@ impl ServerOpts {
 ///
 /// * `code_version_vendor_suffix` - An optional suffix that will be appended to
 ///   the internal fedimint release version, to distinguish binaries built by
-///   different vendors, usually with a different set of modules. Currently DKG
-///   will enforce that the combined `code_version` is the same between all
-///   peers.
+///   different vendors, usually with a different set of modules. DKG requires
+///   the same major and minor release and exact optional vendor identity, while
+///   allowing patch and prerelease differences. The suffix must be non-empty
+///   valid SemVer build metadata.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     module_init_registry: ServerModuleInitRegistry,
@@ -343,6 +344,8 @@ async fn run_inner(
         || fedimint_version.to_string(),
         |suffix| format!("{fedimint_version}+{suffix}"),
     );
+    fedimint_core::version::DkgVersion::parse(&code_version_str)
+        .context("Invalid Fedimint version vendor string")?;
 
     let timing_total_runtime = timing::TimeReporter::new("total-runtime").info();
 
