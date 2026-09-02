@@ -319,6 +319,7 @@ fn default_client_bitcoin_rpc(network: Network) -> BitcoinRpcConfig {
 #[apply(async_trait_maybe_send!)]
 impl ServerModuleInit for WalletInit {
     type Module = Wallet;
+    type Params = ();
 
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
         &[MODULE_CONSENSUS_VERSION]
@@ -369,6 +370,7 @@ impl ServerModuleInit for WalletInit {
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let finality_delay = default_finality_delay(args.network);
@@ -408,6 +410,7 @@ impl ServerModuleInit for WalletInit {
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
         let secp = secp256k1::Secp256k1::new();
         let (sk, pk) = secp.generate_keypair(&mut OsRng);
