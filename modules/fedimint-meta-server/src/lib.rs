@@ -125,6 +125,7 @@ impl ModuleInit for MetaInit {
 #[async_trait]
 impl ServerModuleInit for MetaInit {
     type Module = Meta;
+    type Params = ();
 
     /// Returns the version of this module
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
@@ -157,6 +158,7 @@ impl ServerModuleInit for MetaInit {
         &self,
         peers: &[PeerId],
         _args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         // Generate a config for each peer
         peers
@@ -176,6 +178,7 @@ impl ServerModuleInit for MetaInit {
         &self,
         _peers: &(dyn PeerHandleOps + Send + Sync),
         _args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
         Ok(MetaConfig {
             private: MetaConfigPrivate,

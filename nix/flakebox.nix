@@ -263,6 +263,7 @@ let
         (lib.hiPrio pkgs.bashInteractive)
         bc
         bitcoind
+        foundry
         jq
         lnd
         netcat
