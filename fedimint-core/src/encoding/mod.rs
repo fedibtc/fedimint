@@ -712,6 +712,24 @@ impl Decodable for String {
     }
 }
 
+// Keep the legacy encoding available to external modules (notably Fedi's
+// stability pool) whose persisted records still contain SystemTime. New core
+// records use Timestamp; changing these external bytes would change consensus.
+impl Encodable for SystemTime {
+    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
+        encode_legacy_system_time(self, writer)
+    }
+}
+
+impl Decodable for SystemTime {
+    fn consensus_decode_partial_from_finite_reader<D: std::io::Read>(
+        decoder: &mut D,
+        modules: &ModuleDecoderRegistry,
+    ) -> Result<Self, DecodeError> {
+        decode_legacy_system_time_from_finite_reader(decoder, modules)
+    }
+}
+
 impl Encodable for Duration {
     fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
         self.as_secs().consensus_encode(writer)?;

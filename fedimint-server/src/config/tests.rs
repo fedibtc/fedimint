@@ -61,3 +61,39 @@ fn server_config_accepts_opaque_test_code_versions() {
 
     assert_eq!(config.consensus.code_version, "fedimint");
 }
+
+#[test]
+fn driven_config_keeps_encrypted_layout_and_restarts_with_disk_password() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config = server_config_with_code_version("0.13.0+fedi");
+    let password = "test-seat-password";
+    super::io::plaintext_display_write(
+        &password,
+        &directory.path().join(super::io::PLAINTEXT_PASSWORD),
+    )
+    .expect("write restart password");
+    super::io::write_server_config_encrypted(
+        &config,
+        directory.path(),
+        password,
+        &fedimint_server_core::ServerModuleInitRegistry::default(),
+        None,
+    )
+    .expect("write encrypted configuration");
+    assert!(directory.path().join("private.encrypt").exists());
+    assert!(directory.path().join("private.salt").exists());
+    assert!(!directory.path().join("private.json").exists());
+    let restored =
+        super::io::read_server_config(directory.path()).expect("read encrypted configuration");
+    assert_eq!(
+        serde_json::to_value(config).expect("serialize original"),
+        serde_json::to_value(restored).expect("serialize restored"),
+    );
+    std::fs::write(
+        directory.path().join(super::io::PLAINTEXT_PASSWORD),
+        "wrong",
+    )
+    .expect("replace test password");
+    assert!(super::io::read_server_config(directory.path()).is_err());
+    assert!(directory.path().join("private.encrypt").exists());
+}

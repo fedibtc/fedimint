@@ -310,6 +310,7 @@ impl ServerModuleInit for WalletInit {
         WALLET_PEGIN_FEES_SATS.get_sample_count();
         WALLET_PEGOUT_SATS.get_sample_count();
         WALLET_PEGOUT_FEES_SATS.get_sample_count();
+        WALLET_BLOCK_COUNT.get();
 
         Ok(Wallet::new(
             args.cfg().to_typed()?,
