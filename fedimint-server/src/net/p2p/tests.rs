@@ -16,7 +16,7 @@ use super::{
     P2PConnectionSMCommon, P2PConnectionSMState, P2PConnectionState, P2PConnectionStateMachine,
 };
 use crate::net::p2p_connection::{
-    DynConnectionStatusUpdates, DynIP2PFrame, DynP2PConnection, IP2PConnection,
+    DynConnectionStatusUpdates, DynIP2PFrame, DynP2PConnection, IP2PConnection, IP2PFrame,
 };
 use crate::net::p2p_connector::{DynP2PConnector, IP2PConnector};
 
@@ -97,11 +97,11 @@ impl FakeConnection {
 
 #[async_trait]
 impl IP2PConnection<u64> for FakeConnection {
-    async fn send(&mut self, _message: u64) -> anyhow::Result<()> {
+    async fn send(&self, _message: u64) -> anyhow::Result<()> {
         Ok(())
     }
 
-    async fn receive(&mut self) -> anyhow::Result<DynIP2PFrame<u64>> {
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<u64>> {
         self.control.disconnect.notified().await;
         Err(anyhow!("fake connection disconnected"))
     }
@@ -209,7 +209,7 @@ impl StatusMachineHarness {
         });
         let connector: DynP2PConnector<u64> = Arc::new(PendingConnector { fallback });
         let mut state_machine = P2PConnectionStateMachine {
-            state: P2PConnectionSMState::Connected(Box::new(connection)),
+            state: P2PConnectionSMState::Connected(Arc::new(connection)),
             common: P2PConnectionSMCommon {
                 incoming_sender,
                 outgoing_receiver,
@@ -312,7 +312,8 @@ async fn subscribes_before_snapshot_to_close_status_update_race() {
     harness
         .wait_for_status(ExpectedStatus::Connected(ConnectionType::Direct))
         .await;
-    assert!(control.subscriptions() >= 2);
+    // A single long-lived subscription captures the event racing with the snapshot.
+    assert_eq!(control.subscriptions(), 1);
 }
 
 #[tokio::test]
@@ -326,7 +327,7 @@ async fn superseded_connection_events_do_not_replace_current_status() {
     let new_control = FakeConnectionControl::new(ConnectionType::Direct);
     harness
         .connection_sender
-        .send(Box::new(FakeConnection::new(new_control)))
+        .send(Arc::new(FakeConnection::new(new_control)))
         .await
         .expect("state machine receives replacement connection");
     harness
@@ -377,4 +378,417 @@ async fn closed_status_stream_does_not_spin() {
     control.disconnect();
     harness.wait_for_status(ExpectedStatus::Disconnected).await;
     assert_eq!(harness.current_status(), None);
+}
+
+/// A frame that yields a single pre-baked message.
+struct FakeFrame(u64);
+
+#[async_trait]
+impl IP2PFrame<u64> for FakeFrame {
+    async fn read_to_end(&mut self) -> anyhow::Result<u64> {
+        Ok(self.0)
+    }
+}
+
+/// A connection whose `send` cannot complete until `receive` has been served at
+/// least once. This is the shape of transport flow control: the peer has to
+/// drain our stream before our write can finish.
+struct FlowControlledConnection {
+    /// Granted by `receive`, awaited by `send`.
+    window: Arc<Notify>,
+    frames: async_channel::Receiver<u64>,
+    /// Number of sends that made it past the window wait.
+    sends_completed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl IP2PConnection<u64> for FlowControlledConnection {
+    async fn send(&self, _message: u64) -> anyhow::Result<()> {
+        self.window.notified().await;
+
+        self.sends_completed.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<u64>> {
+        let message = self
+            .frames
+            .recv()
+            .await
+            .map_err(|_| anyhow!("frame channel closed"))?;
+
+        self.window.notify_one();
+
+        Ok(FakeFrame(message).into_dyn())
+    }
+
+    fn rtt(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Regression test for a p2p deadlock: when send and receive were multiplexed
+/// in a single `select!`, a send parked on transport flow control could no
+/// longer poll `receive`, so the window never reopened. Two peers that both
+/// started writing an oversized message hung forever, silently.
+#[tokio::test]
+async fn receives_while_a_send_is_parked_on_flow_control() {
+    let (frame_sender, frames) = async_channel::bounded(1);
+    let (connection_sender, incoming_connections) = async_channel::bounded(1);
+    let (outgoing_sender, outgoing_receiver) = async_channel::bounded(1);
+    let (incoming_sender, incoming_receiver) = async_channel::bounded(1);
+    let (status_sender, _status_receiver) = watch::channel(P2PConnectionState {
+        connected: None,
+        last_error: None,
+    });
+
+    let sends_completed = Arc::new(AtomicUsize::new(0));
+
+    let connection = FlowControlledConnection {
+        window: Arc::new(Notify::new()),
+        frames,
+        sends_completed: sends_completed.clone(),
+    };
+
+    let mut state_machine = P2PConnectionStateMachine {
+        state: P2PConnectionSMState::Connected(Arc::new(connection)),
+        common: P2PConnectionSMCommon {
+            incoming_sender,
+            outgoing_receiver,
+            our_id: PeerId::from(1),
+            our_id_str: "1".to_owned(),
+            peer_id: PeerId::from(0),
+            peer_id_str: "0".to_owned(),
+            connector: Arc::new(PendingConnector { fallback: None }),
+            incoming_connections,
+            status_sender,
+            max_connection_age: None,
+            connection_deadline: None,
+        },
+    };
+
+    let task = runtime::spawn("p2p-flow-control-test", async move {
+        while let Some(next) = state_machine.state_transition().await {
+            state_machine = next;
+        }
+    });
+
+    // Park a send first, so the connection is mid-write when the peer's frame
+    // arrives. Only a receive can unblock it.
+    outgoing_sender.send(7).await.expect("outgoing queued");
+    timeout(Duration::from_secs(5), async {
+        while !outgoing_sender.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("send is dequeued and in flight");
+    frame_sender.send(9).await.expect("frame queued");
+
+    let received = timeout(Duration::from_secs(5), incoming_receiver.recv())
+        .await
+        .expect("receive must be served while the send is parked")
+        .expect("incoming channel is open");
+
+    assert_eq!(received, 9);
+
+    // The send can only get past the window wait because the receive was
+    // served, so a completed send proves both halves made progress.
+    timeout(Duration::from_secs(5), async {
+        while sends_completed.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("parked send completes once the window reopens");
+
+    // If the closed frame channel is observed before the closed outgoing
+    // channel, the machine transitions to Disconnected instead of shutting
+    // down; the connection channel must be closed too for the task to end.
+    drop(frame_sender);
+    drop(outgoing_sender);
+    drop(connection_sender);
+    let _ = task.await;
+}
+
+/// A replacement connection that arrives while a send is parked must not
+/// cancel the in-flight send: the already dequeued message would be silently
+/// lost, and e.g. the DKG sends every message exactly once.
+#[tokio::test]
+async fn replacement_connection_does_not_cancel_in_flight_send() {
+    let (frame_sender, frames) = async_channel::bounded(1);
+    let (connection_sender, incoming_connections) = async_channel::bounded(1);
+    let (outgoing_sender, outgoing_receiver) = async_channel::bounded(1);
+    let (incoming_sender, _incoming_receiver) = async_channel::bounded(1);
+    let (status_sender, mut status_receiver) = watch::channel(P2PConnectionState {
+        connected: None,
+        last_error: None,
+    });
+
+    let sends_completed = Arc::new(AtomicUsize::new(0));
+
+    let connection = FlowControlledConnection {
+        window: Arc::new(Notify::new()),
+        frames,
+        sends_completed: sends_completed.clone(),
+    };
+
+    let mut state_machine = P2PConnectionStateMachine {
+        state: P2PConnectionSMState::Connected(Arc::new(connection)),
+        common: P2PConnectionSMCommon {
+            incoming_sender,
+            outgoing_receiver,
+            our_id: PeerId::from(1),
+            our_id_str: "1".to_owned(),
+            peer_id: PeerId::from(0),
+            peer_id_str: "0".to_owned(),
+            connector: Arc::new(PendingConnector { fallback: None }),
+            incoming_connections,
+            status_sender,
+            max_connection_age: None,
+            connection_deadline: None,
+        },
+    };
+
+    let task = runtime::spawn("p2p-replacement-test", async move {
+        while let Some(next) = state_machine.state_transition().await {
+            state_machine = next;
+        }
+    });
+
+    // Park a send on flow control and wait until the message is dequeued, so
+    // the send is in flight before the replacement connection arrives.
+    outgoing_sender.send(7).await.expect("outgoing queued");
+    timeout(Duration::from_secs(5), async {
+        while !outgoing_sender.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("send is dequeued and in flight");
+
+    connection_sender
+        .send(Arc::new(FakeConnection::new(FakeConnectionControl::new(
+            ConnectionType::Direct,
+        ))))
+        .await
+        .expect("replacement queued");
+
+    // Serving a receive reopens the window; the parked send must still be
+    // alive to complete despite the queued replacement.
+    frame_sender.send(9).await.expect("frame queued");
+    timeout(Duration::from_secs(5), async {
+        while sends_completed.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("in-flight send completes despite the queued replacement");
+
+    // Only then does the replacement connection take over.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if status_receiver
+                .borrow_and_update()
+                .connected
+                .as_ref()
+                .is_some_and(|status| status.conn_type == Some(ConnectionType::Direct))
+            {
+                return;
+            }
+            status_receiver
+                .changed()
+                .await
+                .expect("status sender remains alive");
+        }
+    })
+    .await
+    .expect("replacement connection takes over after the send completes");
+
+    drop(frame_sender);
+    drop(outgoing_sender);
+    drop(connection_sender);
+    let _ = task.await;
+}
+
+struct GatedFrame {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+    fail: bool,
+}
+
+#[async_trait]
+impl IP2PFrame<u64> for GatedFrame {
+    async fn read_to_end(&mut self) -> anyhow::Result<u64> {
+        self.started.notify_one();
+        self.release.notified().await;
+        anyhow::ensure!(!self.fail, "old connection closed");
+        Ok(42)
+    }
+}
+
+struct GatedReadConnection(async_channel::Receiver<GatedFrame>);
+
+#[async_trait]
+impl IP2PConnection<u64> for GatedReadConnection {
+    async fn send(&self, _: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<u64>> {
+        Ok(self.0.recv().await?.into_dyn())
+    }
+
+    fn rtt(&self) -> Option<Duration> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn graceful_retirement_finishes_accepted_frames_and_keeps_replacements() {
+    for expire in [false, true] {
+        for fail in [false, true] {
+            let (frames_tx, frames_rx) = async_channel::bounded(1);
+            let (connection_tx, connection_rx) = async_channel::bounded(1);
+            let (_outgoing_tx, outgoing_rx) = async_channel::bounded(1);
+            let (incoming_tx, incoming_rx) = async_channel::bounded(1);
+            let (status_tx, _) = watch::channel(P2PConnectionState {
+                connected: None,
+                last_error: None,
+            });
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            frames_tx
+                .send(GatedFrame {
+                    started: started.clone(),
+                    release: release.clone(),
+                    fail,
+                })
+                .await
+                .expect("frame queued");
+            let mut common = P2PConnectionSMCommon {
+                incoming_sender: incoming_tx,
+                outgoing_receiver: outgoing_rx,
+                our_id: PeerId::from(1),
+                our_id_str: "1".to_owned(),
+                peer_id: PeerId::from(0),
+                peer_id_str: "0".to_owned(),
+                connector: Arc::new(PendingConnector { fallback: None }),
+                incoming_connections: connection_rx,
+                status_sender: status_tx,
+                max_connection_age: None,
+                connection_deadline: expire
+                    .then(|| tokio::time::Instant::now() + Duration::from_millis(100)),
+            };
+            let mut task = runtime::spawn("p2p-drain-test", async move {
+                common
+                    .transition_connected(Arc::new(GatedReadConnection(frames_rx)), None)
+                    .await
+            });
+            timeout(Duration::from_secs(5), started.notified())
+                .await
+                .expect("frame accepted");
+            if !expire {
+                connection_tx
+                    .send(Arc::new(FakeConnection::new(FakeConnectionControl::new(
+                        ConnectionType::Direct,
+                    ))) as DynP2PConnection<u64>)
+                    .await
+                    .expect("replacement queued");
+            }
+            assert!(
+                timeout(Duration::from_millis(150), &mut task)
+                    .await
+                    .is_err(),
+                "healthy retirement must wait for the accepted frame"
+            );
+            release.notify_one();
+            let next = timeout(Duration::from_secs(5), task)
+                .await
+                .expect("retirement completes")
+                .expect("task completes")
+                .expect("next state");
+            assert_eq!(
+                matches!(next, P2PConnectionSMState::Disconnected { .. }),
+                expire
+            );
+            if !fail {
+                assert_eq!(
+                    incoming_rx.recv().await.expect("accepted frame delivered"),
+                    42
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn expiry_finishes_in_flight_send_before_retiring() {
+    let (_frames_tx, frames_rx) = async_channel::bounded(1);
+    let (_connections_tx, connections_rx) = async_channel::bounded(1);
+    let (outgoing_tx, outgoing_rx) = async_channel::bounded(1);
+    let window = Arc::new(Notify::new());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let connection = FlowControlledConnection {
+        window: window.clone(),
+        frames: frames_rx,
+        sends_completed: completed.clone(),
+    }
+    .into_dyn();
+    outgoing_tx.send(7).await.expect("queued");
+    let mut task = runtime::spawn("expiry-send-test", async move {
+        P2PConnectionSMCommon::send_loop(
+            &connection,
+            &outgoing_rx,
+            &connections_rx,
+            Some(tokio::time::Instant::now() + Duration::from_millis(100)),
+            "1",
+            "0",
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), async {
+        while !outgoing_tx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("send started");
+    assert!(
+        timeout(Duration::from_millis(150), &mut task)
+            .await
+            .is_err()
+    );
+    window.notify_one();
+    let halt = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("send finishes")
+        .expect("task");
+    assert!(matches!(halt, super::SendHalt::Expired));
+    assert_eq!(completed.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn queued_replacement_precedes_queued_outgoing_messages() {
+    let (connections_tx, connections_rx) = async_channel::bounded(1);
+    let (outgoing_tx, outgoing_rx) = async_channel::bounded(1);
+    let connection =
+        FakeConnection::new(FakeConnectionControl::new(ConnectionType::Direct)).into_dyn();
+    connections_tx
+        .send(connection.clone())
+        .await
+        .expect("replacement queued");
+    outgoing_tx.send(7).await.expect("message queued");
+    let halt = P2PConnectionSMCommon::send_loop(
+        &connection,
+        &outgoing_rx,
+        &connections_rx,
+        None,
+        "1",
+        "0",
+    )
+    .await;
+    assert!(matches!(halt, super::SendHalt::Replaced(_)));
+    assert_eq!(outgoing_rx.recv().await.expect("message not consumed"), 7);
 }

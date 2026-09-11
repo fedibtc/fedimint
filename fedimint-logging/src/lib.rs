@@ -13,13 +13,22 @@
 //! This makes it easier to filter interesting calls when
 //! running e.g. `devimint`, that will run both server and client
 //! side.
+//!
+//! An event may carry `safe_to_share = true` only when its complete rendered
+//! message, fields, formatting/error chains, and occurrence contain no secrets,
+//! personal data, operator identity, or operator/private free-form payloads.
+//! Opaque protocol identifiers and operational correlation are allowed; the
+//! marker is not an anonymity guarantee or authorization to collect the event.
 
 use std::fs::File;
 use std::{env, io};
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, Registry};
+
+/// Process-wide tracing layer supplied by an embedding binary.
+pub type ExtraTracingLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 
 pub const LOG_CONSENSUS: &str = "fm::consensus";
 pub const LOG_CORE: &str = "fm::core";
@@ -84,6 +93,7 @@ pub struct TracingSetup {
     #[cfg(feature = "telemetry")]
     with_jaeger: bool,
     with_file: Option<File>,
+    extra_layer: Option<ExtraTracingLayer>,
 }
 
 impl TracingSetup {
@@ -115,6 +125,23 @@ impl TracingSetup {
 
     pub fn with_file(&mut self, file: Option<File>) -> &mut Self {
         self.with_file = file;
+        self
+    }
+
+    /// Attach an additional layer without replacing Fedimint's normal stderr,
+    /// filtering, console, or OpenTelemetry setup.
+    pub fn with_extra_layer<L>(&mut self, layer: L) -> &mut Self
+    where
+        L: Layer<Registry> + Send + Sync + 'static,
+    {
+        self.extra_layer = Some(Box::new(layer));
+        self
+    }
+
+    /// Attach a type-erased additional layer supplied through another crate's
+    /// public API.
+    pub fn with_boxed_extra_layer(&mut self, layer: ExtraTracingLayer) -> &mut Self {
+        self.extra_layer = Some(layer);
         self
     }
 
@@ -225,6 +252,7 @@ impl TracingSetup {
         };
 
         tracing_subscriber::registry()
+            .with(self.extra_layer.take())
             .with(fmt_layer)
             .with(console_opt())
             .with(telemetry_layer_opt())

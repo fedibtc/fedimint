@@ -33,6 +33,7 @@ use rand::rngs::OsRng;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{Mutex, oneshot};
 use tokio_rustls::rustls;
+use tracing::{info, warn};
 
 use crate::config::io::{
     CONSENSUS_CONFIG, ENCRYPTED_EXT, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG, SALT_FILE,
@@ -400,8 +401,8 @@ impl ISetupApi for SetupApi {
                     .to_owned(),
             }
         } else {
-            let (tls_cert, tls_key) =
-                gen_cert_and_key(&name).expect("Failed to generate TLS for given guardian name");
+            let (tls_cert, tls_key) = gen_cert_and_key(&name)
+                .context("Failed to generate TLS for given guardian name")?;
 
             LocalParams {
                 tls_key: Some(tls_key),
@@ -454,7 +455,7 @@ impl ISetupApi for SetupApi {
         let local_params = state
             .local_params
             .clone()
-            .expect("The endpoint is authenticated.");
+            .context("The endpoint is authenticated but local parameters are absent")?;
 
         ensure!(
             info != local_params.setup_code(),
@@ -539,7 +540,7 @@ impl ISetupApi for SetupApi {
         let local_params = state
             .local_params
             .clone()
-            .expect("The endpoint is authenticated.");
+            .context("The endpoint is authenticated but local parameters are absent")?;
 
         let our_setup_code = local_params.setup_code();
 
@@ -746,6 +747,31 @@ impl HasApiContext<SetupApi> for SetupApi {
     }
 }
 
+fn trace_setup_result<T>(
+    operation: &'static str,
+    result: Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    match &result {
+        Ok(_) => info!(
+            safe_to_share = true,
+            stage = "setup_api",
+            operation,
+            "Setup API operation completed"
+        ),
+        Err(error) => {
+            warn!(operation, ?error, "Setup API operation failed");
+            warn!(
+                safe_to_share = true,
+                stage = "setup_api",
+                operation,
+                failure_kind = "request_rejected",
+                "Config generation request failed"
+            );
+        }
+    }
+    result
+}
+
 pub fn server_endpoints() -> Vec<ApiEndpoint<SetupApi>> {
     vec![
         public_api_endpoint! {
@@ -759,20 +785,28 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<SetupApi>> {
             SET_LOCAL_PARAMS_ENDPOINT,
             ApiVersion::new(0, 0),
             async |config: &SetupApi, context, request: SetLocalParamsRequest| -> String {
+                let result = async {
 
-                 config.set_local_parameters(request.name, request.federation_name, request.disable_base_fees, request.enabled_modules, request.federation_size)
-                    .await
-                    .map_err(|e| ApiError::bad_request(e.to_string()))
+                    config.set_local_parameters( request.name, request.federation_name, request.disable_base_fees, request.enabled_modules, request.federation_size)
+                        .await
+                        .map_err(|e| ApiError::bad_request(e.to_string()))
+                }
+                .await;
+                trace_setup_result("set_local_parameters", result)
             }
         },
         admin_api_endpoint! {
             ADD_PEER_SETUP_CODE_ENDPOINT,
             ApiVersion::new(0, 0),
             async |config: &SetupApi, context, info: String| -> String {
+                let result = async {
 
-                config.add_peer_setup_code(info.clone())
-                    .await
-                    .map_err(|e|ApiError::bad_request(e.to_string()))
+                    config.add_peer_setup_code(info)
+                        .await
+                        .map_err(|e|ApiError::bad_request(e.to_string()))
+                }
+                .await;
+                trace_setup_result("add_peer_setup_code", result)
             }
         },
         admin_api_endpoint! {
@@ -797,8 +831,12 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<SetupApi>> {
             START_DKG_ENDPOINT,
             ApiVersion::new(0, 0),
             async |config: &SetupApi, context, _v: ()| -> () {
+                let result = async {
 
-                config.start_dkg().await.map_err(|e| ApiError::server_error(e.to_string()))
+                    config.start_dkg().await.map_err(|e| ApiError::server_error(e.to_string()))
+                }
+                .await;
+                trace_setup_result("start_dkg", result)
             }
         },
     ]

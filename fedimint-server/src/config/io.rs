@@ -157,6 +157,40 @@ pub fn write_server_config(
     plaintext_json_write(&server.private, &path.join(PRIVATE_CONFIG))
 }
 
+/// Write driven-DKG output in the encrypted layout consumed by existing fleet
+/// backups. Ordinary interactive setup continues using upstream plaintext JSON.
+pub(crate) fn write_server_config_encrypted(
+    server: &ServerConfig,
+    path: &Path,
+    password: &str,
+    module_config_gens: &ServerModuleInitRegistry,
+    api_secret: Option<String>,
+) -> anyhow::Result<()> {
+    let salt = fedimint_aead::random_salt();
+    plaintext_display_write(&salt, &path.join(SALT_FILE))?;
+    let key = get_encryption_key(password, &salt)?;
+    let client_config = server.consensus.to_client_config(module_config_gens)?;
+    plaintext_json_write(&server.local, &path.join(LOCAL_CONFIG))?;
+    plaintext_json_write(&server.consensus, &path.join(CONSENSUS_CONFIG))?;
+    plaintext_display_write(
+        &InviteCode::new(
+            server.consensus.api_endpoints()[&server.local.identity]
+                .url
+                .clone(),
+            server.local.identity,
+            server.calculate_federation_id(),
+            api_secret,
+        ),
+        &path.join(CLIENT_INVITE_CODE_FILE),
+    )?;
+    plaintext_json_write(&client_config, &path.join(CLIENT_CONFIG))?;
+    fedimint_aead::encrypted_write(
+        serde_json::to_vec(&server.private)?,
+        &key,
+        path.join(PRIVATE_CONFIG).with_extension(ENCRYPTED_EXT),
+    )
+}
+
 /// Writes struct into a plaintext json file
 fn plaintext_json_write<T: Serialize + DeserializeOwned>(
     obj: &T,
@@ -171,7 +205,7 @@ fn plaintext_json_write<T: Serialize + DeserializeOwned>(
     Ok(())
 }
 
-fn plaintext_display_write<T: Display>(obj: &T, path: &Path) -> anyhow::Result<()> {
+pub(crate) fn plaintext_display_write<T: Display>(obj: &T, path: &Path) -> anyhow::Result<()> {
     use std::io::Write;
     let mut file = fs::File::options()
         .create_new(true)

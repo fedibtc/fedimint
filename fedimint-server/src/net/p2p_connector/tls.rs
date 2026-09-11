@@ -20,7 +20,9 @@ use tokio_util::codec::LengthDelimitedCodec;
 
 use super::IP2PConnector;
 use super::iroh::parse_p2p;
-use crate::net::p2p_connection::{DynP2PConnection, IP2PConnection as _};
+use crate::net::p2p_connection::{
+    DynP2PConnection, IP2PConnection as _, MAX_P2P_MESSAGE_SIZE, TlsP2PConnection,
+};
 
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
@@ -45,42 +47,55 @@ impl TlsTcpConnector {
         peers: BTreeMap<PeerId, PeerUrl>,
         identity: PeerId,
     ) -> TlsTcpConnector {
+        Self::try_new(cfg, p2p_bind_addr, peers, identity)
+            .await
+            .expect("Failed to construct TLS P2P connector")
+    }
+
+    /// Construct a TLS connector without panicking on invalid input or bind
+    /// failure.
+    pub async fn try_new(
+        cfg: TlsConfig,
+        p2p_bind_addr: SocketAddr,
+        peers: BTreeMap<PeerId, PeerUrl>,
+        identity: PeerId,
+    ) -> anyhow::Result<TlsTcpConnector> {
         let mut root_cert_store = RootCertStore::empty();
 
         for cert in cfg.certificates.values() {
             root_cert_store
                 .add(cert.clone())
-                .expect("Could not add peer certificate");
+                .context("Could not add peer certificate")?;
         }
 
         let verifier = WebPkiClientVerifier::builder(root_cert_store.into())
             .build()
-            .expect("Failed to create client verifier");
+            .context("Failed to create client verifier")?;
 
         let certificate = cfg
             .certificates
             .get(&identity)
-            .expect("No certificate for ourself found")
+            .context("No certificate for ourself found")?
             .clone();
 
         let config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(vec![certificate], cfg.private_key.clone_key())
-            .expect("Failed to create TLS config");
+            .context("Failed to create TLS config")?;
 
         let listener = TcpListener::bind(p2p_bind_addr)
             .await
-            .expect("Could not bind to port");
+            .context("Could not bind P2P port")?;
 
         let acceptor = TlsAcceptor::from(Arc::new(config.clone()));
 
-        TlsTcpConnector {
+        Ok(TlsTcpConnector {
             cfg,
             peers: peers.into_iter().map(|(id, peer)| (id, peer.url)).collect(),
             identity,
             listener,
             acceptor,
-        }
+        })
     }
 }
 
@@ -146,9 +161,10 @@ where
 
         let framed = LengthDelimitedCodec::builder()
             .length_field_type::<u64>()
+            .max_frame_length(MAX_P2P_MESSAGE_SIZE)
             .new_framed(TlsStream::Client(tls));
 
-        Ok(framed.into_dyn())
+        Ok(TlsP2PConnection::new(framed).into_dyn())
     }
 
     async fn accept(&self) -> anyhow::Result<(PeerId, DynP2PConnection<M>)> {
@@ -174,9 +190,10 @@ where
 
         let framed = LengthDelimitedCodec::builder()
             .length_field_type::<u64>()
+            .max_frame_length(MAX_P2P_MESSAGE_SIZE)
             .new_framed(TlsStream::Server(tls));
 
-        Ok((auth_peer, framed.into_dyn()))
+        Ok((auth_peer, TlsP2PConnection::new(framed).into_dyn()))
     }
 
     fn connection_type(&self, _peer: PeerId) -> Option<ConnectionType> {

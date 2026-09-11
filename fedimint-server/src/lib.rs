@@ -24,8 +24,10 @@ extern crate fedimint_core;
 pub mod connection_limits;
 pub mod db;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
@@ -37,6 +39,7 @@ use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::P2PMessage;
 use fedimint_core::db::{Database, DatabaseTransaction, IDatabaseTransactionOpsCoreTyped as _};
 use fedimint_core::epoch::ConsensusItem;
+use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::ApiAuth;
 use fedimint_core::net::peers::DynP2PConnections;
 use fedimint_core::task::{TaskGroup, sleep};
@@ -51,12 +54,22 @@ use jsonrpsee::RpcModule;
 use net::api::ApiSecrets;
 use net::p2p::P2PStatusReceivers;
 use net::p2p_connector::IrohConnector;
+#[cfg(unix)]
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 use tokio_rustls::rustls;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::config::ConfigGenSettings;
-use crate::config::io::write_server_config;
+#[cfg(unix)]
+use crate::config::driven::{
+    ChildMessage, ChildState, FM_DKG_CTRL_ENV, PROTOCOL_VERSION, ParentMessage,
+    ensure_no_config_artifacts, install_staging, prepare_staging, read_frame, validate_run_dkg,
+    write_frame,
+};
+use crate::config::io::{
+    PLAINTEXT_PASSWORD, plaintext_display_write, write_server_config, write_server_config_encrypted,
+};
 use crate::config::setup::{ConfigGenOutcome, SetupApi};
 use crate::db::{ServerInfo, ServerInfoKey};
 use crate::fedimint_core::net::peers::IP2PConnections;
@@ -102,6 +115,30 @@ pub type DashboardUiRouter = Box<dyn Fn(DynDashboardApi) -> axum::Router + Send>
 
 /// A function/closure type for handling setup UI
 pub type SetupUiRouter = Box<dyn Fn(DynSetupApi) -> axum::Router + Send>;
+
+/// Deferred database opener used to keep driven DKG path-independent.
+pub type DatabaseOpener = Box<
+    dyn FnOnce(PathBuf) -> Pin<Box<dyn Future<Output = anyhow::Result<Database>> + Send>> + Send,
+>;
+
+fn config_gen_failure(
+    stage: &'static str,
+    failure_kind: &'static str,
+    error: impl Into<anyhow::Error>,
+) -> anyhow::Error {
+    let error = error.into();
+    tracing::error!(
+        error = format_args!("{error:#}"),
+        "configuration generation stage failed"
+    );
+    tracing::warn!(
+        safe_to_share = true,
+        stage,
+        failure_kind,
+        "Configuration generation failed"
+    );
+    error
+}
 
 /// Run a server without configuring custom Iroh 1.0 relays for guardian P2P.
 ///
@@ -258,25 +295,86 @@ pub async fn run_with_iroh_p2p_relays_and_next_api(
 
             (cfg, connections, p2p_status_receivers)
         }
-        None => {
-            Box::pin(run_config_gen_with_iroh_p2p_relays(
-                data_dir.clone(),
-                settings.clone(),
-                db.clone(),
-                &task_group,
-                code_version_str.clone(),
-                code_version_hash.clone(),
-                force_api_secrets.clone(),
-                setup_ui_router,
-                module_init_registry.clone(),
-                auth_ui.clone(),
-                auth_api.clone(),
-                iroh_p2p_relays,
-            ))
-            .await?
-        }
+        None => Box::pin(run_config_gen_with_iroh_p2p_relays(
+            data_dir.clone(),
+            settings.clone(),
+            db.clone(),
+            &task_group,
+            code_version_str.clone(),
+            code_version_hash.clone(),
+            force_api_secrets.clone(),
+            setup_ui_router,
+            module_init_registry.clone(),
+            auth_ui.clone(),
+            auth_api.clone(),
+            iroh_p2p_relays,
+        ))
+        .await
+        .map_err(|err| {
+            error!(
+                target: LOG_CONSENSUS,
+                error = format_args!("{err:#}"),
+                "configuration generation failed"
+            );
+            warn!(
+                target: LOG_CONSENSUS,
+                safe_to_share = true,
+                stage = "configuration_generation",
+                failure_kind = "fatal",
+                "Configuration generation failed"
+            );
+            err
+        })?,
     };
 
+    run_consensus(
+        data_dir,
+        force_api_secrets,
+        settings,
+        db,
+        code_version_str,
+        module_init_registry,
+        task_group,
+        bitcoin_rpc,
+        dashboard_ui_router,
+        db_checkpoint_retention,
+        iroh_api_limits,
+        cfg,
+        connections,
+        p2p_status_receivers,
+        auth_ui,
+        auth_api,
+        code_version_hash,
+        session_timeout,
+        iroh_next_api_settings,
+        async { Ok(()) },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_consensus(
+    data_dir: PathBuf,
+    force_api_secrets: ApiSecrets,
+    settings: ConfigGenSettings,
+    db: Database,
+    code_version_str: String,
+    module_init_registry: ServerModuleInitRegistry,
+    task_group: TaskGroup,
+    bitcoin_rpc: DynServerBitcoinRpc,
+    dashboard_ui_router: DashboardUiRouter,
+    db_checkpoint_retention: u64,
+    iroh_api_limits: ConnectionLimits,
+    cfg: ServerConfig,
+    connections: DynP2PConnections<P2PMessage>,
+    p2p_status_receivers: P2PStatusReceivers,
+    auth_ui: Option<ApiAuth>,
+    auth_api: Option<ApiAuth>,
+    code_version_hash: String,
+    session_timeout: Duration,
+    iroh_next_api_settings: Option<IrohNextApiSettings>,
+    consensus_started: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
     let decoders = module_init_registry.decoders_strict(
         cfg.consensus
             .modules
@@ -291,11 +389,13 @@ pub async fn run_with_iroh_p2p_relays_and_next_api(
     start_api_announcement_service(&db, &task_group, &cfg, force_api_secrets.get_active()).await?;
     start_pkarr_publish_service(&db, &task_group, &cfg).await?;
 
-    info!(target: LOG_CONSENSUS, "Starting consensus...");
+    info!(target: LOG_CONSENSUS, safe_to_share = true, "Starting consensus...");
 
     let connectors = ConnectorRegistry::build_from_server_defaults()
         .bind()
         .await?;
+
+    consensus_started.await?;
 
     Box::pin(consensus::run(
         connectors,
@@ -324,11 +424,342 @@ pub async fn run_with_iroh_p2p_relays_and_next_api(
     ))
     .await?;
 
-    info!(target: LOG_CONSENSUS, "Shutting down tasks...");
+    info!(target: LOG_CONSENSUS, safe_to_share = true, "Shutting down tasks...");
 
     task_group.shutdown();
 
     Ok(())
+}
+
+/// Run setup exclusively over the inherited driven-DKG control socket.
+///
+/// No setup API, UI, authentication endpoint, or database is opened until a
+/// complete configuration has been atomically installed in `data_dir`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
+pub async fn run_driven(
+    data_dir: PathBuf,
+    auth_ui: Option<ApiAuth>,
+    auth_api: Option<ApiAuth>,
+    force_api_secrets: ApiSecrets,
+    settings: ConfigGenSettings,
+    open_database: DatabaseOpener,
+    code_version_str: String,
+    module_init_registry: ServerModuleInitRegistry,
+    task_group: TaskGroup,
+    bitcoin_rpc: DynServerBitcoinRpc,
+    dashboard_ui_router: DashboardUiRouter,
+    db_checkpoint_retention: u64,
+    iroh_api_limits: ConnectionLimits,
+    code_version_hash: String,
+    session_timeout: Duration,
+    p2p_max_connection_age: Option<Duration>,
+    iroh_p2p_relays: Vec<SafeUrl>,
+    iroh_next_api_settings: Option<IrohNextApiSettings>,
+) -> anyhow::Result<()> {
+    let mut control = inherited_control_socket().await?;
+
+    let existing_config = if data_dir.exists() {
+        match get_config_if_present_strict(&data_dir) {
+            Ok(config) => config,
+            Err(error) => {
+                error!(
+                    target: LOG_CONSENSUS,
+                    error = format_args!("{error:#}"),
+                    "Existing driven-DKG configuration is unreadable"
+                );
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
+    let (cfg, connections, p2p_status_receivers) = if let Some(cfg) = existing_config {
+        write_frame(
+            &mut control,
+            &ChildMessage::Hello {
+                proto: PROTOCOL_VERSION,
+                code_version: code_version_str.clone(),
+                state: ChildState::AlreadyConfigured {
+                    invite_code: InviteCode::new(
+                        cfg.consensus.api_endpoints()[&cfg.local.identity]
+                            .url
+                            .clone(),
+                        cfg.local.identity,
+                        cfg.calculate_federation_id(),
+                        force_api_secrets.get_active(),
+                    )
+                    .to_string(),
+                },
+            },
+        )
+        .await?;
+
+        let connector = if cfg.consensus.iroh_endpoints.is_empty() {
+            TlsTcpConnector::try_new(
+                cfg.tls_config(),
+                settings.p2p_bind,
+                cfg.local.p2p_endpoints.clone(),
+                cfg.local.identity,
+            )
+            .await?
+            .into_dyn()
+        } else {
+            IrohConnector::new(
+                cfg.private
+                    .iroh_p2p_sk
+                    .clone()
+                    .expect("Iroh config contains a P2P secret key"),
+                settings.p2p_bind,
+                settings.iroh_dns.clone(),
+                iroh_p2p_relays.clone(),
+                cfg.consensus
+                    .iroh_endpoints
+                    .iter()
+                    .map(|(peer, endpoints)| (*peer, endpoints.p2p_pk))
+                    .collect(),
+            )
+            .await?
+            .into_dyn()
+        };
+        let (status_senders, status_receivers) = p2p_status_channels(connector.peers());
+        let connections = ReconnectP2PConnections::new(
+            cfg.local.identity,
+            connector,
+            &task_group,
+            status_senders,
+            p2p_max_connection_age,
+        )
+        .into_dyn();
+        (cfg, connections, status_receivers)
+    } else {
+        let staging = prepare_staging(&data_dir)?;
+        write_frame(
+            &mut control,
+            &ChildMessage::Hello {
+                proto: PROTOCOL_VERSION,
+                code_version: code_version_str.clone(),
+                state: ChildState::NeedsParams,
+            },
+        )
+        .await?;
+
+        let parent_message: ParentMessage = read_frame(&mut control).await?;
+        let ParentMessage::RunDkg { api_auth, .. } = &parent_message;
+        let password = api_auth.clone();
+        let params = match validate_run_dkg(parent_message, &settings) {
+            Ok(params) => params,
+            Err(error) => {
+                let reason = bounded_reason(&format!("{error:#}"));
+                write_frame(&mut control, &ChildMessage::ParamsRejected { reason }).await?;
+                return Err(error);
+            }
+        };
+        write_frame(&mut control, &ChildMessage::DkgStarted {}).await?;
+
+        let generated = async {
+            let connector = if params.iroh_endpoints().is_empty() {
+                TlsTcpConnector::try_new(
+                    params.tls_config(),
+                    settings.p2p_bind,
+                    params.p2p_urls(),
+                    params.identity,
+                )
+                .await?
+                .into_dyn()
+            } else {
+                IrohConnector::new(
+                    params
+                        .iroh_p2p_sk
+                        .clone()
+                        .expect("validated Iroh params contain a P2P secret key"),
+                    settings.p2p_bind,
+                    settings.iroh_dns.clone(),
+                    iroh_p2p_relays.clone(),
+                    params
+                        .iroh_endpoints()
+                        .iter()
+                        .map(|(peer, endpoints)| (*peer, endpoints.p2p_pk))
+                        .collect(),
+                )
+                .await?
+                .into_dyn()
+            };
+            let (status_senders, status_receivers) = p2p_status_channels(connector.peers());
+            let connections = ReconnectP2PConnections::new(
+                params.identity,
+                connector,
+                &task_group,
+                status_senders,
+                p2p_max_connection_age,
+            )
+            .into_dyn();
+
+            let cfg = ServerConfig::distributed_gen(
+                &params,
+                module_init_registry.clone(),
+                code_version_str.clone(),
+                connections.clone(),
+                status_receivers.clone(),
+            )
+            .await?;
+            cfg.validate_config(&cfg.local.identity, &module_init_registry)?;
+            Ok::<_, anyhow::Error>((cfg, connections, status_receivers))
+        }
+        .await;
+
+        let (cfg, connections, status_receivers) = match generated {
+            Ok(generated) => generated,
+            Err(error) => {
+                error!(
+                    target: LOG_CONSENSUS,
+                    error = format_args!("{error:#}"),
+                    "driven DKG failed"
+                );
+                write_frame(
+                    &mut control,
+                    &ChildMessage::DkgFailed {
+                        reason: "distributed key generation failed; see server logs".to_string(),
+                    },
+                )
+                .await?;
+                return Err(error);
+            }
+        };
+
+        let persist_result = (|| {
+            plaintext_display_write(&password, &staging.join(PLAINTEXT_PASSWORD))?;
+            write_server_config_encrypted(
+                &cfg,
+                &staging,
+                &password,
+                &module_init_registry,
+                force_api_secrets.get_active(),
+            )?;
+            install_staging(&staging, &data_dir)
+        })();
+        if let Err(error) = persist_result {
+            error!(
+                target: LOG_CONSENSUS,
+                error = format_args!("{error:#}"),
+                "driven-DKG configuration persistence failed"
+            );
+            write_frame(
+                &mut control,
+                &ChildMessage::DkgFailed {
+                    reason: "configuration persistence failed; see server logs".to_string(),
+                },
+            )
+            .await?;
+            return Err(error);
+        }
+
+        write_frame(
+            &mut control,
+            &ChildMessage::ConfigPersisted {
+                invite_code: InviteCode::new(
+                    cfg.consensus.api_endpoints()[&cfg.local.identity]
+                        .url
+                        .clone(),
+                    cfg.local.identity,
+                    cfg.calculate_federation_id(),
+                    force_api_secrets.get_active(),
+                )
+                .to_string(),
+                api_url: cfg.consensus.api_endpoints()[&cfg.local.identity]
+                    .url
+                    .to_string(),
+            },
+        )
+        .await?;
+        (cfg, connections, status_receivers)
+    };
+
+    let db = open_database(data_dir.clone()).await?;
+    run_consensus(
+        data_dir,
+        force_api_secrets,
+        settings,
+        db,
+        code_version_str,
+        module_init_registry,
+        task_group,
+        bitcoin_rpc,
+        dashboard_ui_router,
+        db_checkpoint_retention,
+        iroh_api_limits,
+        cfg,
+        connections,
+        p2p_status_receivers,
+        auth_ui,
+        auth_api,
+        code_version_hash,
+        session_timeout,
+        iroh_next_api_settings,
+        async move {
+            write_frame(&mut control, &ChildMessage::ConsensusStarted {}).await?;
+            control.shutdown().await?;
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// Driven DKG is unavailable without AF_UNIX socket support.
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(unix))]
+pub async fn run_driven(
+    _data_dir: PathBuf,
+    _auth_ui: Option<ApiAuth>,
+    _auth_api: Option<ApiAuth>,
+    _force_api_secrets: ApiSecrets,
+    _settings: ConfigGenSettings,
+    _open_database: DatabaseOpener,
+    _code_version_str: String,
+    _module_init_registry: ServerModuleInitRegistry,
+    _task_group: TaskGroup,
+    _bitcoin_rpc: DynServerBitcoinRpc,
+    _dashboard_ui_router: DashboardUiRouter,
+    _db_checkpoint_retention: u64,
+    _iroh_api_limits: ConnectionLimits,
+    _code_version_hash: String,
+    _session_timeout: Duration,
+    _p2p_max_connection_age: Option<Duration>,
+    _iroh_p2p_relays: Vec<SafeUrl>,
+    _iroh_next_api_settings: Option<IrohNextApiSettings>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("Driven DKG requires an AF_UNIX control socket")
+}
+
+#[cfg(unix)]
+fn bounded_reason(reason: &str) -> String {
+    reason.chars().take(512).collect()
+}
+
+#[cfg(unix)]
+async fn inherited_control_socket() -> anyhow::Result<tokio::net::UnixStream> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    anyhow::ensure!(
+        fedimint_core::envs::is_env_var_set(FM_DKG_CTRL_ENV),
+        "Driven DKG requires FM_DKG_CTRL=1"
+    );
+    // SAFETY: driven mode takes exclusive ownership of stdin, which the parent
+    // contract requires to be its end of the control socketpair.
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(std::io::stdin().as_raw_fd()) };
+    let stream = std::os::unix::net::UnixStream::from(owned_fd);
+    stream
+        .peer_addr()
+        .context("Driven-DKG stdin must be a connected AF_UNIX socket")?;
+    let socket_type = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::SockType)
+        .context("Reading driven-DKG stdin socket type")?;
+    anyhow::ensure!(
+        socket_type == nix::sys::socket::SockType::Stream,
+        "Driven-DKG stdin must use SOCK_STREAM semantics"
+    );
+    stream.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(stream).context("Opening driven-DKG control socket")
 }
 
 async fn update_server_info_version_dbtx(
@@ -348,6 +779,14 @@ pub fn get_config(data_dir: &Path) -> anyhow::Result<Option<ServerConfig>> {
         return Ok(None);
     }
 
+    read_server_config(data_dir).map(Some)
+}
+
+fn get_config_if_present_strict(data_dir: &Path) -> anyhow::Result<Option<ServerConfig>> {
+    if !data_dir.join("consensus.json").exists() {
+        ensure_no_config_artifacts(data_dir)?;
+        return Ok(None);
+    }
     read_server_config(data_dir).map(Some)
 }
 
@@ -498,7 +937,7 @@ pub async fn run_config_gen_with_iroh_p2p_relays(
     DynP2PConnections<P2PMessage>,
     P2PStatusReceivers,
 )> {
-    info!(target: LOG_CONSENSUS, "Starting config gen");
+    info!(target: LOG_CONSENSUS, safe_to_share = true, "Starting config gen");
 
     initialize_gauge_metrics(task_group, &db).await;
 
@@ -534,40 +973,65 @@ pub async fn run_config_gen_with_iroh_p2p_relays(
 
     let ui_listener = TcpListener::bind(settings.ui_bind)
         .await
-        .expect("Failed to bind setup UI");
+        .context("Failed to bind setup UI")
+        .map_err(|error| config_gen_failure("setup_ui_bind", "bind_failed", error))?;
 
     ui_task_group.spawn("setup-ui", move |handle| async move {
-        axum::serve(ui_listener, ui_service)
+        if let Err(err) = axum::serve(ui_listener, ui_service)
             .with_graceful_shutdown(handle.make_shutdown_rx())
             .await
-            .expect("Failed to serve setup UI");
+        {
+            error!(error = %err, "setup UI server failed");
+            warn!(
+                safe_to_share = true,
+                stage = "setup_ui",
+                failure_kind = "server_failed",
+                "Configuration generation failed"
+            );
+            panic!("Failed to serve setup UI");
+        }
     });
 
     info!(target: LOG_CONSENSUS, "Setup UI running at http://{} 🚀", settings.ui_bind);
+    info!(
+        target: LOG_CONSENSUS,
+        safe_to_share = true,
+        stage = "setup_services",
+        "Configuration setup services are ready"
+    );
 
     loop {
-        let config_gen_outcome = cgp_receiver
-            .recv()
-            .await
-            .expect("Config gen params receiver closed unexpectedly");
+        let config_gen_outcome = cgp_receiver.recv().await.ok_or_else(|| {
+            config_gen_failure(
+                "setup_parameters",
+                "channel_closed",
+                anyhow::anyhow!("Config gen params receiver closed unexpectedly"),
+            )
+        })?;
 
         match config_gen_outcome {
             ConfigGenOutcome::Generated(cg_params) => {
+                info!(target: LOG_CONSENSUS, safe_to_share = true,
+                    stage = "setup_parameters", peer_count = cg_params.peer_ids().len(),
+                    "Configuration generation parameters accepted");
                 // HACK: The `start-dkg` API call needs to have some time to finish
                 // before we shut down api handling. There's no easy and good way to do
                 // that other than just giving it some grace period.
                 sleep(Duration::from_millis(100)).await;
 
-                api_handler
-                    .stop()
-                    .expect("Config api should still be running");
+                api_handler.stop().map_err(|error| {
+                    config_gen_failure("setup_api_shutdown", "stop_failed", error)
+                })?;
 
                 api_handler.stopped().await;
 
                 ui_task_group
                     .shutdown_join_all(None)
                     .await
-                    .context("Failed to shutdown UI server after config gen")?;
+                    .context("Failed to shutdown UI server after config gen")
+                    .map_err(|error| {
+                        config_gen_failure("setup_ui_shutdown", "task_join_failed", error)
+                    })?;
 
                 let cg_params = *cg_params;
                 let connector = if cg_params.iroh_endpoints().is_empty() {
@@ -594,7 +1058,10 @@ pub async fn run_config_gen_with_iroh_p2p_relays(
                             .map(|(peer, endpoints)| (*peer, endpoints.p2p_pk))
                             .collect(),
                     )
-                    .await?
+                    .await
+                    .map_err(|error| {
+                        config_gen_failure("p2p_connector", "initialization_failed", error)
+                    })?
                     .into_dyn()
                 };
 
@@ -629,8 +1096,18 @@ pub async fn run_config_gen_with_iroh_p2p_relays(
                     &data_dir,
                     &module_init_registry,
                     api_secrets.get_active(),
-                )?;
+                )
+                .map_err(|error| {
+                    config_gen_failure(
+                        "configuration_persistence",
+                        "server_config_write_failed",
+                        error,
+                    )
+                })?;
 
+                info!(target: LOG_CONSENSUS, safe_to_share = true,
+                    stage = "configuration_persistence",
+                    "Generated server configuration was persisted");
                 return Ok((cfg, connections, p2p_status_receivers));
             }
             ConfigGenOutcome::Restored(restored, restore_result_sender) => {
@@ -713,9 +1190,9 @@ pub async fn run_config_gen_with_iroh_p2p_relays(
                 // shutting down setup serving.
                 sleep(Duration::from_millis(100)).await;
 
-                api_handler
-                    .stop()
-                    .expect("Config api should still be running");
+                api_handler.stop().map_err(|error| {
+                    config_gen_failure("setup_api_shutdown", "stop_failed", error)
+                })?;
 
                 api_handler.stopped().await;
 
