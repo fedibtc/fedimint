@@ -646,7 +646,7 @@ pub struct FederationApi {
     /// Api secret of the federation
     api_secret: Option<String>,
     /// Connection pool
-    connection_pool: ConnectionPool<dyn IGuardianConnection>,
+    connection_pool: Arc<ConnectionPool<dyn IGuardianConnection>>,
 }
 
 impl FederationApi {
@@ -662,7 +662,7 @@ impl FederationApi {
             admin_id: admin_peer_id,
             module_id: None,
             api_secret: api_secret.map(ToOwned::to_owned),
-            connection_pool: ConnectionPool::new(connectors),
+            connection_pool: connectors.guardian_connection_pool(api_secret),
         }
     }
 
@@ -720,7 +720,9 @@ impl FederationApi {
 
     /// Get receiver for changes in the active connections
     ///
-    /// This allows real-time monitoring of connection status.
+    /// This reports all URLs in the registry/authentication-scoped pool, including
+    /// URLs belonging to other API views. Use `connection_status_stream` for a
+    /// view filtered to this API's peers.
     pub fn get_active_connection_receiver(&self) -> watch::Receiver<BTreeSet<SafeUrl>> {
         self.connection_pool.get_active_connection_receiver()
     }

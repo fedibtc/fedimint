@@ -375,12 +375,19 @@ impl FederationTestBuilder {
             let bitcoin_rpc_connection = self.bitcoin_rpc_connection.clone();
 
             task_group.spawn("fedimintd", move |_| async move {
+                let connectors = ConnectorRegistry::build_from_testing_env()
+                    .unwrap()
+                    .bind()
+                    .await
+                    .unwrap();
+                let service_connectors = ConnectorRegistry::build_from_server_env()
+                    .unwrap()
+                    .bind()
+                    .await
+                    .unwrap();
                 Box::pin(consensus::run(
-                    ConnectorRegistry::build_from_testing_env()
-                        .unwrap()
-                        .bind()
-                        .await
-                        .unwrap(),
+                    connectors,
+                    service_connectors,
                     Some(ApiAuth::new("pass".to_string())),
                     Some(ApiAuth::new("pass".to_string())),
                     connections,

@@ -68,12 +68,13 @@ impl_db_lookup!(
 
 /// Build the federation API client used to publish guardian metadata.
 pub async fn prepare_guardian_metadata_service(
+    connectors: ConnectorRegistry,
     db: &Database,
     cfg: &ServerConfig,
     api_secret: Option<String>,
 ) -> anyhow::Result<DynGlobalApi> {
     DynGlobalApi::new(
-        ConnectorRegistry::build_from_server_env()?.bind().await?,
+        connectors,
         super::announcement::get_api_urls(db, &cfg.consensus).await,
         api_secret.as_deref(),
     )

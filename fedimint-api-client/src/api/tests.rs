@@ -44,3 +44,56 @@ fn creates_essential_guardians_invite_code() {
         peer_to_url_map.into_iter().take(max_size).collect();
     assert_eq!(expected_map, code.peers());
 }
+
+#[tokio::test]
+async fn api_views_share_pools_without_sharing_peer_maps_or_authentication() {
+    use std::sync::Arc;
+
+    use fedimint_connectors::ConnectorRegistry;
+
+    use super::{FederationApi, IRawFederationApi as _};
+
+    let connectors = ConnectorRegistry::build_from_server_defaults()
+        .bind()
+        .await
+        .unwrap();
+    let url: SafeUrl = "ws://guardian.example/".parse().unwrap();
+    let first = FederationApi::new(
+        connectors.clone(),
+        [(PeerId::from(0), url.clone())].into(),
+        None,
+        None,
+    );
+    let second = FederationApi::new(
+        connectors.clone(),
+        [(PeerId::from(7), url.clone())].into(),
+        None,
+        None,
+    );
+    assert!(Arc::ptr_eq(&first.connection_pool, &second.connection_pool));
+    assert_ne!(first.all_peers(), second.all_peers());
+
+    let mut pools = vec![first.connection_pool.clone()];
+    for secret in ["", "secret-a", "secret-b"] {
+        let api = FederationApi::new(
+            connectors.clone(),
+            [(PeerId::from(0), url.clone())].into(),
+            None,
+            Some(secret),
+        );
+        for pool in &pools {
+            assert!(!Arc::ptr_eq(pool, &api.connection_pool));
+        }
+        pools.push(api.connection_pool);
+    }
+
+    let other_registry = ConnectorRegistry::build_from_server_defaults()
+        .bind()
+        .await
+        .unwrap();
+    let isolated = FederationApi::new(other_registry, [(PeerId::from(0), url)].into(), None, None);
+    assert!(!Arc::ptr_eq(
+        &first.connection_pool,
+        &isolated.connection_pool
+    ));
+}

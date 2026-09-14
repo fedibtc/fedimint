@@ -11,7 +11,7 @@ use std::fmt::{self, Debug};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
@@ -82,7 +82,7 @@ type ConnectorInitFn = Arc<
 ///
 /// See [`ConnectorRegistry::build_from_client_env`] and similar
 /// to create.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // Shut up, Clippy
 pub struct ConnectorRegistryBuilder {
     /// List of overrides to use when attempting to connect to given url
@@ -167,6 +167,7 @@ impl ConnectorRegistryBuilder {
         Ok(ConnectorRegistry {
             inner: ConnectorRegistryInner {
                 connectors_lazy,
+                guardian_pools: Mutex::new(HashMap::new()),
                 connection_overrides: self.connection_overrides,
                 initialized: SetOnce::new(),
                 path_change,
@@ -282,6 +283,10 @@ impl ConnectorRegistryBuilder {
 
 /// Actual data shared between copies of [`ConnectorRegistry`] handle
 struct ConnectorRegistryInner {
+    /// Pools are scoped to the exact transport authentication context. Weak
+    /// references avoid a cycle: each pool retains its connector registry.
+    #[allow(clippy::type_complexity)]
+    guardian_pools: Mutex<HashMap<Option<String>, Weak<ConnectionPool<dyn IGuardianConnection>>>>,
     /// Lazily initialized [`Connector`]s per protocol supported
     connectors_lazy: BTreeMap<String, (ConnectorInitFn, OnceCell<DynConnector>)>,
     /// Connection URL overrides for testing/custom routing
@@ -327,6 +332,28 @@ impl fmt::Debug for ConnectorRegistry {
 }
 
 impl ConnectorRegistry {
+    /// Share guardian connections between API views with the same authentication
+    /// context. The pool keys connections by full URL; callers must use it only
+    /// with this `api_secret`. Separate registries never share pools.
+    pub fn guardian_connection_pool(
+        &self,
+        api_secret: Option<&str>,
+    ) -> Arc<ConnectionPool<dyn IGuardianConnection>> {
+        let mut pools = self
+            .inner
+            .guardian_pools
+            .lock()
+            .expect("Guardian pool cache mutex is not poisoned");
+        pools.retain(|_, pool| pool.strong_count() > 0);
+        let key = api_secret.map(str::to_owned);
+        if let Some(pool) = pools.get(&key).and_then(Weak::upgrade) {
+            return pool;
+        }
+        let pool = Arc::new(ConnectionPool::new(self.clone()));
+        pools.insert(key, Arc::downgrade(&pool));
+        pool
+    }
+
     /// Whether compatible iroh-next endpoints advertised in guardian metadata
     /// are used.
     pub fn iroh_next_enabled(&self) -> bool {
@@ -989,5 +1016,127 @@ impl<T: ?Sized> ConnectionState<T> {
         } else {
             backoff_locked.backoff.next().expect("Keeps retrying")
         }
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct TestConnection {
+        connected: watch::Sender<bool>,
+    }
+
+    #[apply(async_trait_maybe_send!)]
+    impl IConnection for TestConnection {
+        async fn await_disconnection(&self) {
+            self.connected
+                .subscribe()
+                .wait_for(|connected| !connected)
+                .await
+                .expect("test sender remains alive");
+        }
+
+        fn is_connected(&self) -> bool {
+            *self.connected.borrow()
+        }
+    }
+
+    #[apply(async_trait_maybe_send!)]
+    impl IGuardianConnection for TestConnection {
+        async fn request(
+            &self,
+            _method: ApiMethod,
+            _request: ApiRequestErased,
+        ) -> ServerResult<Value> {
+            Ok(Value::Null)
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_pool_single_flights_and_reconnects_by_full_url() {
+        let registry = ConnectorRegistry::build_from_server_defaults()
+            .bind()
+            .await
+            .unwrap();
+        let first_pool = registry.guardian_connection_pool(None);
+        let second_pool = registry.guardian_connection_pool(None);
+        let connections = Arc::new(Mutex::new(Vec::<Arc<TestConnection>>::new()));
+        let create = {
+            let connections = connections.clone();
+            move |_: SafeUrl, _: Option<String>, _: ConnectorRegistry| {
+                let connections = connections.clone();
+                async move {
+                    let conn = Arc::new(TestConnection {
+                        connected: watch::channel(true).0,
+                    });
+                    connections.lock().unwrap().push(conn.clone());
+                    tokio::task::yield_now().await;
+                    Ok(conn as Arc<dyn IGuardianConnection>)
+                }
+            }
+        };
+        let url: SafeUrl = "ws://guardian.example/".parse().unwrap();
+        let (first, second) = tokio::join!(
+            first_pool.get_or_create_connection(&url, None, create.clone()),
+            second_pool.get_or_create_connection(&url, None, create.clone()),
+        );
+        let first = first.unwrap();
+        assert!(Arc::ptr_eq(&first, &second.unwrap()));
+        assert_eq!(connections.lock().unwrap().len(), 1);
+
+        connections.lock().unwrap()[0].connected.send_replace(false);
+        let (replacement, same_replacement) = tokio::join!(
+            first_pool.get_or_create_connection(&url, None, create.clone()),
+            second_pool.get_or_create_connection(&url, None, create.clone()),
+        );
+        let replacement = replacement.unwrap();
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        assert!(Arc::ptr_eq(&replacement, &same_replacement.unwrap()));
+        assert_eq!(connections.lock().unwrap().len(), 2);
+
+        let other_url: SafeUrl = "ws://guardian.example/v1".parse().unwrap();
+        let other = second_pool
+            .get_or_create_connection(&other_url, None, create)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&replacement, &other));
+        assert_eq!(connections.lock().unwrap().len(), 3);
+
+        for conn in connections.lock().unwrap().iter() {
+            conn.connected.send_replace(false);
+        }
+    }
+
+    #[tokio::test]
+    async fn guardian_pool_cache_is_weak_and_does_not_expose_secrets() {
+        let registry = ConnectorRegistry::build_from_server_defaults()
+            .bind()
+            .await
+            .unwrap();
+        let pool = registry.guardian_connection_pool(Some("private-test-secret"));
+        let weak_pool = Arc::downgrade(&pool);
+        assert!(!format!("{registry:?} {pool:?}").contains("private-test-secret"));
+        drop(pool);
+        assert!(weak_pool.upgrade().is_none());
+
+        let replacement = registry.guardian_connection_pool(None);
+        assert_eq!(registry.inner.guardian_pools.lock().unwrap().len(), 1);
+        let weak_registry = Arc::downgrade(&registry.inner);
+        drop(replacement);
+        drop(registry);
+        assert!(weak_registry.upgrade().is_none());
+    }
+
+    #[test]
+    fn connector_builder_equality_includes_routing_overrides() {
+        let defaults = ConnectorRegistry::build_from_server_defaults();
+        assert_eq!(defaults, defaults.clone());
+        let overridden = defaults.clone().with_connection_override(
+            "ws://guardian.example/".parse().unwrap(),
+            "ws://override.example/".parse().unwrap(),
+        );
+        assert_ne!(defaults, overridden);
     }
 }

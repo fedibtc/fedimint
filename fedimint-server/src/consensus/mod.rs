@@ -213,6 +213,7 @@ fn spawn_iroh_api_tasks(
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     connectors: ConnectorRegistry,
+    service_connectors: ConnectorRegistry,
     auth_ui: Option<ApiAuth>,
     auth_api: Option<ApiAuth>,
     connections: DynP2PConnections<P2PMessage>,
@@ -379,8 +380,13 @@ pub async fn run(
         task_group: task_group.clone(),
     };
 
-    let guardian_metadata_api =
-        prepare_guardian_metadata_service(&db, &cfg, force_api_secrets.get_active()).await?;
+    let guardian_metadata_api = prepare_guardian_metadata_service(
+        service_connectors,
+        &db,
+        &cfg,
+        force_api_secrets.get_active(),
+    )
+    .await?;
 
     let iroh_api_endpoints = prepare_iroh_api_endpoints(
         &cfg,

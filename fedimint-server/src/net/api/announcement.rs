@@ -39,6 +39,7 @@ impl_db_lookup!(
 );
 
 pub async fn start_api_announcement_service(
+    connectors: ConnectorRegistry,
     db: &Database,
     tg: &TaskGroup,
     cfg: &ServerConfig,
@@ -55,10 +56,8 @@ pub async fn start_api_announcement_service(
     };
 
     let db = db.clone();
-    // FIXME: (@leonardo) how should we handle the connector here ?
     let api_client = DynGlobalApi::new(
-        // TODO: get from somewhere/unify?
-        ConnectorRegistry::build_from_server_env()?.bind().await?,
+        connectors,
         get_api_urls(&db, &cfg.consensus).await,
         api_secret.as_deref(),
     )?;

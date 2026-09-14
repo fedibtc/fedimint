@@ -386,19 +386,34 @@ async fn run_consensus(
 
     initialize_gauge_metrics(&task_group, &db).await;
 
-    start_api_announcement_service(&db, &task_group, &cfg, force_api_secrets.get_active()).await?;
+    let connector_builder = ConnectorRegistry::build_from_server_defaults();
+    let service_connector_builder = ConnectorRegistry::build_from_server_env()?;
+    let connectors = connector_builder.clone().bind().await?;
+    // Preserve service-only environment overrides without duplicating endpoints
+    // when their effective connector configuration is identical.
+    let service_connectors = if service_connector_builder == connector_builder {
+        connectors.clone()
+    } else {
+        service_connector_builder.bind().await?
+    };
+
+    start_api_announcement_service(
+        service_connectors.clone(),
+        &db,
+        &task_group,
+        &cfg,
+        force_api_secrets.get_active(),
+    )
+    .await?;
     start_pkarr_publish_service(&db, &task_group, &cfg).await?;
 
     info!(target: LOG_CONSENSUS, safe_to_share = true, "Starting consensus...");
-
-    let connectors = ConnectorRegistry::build_from_server_defaults()
-        .bind()
-        .await?;
 
     consensus_started.await?;
 
     Box::pin(consensus::run(
         connectors,
+        service_connectors,
         auth_ui,
         auth_api,
         connections,
