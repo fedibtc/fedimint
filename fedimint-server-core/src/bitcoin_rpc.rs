@@ -147,11 +147,9 @@ impl ServerBitcoinRpcMonitor {
     }
 
     pub async fn submit_transaction(&self, tx: Transaction) -> Result<()> {
-        ensure!(
-            self.status_receiver.borrow().is_some(),
-            "Not connected to bitcoin backend"
-        );
-
+        // Read health is not broadcast readiness: a node in IBD (or with a
+        // failed fee estimate) can still accept a transaction. The backend
+        // remains responsible for any identity checks and transport errors.
         self.rpc.submit_transaction(tx).await
     }
 
