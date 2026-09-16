@@ -25,7 +25,12 @@ fedimint-server-core = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-util",
+    "net",
+    "rt-multi-thread",
+    "test-util",
+] }
 
 [lints]
 workspace = true

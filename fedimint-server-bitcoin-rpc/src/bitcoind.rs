@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use anyhow::anyhow;
 use bitcoin::{BlockHash, Transaction};
 use bitcoincore_rpc::Error::JsonRpc;
@@ -35,6 +38,11 @@ impl BitcoindClient {
             client: Client::new(url.as_str(), auth)?,
             url,
         })
+    }
+
+    /// Return Core's explicit initial-block-download state.
+    pub(crate) async fn is_in_initial_block_download(&self) -> anyhow::Result<bool> {
+        Ok(block_in_place(|| self.client.get_blockchain_info())?.initial_block_download)
     }
 }
 
