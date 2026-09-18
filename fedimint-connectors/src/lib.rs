@@ -35,6 +35,42 @@ use crate::ws::WebsocketConnector;
 
 const IROH_NEXT_PATH: &str = "/v1";
 
+const LEGACY_API_REDIRECTS: &[(&str, &str)] = &[
+    (
+        "wss://fedimintd.fedimint.freedommint.xyz/",
+        "wss://fedimintd.fedimint.tigerboat21.com/",
+    ),
+    ("wss://api.bitcoinprinciples.xyz/", "wss://api.d6o.org/"),
+    (
+        "wss://outlying-mouse-4ex5u4hthfuo44e6z7gb.wnext.app/ws/",
+        "wss://api.m0na.org/",
+    ),
+    (
+        "wss://third-alligator-vrj3e2jue57qllu7ktje.wnext.app/ws/",
+        "wss://api.boc0.net/",
+    ),
+    (
+        "wss://blank-orc-e6o4bhwtlrasdrmfpend.wnext.app/ws/",
+        "wss://api.og0n.io/",
+    ),
+    (
+        "wss://dependable-distribution-rc47wuqts5mdhq35v7x6.wnext.app/ws/",
+        "wss://api.dac0.com/",
+    ),
+];
+
+fn legacy_api_redirects() -> BTreeMap<SafeUrl, SafeUrl> {
+    LEGACY_API_REDIRECTS
+        .iter()
+        .map(|(original, replacement)| {
+            (
+                SafeUrl::parse(original).expect("hardcoded legacy API URL is valid"),
+                SafeUrl::parse(replacement).expect("hardcoded replacement API URL is valid"),
+            )
+        })
+        .collect()
+}
+
 /// Parse an advertised Iroh 1.0 endpoint ID into its API URL.
 ///
 /// The `/v1` path is an internal transport-selection marker. It prevents the
@@ -360,7 +396,7 @@ impl ConnectorRegistry {
             ws_force_tor: false,
             http_enable: true,
 
-            connection_overrides: BTreeMap::default(),
+            connection_overrides: legacy_api_redirects(),
         }
     }
 
@@ -376,7 +412,7 @@ impl ConnectorRegistry {
             ws_force_tor: false,
             http_enable: false,
 
-            connection_overrides: BTreeMap::default(),
+            connection_overrides: legacy_api_redirects(),
         }
     }
 
