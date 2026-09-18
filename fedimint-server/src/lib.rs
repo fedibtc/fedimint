@@ -1082,6 +1082,18 @@ pub async fn run_config_gen_with_iroh_p2p_relays(
                     .into_dyn()
                 };
 
+                info!(
+                    target: LOG_CONSENSUS,
+                    safe_to_share = true,
+                    stage = "p2p_connector",
+                    transport = if cg_params.iroh_endpoints().is_empty() {
+                        "tcp_tls"
+                    } else {
+                        "iroh"
+                    },
+                    "Configuration-generation peer connector is ready"
+                );
+
                 let (p2p_status_senders, p2p_status_receivers) =
                     p2p_status_channels(connector.peers());
 

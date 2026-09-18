@@ -811,9 +811,9 @@ impl ServerConfig {
             code_version_str,
         );
 
-        // `code_version` is the only version-compatibility gate on this branch:
-        // setup codes do not carry a version. Different major/minor/vendor
-        // projections produce different checksums and fail here, after DKG.
+        // Interactive setup checks major/minor versions early, but setup codes
+        // omit vendor metadata. Different major/minor/vendor projections still
+        // produce different checksums and fail here, including in driven setup.
         let checksum = cfg.consensus.consensus_hash_sha256();
 
         info!(

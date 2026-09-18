@@ -115,8 +115,17 @@ fn ensure_fedimint_version_matches(
     let peer_fedimint_version =
         fedimint_core::version::release_version(&peer_setup_code.fedimint_version);
 
+    // Setup codes carry only the release version. Check major/minor here;
+    // the final consensus checksum enforces the full vendor identity.
+    let peer_compatibility = fedimint_core::version::DkgVersion::parse(peer_fedimint_version)
+        .context("Invalid peer Fedimint version")?
+        .compatibility_version();
+    let local_compatibility = fedimint_core::version::DkgVersion::parse(local_fedimint_version)
+        .context("Invalid local Fedimint version")?
+        .compatibility_version();
+
     ensure!(
-        peer_fedimint_version == local_fedimint_version,
+        peer_compatibility == local_compatibility,
         "Guardian uses Fedimint version {peer_fedimint_version} but we use {local_fedimint_version}",
     );
 
@@ -975,60 +984,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_peer_setup_code_with_different_fedimint_version() {
-        let api = setup_api_with_version(Network::Regtest, "1.2.3-alpha");
-        let peer_api = setup_api_with_version(Network::Regtest, "1.2.4-beta");
+    async fn rejects_incompatible_fedimint_versions_at_admission_and_dkg() {
+        for peer_version in ["1.3.3", "2.2.3"] {
+            let api = setup_api_with_version(Network::Regtest, "1.2.3-alpha+fedi");
+            let peer_api = setup_api_with_version(Network::Regtest, peer_version);
 
-        setup_code(&api, "local").await;
-        let peer_code = setup_code(&peer_api, "peer").await;
+            setup_code(&api, "local").await;
+            let peer_code = setup_code(&peer_api, "peer").await;
+            let expected =
+                format!("Guardian uses Fedimint version {peer_version} but we use 1.2.3");
 
-        let err = api
-            .add_peer_setup_code(peer_code)
+            let err = api
+                .add_peer_setup_code(peer_code.clone())
+                .await
+                .expect_err("major/minor skew must be rejected at admission");
+            assert!(err.to_string().contains(&expected));
+
+            // Bypass admission to exercise the independent start-time check.
+            let peer_code = base32::decode_prefixed(FEDIMINT_PREFIX, &peer_code)
+                .expect("peer setup code should decode");
+            api.state.lock().await.setup_codes.insert(peer_code);
+
+            let err = api
+                .start_dkg()
+                .await
+                .expect_err("major/minor skew must also be rejected when starting DKG");
+            assert!(err.to_string().contains(&expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_patch_and_prerelease_skew_at_admission_and_dkg() {
+        let mut api = setup_api_with_version(Network::Regtest, "1.2.3-alpha+fedi");
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        api.sender = sender;
+        api.set_local_parameters(
+            "local".to_owned(),
+            Some("version-skew-test".to_owned()),
+            None,
+            None,
+            Some(4),
+        )
+        .await
+        .expect("setting local parameters should succeed");
+
+        for (name, version) in [
+            ("peer-a", "1.2.4+fedi"),
+            ("peer-b", "1.2.9-rc.1+fedi"),
+            ("peer-c", "1.2.3-beta+fedi"),
+        ] {
+            let peer_api = setup_api_with_version(Network::Regtest, version);
+            let peer_code = setup_code(&peer_api, name).await;
+            assert_eq!(
+                api.add_peer_setup_code(peer_code)
+                    .await
+                    .expect("patch/prerelease skew must be accepted"),
+                name
+            );
+        }
+
+        api.start_dkg()
             .await
-            .expect_err("peer setup code with different Fedimint version should be rejected");
-
-        assert!(
-            err.to_string()
-                .contains("Guardian uses Fedimint version 1.2.4 but we use 1.2.3")
+            .expect("compatible peers must reach config generation");
+        let ConfigGenOutcome::Generated(params) = receiver
+            .try_recv()
+            .expect("config generation parameters must be delivered")
+        else {
+            panic!("expected generated parameters, not a restore");
+        };
+        assert_eq!(params.peers.len(), 4);
+        assert_eq!(
+            params
+                .peers
+                .values()
+                .map(|peer| peer.fedimint_version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.2.3", "1.2.4", "1.2.9", "1.2.3"]
         );
     }
 
     #[tokio::test]
-    async fn accepts_peer_setup_code_with_same_release_fedimint_version() {
-        let api = setup_api_with_version(Network::Regtest, "1.2.3-alpha");
-        let peer_api = setup_api_with_version(Network::Regtest, "1.2.3-beta");
-
+    async fn rejects_malformed_peer_fedimint_version() {
+        let api = setup_api(Network::Regtest);
         setup_code(&api, "local").await;
-        let peer_code = setup_code(&peer_api, "peer").await;
-
-        let added_peer = api
-            .add_peer_setup_code(peer_code)
-            .await
-            .expect("peer setup code with same Fedimint release version should be accepted");
-
-        assert_eq!(added_peer, "peer");
-    }
-
-    #[tokio::test]
-    async fn rejects_wrong_fedimint_version_during_dkg() {
-        let api = setup_api_with_version(Network::Regtest, "1.2.3-alpha");
-        let peer_api = setup_api_with_version(Network::Regtest, "1.2.4-beta");
-
-        setup_code(&api, "local").await;
-        let peer_code = setup_code(&peer_api, "peer").await;
-        let peer_code = base32::decode_prefixed(FEDIMINT_PREFIX, &peer_code)
-            .expect("peer setup code should decode");
-
-        api.state.lock().await.setup_codes.insert(peer_code);
-
-        let err = api
-            .start_dkg()
-            .await
-            .expect_err("DKG should reject peer setup code with different Fedimint version");
-
-        assert!(
-            err.to_string()
-                .contains("Guardian uses Fedimint version 1.2.4 but we use 1.2.3")
-        );
+        for version in ["invalid", "1.2"] {
+            let peer_api = setup_api_with_version(Network::Regtest, version);
+            let peer_code = setup_code(&peer_api, "peer").await;
+            let err = api
+                .add_peer_setup_code(peer_code)
+                .await
+                .expect_err("malformed versions must not pass admission");
+            assert!(err.to_string().contains("Invalid peer Fedimint version"));
+        }
     }
 }
