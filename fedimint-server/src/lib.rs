@@ -607,7 +607,9 @@ pub async fn run_driven(
                 connector,
                 &task_group,
                 status_senders,
-                p2p_max_connection_age,
+                // DKG messages are not replayed after disconnects. Match
+                // interactive setup: do not retire these connections by age.
+                None,
             )
             .into_dyn();
 
