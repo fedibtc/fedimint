@@ -231,12 +231,12 @@ impl IServerBitcoinRpc for BitcoindClientWithFallback {
         {
             Ok(()) => Ok(()),
             Err(primary) => {
-                self.bitcoind_client.failed(&primary);
+                self.bitcoind_client.invalidate_after_broadcast_failure();
                 warn!(target: LOG_SERVER, error = %primary.fmt_compact_anyhow(), "Bitcoind broadcast failed; trying Esplora");
                 self.broadcast(&self.esplora_client, transaction)
                     .await
                     .map_err(|fallback| {
-                        self.esplora_client.failed(&fallback);
+                        self.esplora_client.invalidate_after_broadcast_failure();
                         anyhow!(
                             "Bitcoin broadcast failed: bitcoind: {primary:#}; esplora: {fallback:#}"
                         )

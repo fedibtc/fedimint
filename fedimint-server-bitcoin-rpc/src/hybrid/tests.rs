@@ -574,3 +574,72 @@ async fn broadcast_does_not_use_wrong_chain_after_recovery() {
     assert_eq!(primary.calls("broadcast"), 0);
     assert_eq!(fallback.calls("broadcast"), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn rejected_rebroadcasts_do_not_disable_healthy_reads() {
+    let (mut rpc, primary, fallback) = hybrid();
+    // Keep production timing: the default helper's zero failure TTL hides this bug.
+    for backend in [&mut rpc.bitcoind_client, &mut rpc.esplora_client] {
+        backend.deadline = Duration::from_secs(5);
+        backend.success_ttl = Duration::from_secs(5);
+        backend.failure_ttl = Duration::from_secs(30);
+    }
+    let rpc = Arc::new(rpc);
+    let tasks = TaskGroup::new();
+    let monitor = ServerBitcoinRpcMonitor::new(rpc.clone(), Duration::from_secs(60), &tasks);
+    wait_for_status(&monitor, true).await;
+    primary.state.lock().unwrap().fail_broadcast = true;
+    fallback.state.lock().unwrap().fail_broadcast = true;
+    let block = genesis_block(Network::Bitcoin);
+    // Reject just before each monitor tick, covering both primary and fallback
+    // reads.
+    tokio::time::sleep(Duration::from_secs(50)).await;
+    for primary_ibd in [false, true] {
+        primary.state.lock().unwrap().ibd = primary_ibd;
+        let err = monitor
+            .submit_transaction(block.txdata[0].clone())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("broadcast rejected"), "{err}");
+        assert_eq!(primary.get_block_count().await.unwrap(), 100);
+        assert_eq!(fallback.get_block_count().await.unwrap(), 100);
+        assert_eq!(rpc.get_block_hash(42).await.unwrap(), block.block_hash());
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert!(
+            monitor.status().is_some(),
+            "transaction rejection is not a read outage"
+        );
+        assert_eq!(monitor.get_block(&block.block_hash()).await.unwrap(), block);
+        tokio::time::sleep(Duration::from_secs(49)).await;
+    }
+    assert_eq!(primary.calls("broadcast"), 2);
+    assert_eq!(fallback.calls("broadcast"), 2);
+    assert_eq!(primary.calls("hash:42"), 1);
+    assert_eq!(fallback.calls("hash:42"), 1);
+    tasks
+        .shutdown_join_all(Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn failed_broadcast_still_invalidates_identity_before_next_use() {
+    let (rpc, primary, fallback) = hybrid();
+    rpc.get_block_count().await.unwrap();
+    primary.state.lock().unwrap().offline = true;
+    let tx = genesis_block(Network::Bitcoin).txdata.remove(0);
+    rpc.submit_transaction(tx.clone()).await.unwrap();
+    {
+        let mut state = primary.state.lock().unwrap();
+        state.offline = false;
+        state.chain = chain(Network::Testnet);
+    }
+    // A broadcast transport failure may mean the endpoint was replaced.
+    // It must not leave the old identity trusted, even without a read cooldown.
+    rpc.submit_transaction(tx).await.unwrap();
+    assert_eq!(primary.calls("broadcast"), 1);
+    assert_eq!(fallback.calls("broadcast"), 2);
+    rpc.get_block_hash(42).await.unwrap();
+    assert_eq!(primary.calls("hash:42"), 0);
+    assert_eq!(fallback.calls("hash:42"), 1);
+}

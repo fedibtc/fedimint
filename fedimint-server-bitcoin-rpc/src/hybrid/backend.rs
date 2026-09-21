@@ -141,6 +141,16 @@ impl Backend {
         state.cache = Some((Instant::now() + self.failure_ttl, Err(format!("{error:#}"))));
     }
 
+    /// A rejected transaction does not establish that reads are unavailable.
+    /// Recheck health and identity on the next read instead of caching the
+    /// broadcast error as an endpoint outage.
+    pub(super) fn invalidate_after_broadcast_failure(&self) {
+        let mut state = self.state.lock().expect("backend state lock poisoned");
+        state.chain_id = None;
+        state.generation = state.generation.wrapping_add(1);
+        state.cache = None;
+    }
+
     async fn fetch_status(&self) -> Result<Status> {
         Ok(Status {
             chain_id: self.fetch_chain_id().await?,
