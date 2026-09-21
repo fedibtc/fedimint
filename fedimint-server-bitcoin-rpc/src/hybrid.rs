@@ -1,64 +1,43 @@
-mod backend;
 #[cfg(test)]
 mod tests;
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Result, anyhow, ensure};
-use async_trait::async_trait;
+use anyhow::{Result, anyhow};
 use bitcoin::{BlockHash, Transaction};
 use fedimint_core::envs::BitcoinRpcConfig;
 use fedimint_core::util::{FmtCompactAnyhow as _, SafeUrl};
 use fedimint_core::{ChainId, Feerate};
 use fedimint_logging::LOG_SERVER;
-use fedimint_server_core::bitcoin_rpc::IServerBitcoinRpc;
+use fedimint_server_core::bitcoin_rpc::{DynServerBitcoinRpc, IServerBitcoinRpc};
 use tracing::{info, warn};
 
-use self::backend::{Backend, Status};
 use crate::bitcoind::BitcoindClient;
 use crate::esplora::EsploraClient;
 
-/// Private extension used only by hybrid backend health selection.
-#[async_trait]
-pub(super) trait HybridBitcoinRpc: IServerBitcoinRpc {
-    /// Whether this endpoint is still downloading its initial chain.
-    async fn is_in_initial_block_download(&self) -> Result<bool> {
-        Ok(self
-            .get_sync_progress()
-            .await?
-            .is_some_and(|progress| progress < 1.0))
-    }
-}
-
-#[async_trait]
-impl HybridBitcoinRpc for BitcoindClient {
-    async fn is_in_initial_block_download(&self) -> Result<bool> {
-        self.is_in_initial_block_download().await
-    }
-}
-
-impl HybridBitcoinRpc for EsploraClient {}
-
-/// A bitcoind primary and trusted Esplora fallback on one chain.
+/// A local bitcoind primary and trusted Esplora fallback on one chain.
 ///
 /// Esplora is trusted for chain selection, including startup without bitcoind.
-/// Chain equality checks catch misconfiguration; they are not SPV verification.
-/// Reads prefer a non-IBD primary unless Esplora reports a higher tip.
-/// Broadcast remains primary-first, using Esplora only after a primary error.
-/// Configuration and URL accessors describe the primary only.
+/// A one-time startup equality check catches misconfiguration when both
+/// endpoints are available; it is not SPV or reconnection verification.
+/// Reads remain bitcoind-first, except block counts use Esplora while Core
+/// explicitly reports initial block download. Broadcast remains primary-first.
 #[derive(Debug)]
 pub struct BitcoindClientWithFallback {
-    /// Primary full-node RPC and remembered health/identity.
-    bitcoind_client: Backend,
-    /// Trusted fallback RPC and remembered health/identity.
-    esplora_client: Backend,
-    /// Process identity learned from available trusted endpoints at startup.
+    /// Primary full-node RPC.
+    bitcoind_client: DynServerBitcoinRpc,
+    /// Trusted fallback RPC.
+    esplora_client: DynServerBitcoinRpc,
+    /// First chain identity obtained during startup or ordinary status reads.
     chain_id: OnceLock<ChainId>,
+    /// Whether Core has reported completion of initial block download.
+    bitcoind_ibd_complete: AtomicBool,
 }
 
 impl BitcoindClientWithFallback {
-    /// Construct a hybrid backend using two explicitly trusted endpoints.
-    pub fn new(
+    /// Construct and initialize a hybrid backend using two trusted endpoints.
+    pub async fn new(
         username: String,
         password: String,
         bitcoind_url: &SafeUrl,
@@ -70,146 +49,144 @@ impl BitcoindClientWithFallback {
             %esplora_url,
             "Initializing bitcoin bitcoind backend with trusted esplora fallback"
         );
+        Self::from_clients(
+            BitcoindClient::new(username, password, bitcoind_url)?.into_dyn(),
+            EsploraClient::new(esplora_url)?.into_dyn(),
+        )
+        .await
+    }
+
+    /// Perform the one-time startup identity check and build the backend.
+    async fn from_clients(
+        bitcoind_client: DynServerBitcoinRpc,
+        esplora_client: DynServerBitcoinRpc,
+    ) -> Result<Self> {
+        let (primary, fallback) = tokio::join!(
+            bitcoind_client.get_chain_id(),
+            esplora_client.get_chain_id(),
+        );
+        let chain_id = match (primary, fallback) {
+            (Ok(primary), Ok(fallback)) => {
+                if primary != fallback {
+                    return Err(anyhow!("Bitcoind and Esplora chain identities differ"));
+                }
+                Some(primary)
+            }
+            (Ok(chain_id), Err(_)) => {
+                warn!(
+                    target: LOG_SERVER,
+                    "Could not compare Esplora chain identity at startup; using bitcoind identity"
+                );
+                Some(chain_id)
+            }
+            (Err(_), Ok(chain_id)) => {
+                warn!(
+                    target: LOG_SERVER,
+                    "Could not compare bitcoind chain identity at startup; using trusted Esplora identity"
+                );
+                Some(chain_id)
+            }
+            (Err(_), Err(_)) => {
+                warn!(
+                    target: LOG_SERVER,
+                    "Could not check either Bitcoin backend chain identity at startup"
+                );
+                None
+            }
+        };
+        let cached_chain_id = OnceLock::new();
+        if let Some(chain_id) = chain_id {
+            let _ = cached_chain_id.set(chain_id);
+        }
         Ok(Self {
-            bitcoind_client: Backend::new(
-                "bitcoind",
-                std::sync::Arc::new(BitcoindClient::new(username, password, bitcoind_url)?),
-            ),
-            esplora_client: Backend::new(
-                "esplora",
-                std::sync::Arc::new(EsploraClient::new(esplora_url)?),
-            ),
-            chain_id: OnceLock::new(),
+            bitcoind_client,
+            esplora_client,
+            chain_id: cached_chain_id,
+            bitcoind_ibd_complete: AtomicBool::new(false),
         })
     }
 
-    /// Establish one identity, using trusted Esplora if Core is unavailable.
-    fn establish_identity(
-        &self,
-        primary: &Result<Status>,
-        fallback: &Result<Status>,
-    ) -> Result<ChainId> {
-        if let Some(id) = self.chain_id.get() {
-            return Ok(*id);
+    async fn fallback_block_count(&self, primary: anyhow::Error) -> Result<u64> {
+        warn!(
+            target: LOG_SERVER,
+            error = %primary.fmt_compact_anyhow(),
+            "Bitcoind block count unavailable; falling back to Esplora"
+        );
+        match self.esplora_client.get_block_count().await {
+            Ok(count) => Ok(count),
+            Err(_) => {
+                warn!(
+                    target: LOG_SERVER,
+                    "Esplora block-count fallback also failed; returning the bitcoind error"
+                );
+                Err(primary)
+            }
         }
-        let id = match (primary, fallback) {
-            (Ok(primary), Ok(fallback)) => {
-                if primary.chain_id != fallback.chain_id {
-                    let error = anyhow!("Bitcoind and Esplora chain identities differ");
-                    self.bitcoind_client.failed(&error);
-                    self.esplora_client.failed(&error);
-                    return Err(error);
-                }
-                primary.chain_id
-            }
-            (Ok(status), Err(_)) | (Err(_), Ok(status)) => status.chain_id,
-            (Err(primary), Err(fallback)) => {
-                return Err(anyhow!(
-                    "Cannot establish Bitcoin chain identity: bitcoind: {primary:#}; esplora: {fallback:#}"
-                ));
-            }
-        };
-        let _ = self.chain_id.set(id);
-        Ok(*self.chain_id.get().expect("chain identity was established"))
-    }
-
-    /// Prefer the primary at equal tips, otherwise use the fresher ready
-    /// source.
-    async fn read_backends(&self) -> Result<Vec<&Backend>> {
-        let primary_backend = self.bitcoind_client.clone();
-        let fallback_backend = self.esplora_client.clone();
-        let primary_task = fedimint_core::runtime::spawn("hybrid-primary-health", async move {
-            primary_backend.status().await
-        });
-        let fallback_task = fedimint_core::runtime::spawn("hybrid-fallback-health", async move {
-            fallback_backend.status().await
-        });
-        let primary = primary_task.await.map_err(anyhow::Error::from)?;
-        let fallback = fallback_task.await.map_err(anyhow::Error::from)?;
-        let expected = self.establish_identity(&primary, &fallback)?;
-        let usable = |backend: &Backend, result: Result<Status>| -> Result<u64> {
-            let status = result?;
-            if status.chain_id != expected {
-                let error = anyhow!("Bitcoin backend chain identity mismatch");
-                backend.failed(&error);
-                return Err(error);
-            }
-            ensure!(!status.ibd, "Bitcoin backend is in initial block download");
-            Ok(status.count)
-        };
-        match (
-            usable(&self.bitcoind_client, primary),
-            usable(&self.esplora_client, fallback),
-        ) {
-            (Ok(primary), Ok(fallback)) if primary < fallback => {
-                // Do not fall back to the known-stale primary if Esplora fails.
-                Ok(vec![&self.esplora_client])
-            }
-            (Ok(_), Ok(_)) => Ok(vec![&self.bitcoind_client, &self.esplora_client]),
-            (Ok(_), Err(error)) => {
-                warn!(target: LOG_SERVER, error = %error.fmt_compact_anyhow(), "Esplora is not eligible for reads");
-                Ok(vec![&self.bitcoind_client])
-            }
-            (Err(error), Ok(_)) => {
-                warn!(target: LOG_SERVER, error = %error.fmt_compact_anyhow(), "Bitcoind is not eligible for reads");
-                Ok(vec![&self.esplora_client])
-            }
-            (Err(primary), Err(fallback)) => Err(anyhow!(
-                "No usable Bitcoin backend: bitcoind: {primary:#}; esplora: {fallback:#}"
-            )),
-        }
-    }
-
-    async fn broadcast(&self, backend: &Backend, transaction: Transaction) -> Result<()> {
-        let expected = self.get_chain_id().await?;
-        backend.check_identity(expected).await?;
-        backend.rpc.submit_transaction(transaction).await
     }
 }
 
-/// Keep every read on the same eligibility and error-handling path.
+/// Try an ordinary read locally, then retry only that request on Esplora.
 macro_rules! read_rpc {
     ($self:ident, $method:ident $(, $arg:expr)*) => {{
-        let mut errors = Vec::new();
-        for backend in $self.read_backends().await? {
-            let expected = *$self.chain_id.get().expect("read selection established identity");
-            let result = async {
-                // Usually a local cache read. Revalidate if another request
-                // observed failure after this call selected the backend.
-                backend.check_identity(expected).await?;
-                backend.rpc.$method($($arg),*).await
-            }.await;
-            match result {
-                Ok(value) => return Ok(value),
-                Err(error) => {
-                    backend.failed(&error);
-                    warn!(
-                        target: LOG_SERVER,
-                        backend = backend.name,
-                        method = stringify!($method),
-                        error = %error.fmt_compact_anyhow(),
-                        "Bitcoin read failed; trying any other eligible backend"
-                    );
-                    errors.push(format!("{}: {error:#}", backend.name));
+        let primary = $self.bitcoind_client.$method($($arg),*).await;
+        match primary {
+            Ok(value) => Ok(value),
+            Err(primary) => {
+                warn!(
+                    target: LOG_SERVER,
+                    method = stringify!($method),
+                    error = %primary.fmt_compact_anyhow(),
+                    "Bitcoind read failed; trying Esplora"
+                );
+                match $self.esplora_client.$method($($arg),*).await {
+                    Ok(value) => Ok(value),
+                    Err(_) => {
+                        warn!(
+                            target: LOG_SERVER,
+                            method = stringify!($method),
+                            "Esplora read fallback also failed; returning the bitcoind error"
+                        );
+                        Err(primary)
+                    }
                 }
             }
         }
-        Err(anyhow!("Bitcoin read failed: {}", errors.join("; ")))
     }};
 }
 
 #[async_trait::async_trait]
 impl IServerBitcoinRpc for BitcoindClientWithFallback {
     fn get_bitcoin_rpc_config(&self) -> BitcoinRpcConfig {
-        self.bitcoind_client.rpc.get_bitcoin_rpc_config()
+        self.bitcoind_client.get_bitcoin_rpc_config()
     }
 
     fn get_url(&self) -> SafeUrl {
-        self.bitcoind_client.rpc.get_url()
+        self.bitcoind_client.get_url()
     }
 
     async fn get_block_count(&self) -> Result<u64> {
-        read_rpc!(self, get_block_count)
+        if self.bitcoind_ibd_complete.load(Ordering::Relaxed) {
+            return match self.bitcoind_client.get_block_count().await {
+                Ok(count) => Ok(count),
+                Err(primary) => self.fallback_block_count(primary).await,
+            };
+        }
+
+        match self
+            .bitcoind_client
+            .get_block_count_and_initial_block_download()
+            .await
+        {
+            Ok((_count, true)) => {
+                self.fallback_block_count(anyhow!("Bitcoind is in initial block download"))
+                    .await
+            }
+            Ok((count, false)) => {
+                self.bitcoind_ibd_complete.store(true, Ordering::Relaxed);
+                Ok(count)
+            }
+            Err(primary) => self.fallback_block_count(primary).await,
+        }
     }
 
     async fn get_block_hash(&self, height: u64) -> Result<BlockHash> {
@@ -226,47 +203,51 @@ impl IServerBitcoinRpc for BitcoindClientWithFallback {
 
     async fn submit_transaction(&self, transaction: Transaction) -> Result<()> {
         match self
-            .broadcast(&self.bitcoind_client, transaction.clone())
+            .bitcoind_client
+            .submit_transaction(transaction.clone())
             .await
         {
             Ok(()) => Ok(()),
             Err(primary) => {
-                self.bitcoind_client.failed(&primary);
                 warn!(target: LOG_SERVER, error = %primary.fmt_compact_anyhow(), "Bitcoind broadcast failed; trying Esplora");
-                self.broadcast(&self.esplora_client, transaction)
-                    .await
-                    .map_err(|fallback| {
-                        self.esplora_client.failed(&fallback);
-                        anyhow!(
-                            "Bitcoin broadcast failed: bitcoind: {primary:#}; esplora: {fallback:#}"
-                        )
-                    })
+                match self.esplora_client.submit_transaction(transaction).await {
+                    Ok(()) => Ok(()),
+                    Err(_) => {
+                        warn!(
+                            target: LOG_SERVER,
+                            "Esplora broadcast fallback also failed; returning the bitcoind error"
+                        );
+                        Err(primary)
+                    }
+                }
             }
         }
     }
 
     async fn get_sync_progress(&self) -> Result<Option<f64>> {
-        // Eligibility already excludes IBD. Esplora has no progress estimate.
-        self.read_backends().await?;
         Ok(None)
     }
 
     async fn get_chain_id(&self) -> Result<ChainId> {
-        if let Some(id) = self.chain_id.get() {
-            return Ok(*id);
+        if let Some(chain_id) = self.chain_id.get() {
+            return Ok(*chain_id);
         }
-        let primary_backend = self.bitcoind_client.clone();
-        let fallback_backend = self.esplora_client.clone();
-        let primary_task = fedimint_core::runtime::spawn("hybrid-primary-identity", async move {
-            primary_backend.status().await
-        });
-        let fallback_task = fedimint_core::runtime::spawn("hybrid-fallback-identity", async move {
-            fallback_backend.status().await
-        });
-        let primary = primary_task.await.map_err(anyhow::Error::from)?;
-        let fallback = fallback_task.await.map_err(anyhow::Error::from)?;
-        // Identity is independent of read readiness: an IBD node can still
-        // identify its chain and attempt transaction broadcast.
-        self.establish_identity(&primary, &fallback)
+
+        let chain_id = match self.bitcoind_client.get_chain_id().await {
+            Ok(chain_id) => chain_id,
+            Err(primary) => {
+                warn!(
+                    target: LOG_SERVER,
+                    error = %primary.fmt_compact_anyhow(),
+                    "Bitcoind chain identity unavailable; trying Esplora"
+                );
+                self.esplora_client.get_chain_id().await?
+            }
+        };
+        let _ = self.chain_id.set(chain_id);
+        Ok(*self
+            .chain_id
+            .get()
+            .expect("chain identity was just initialized"))
     }
 }

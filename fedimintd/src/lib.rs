@@ -128,9 +128,9 @@ struct ServerOpts {
     /// This should not include authentication parameters, they should be
     /// included in `FM_BITCOIND_USERNAME` and `FM_BITCOIND_PASSWORD`
     ///
-    /// With Esplora configured, reads prefer a non-IBD bitcoind at least as
-    /// current as the trusted Esplora endpoint. Broadcast remains
-    /// bitcoind-first.
+    /// With Esplora configured, reads remain bitcoind-first except block count
+    /// uses Esplora while bitcoind reports initial block download. Broadcast
+    /// remains bitcoind-first.
     #[arg(long, env = FM_BITCOIND_URL_ENV)]
     bitcoind_url: Option<SafeUrl>,
 
@@ -146,12 +146,13 @@ struct ServerOpts {
 
     /// Trusted Esplora HTTP base URL, e.g. <https://mempool.space/api>
     ///
-    /// With bitcoind configured, serves reads when bitcoind fails, is in
-    /// initial block download, or reports a lower tip. Both must use the
-    /// same chain. Esplora can bootstrap while bitcoind is offline and is
-    /// trusted for chain selection, not independently verified.
+    /// With bitcoind configured, retries individual failed reads and supplies
+    /// block count while bitcoind reports initial block download. Their chain
+    /// identities are compared once at startup when both respond. Esplora can
+    /// bootstrap while bitcoind is offline and is trusted for chain selection,
+    /// not independently verified.
     /// Transactions go to Esplora only after a bitcoind broadcast error.
-    /// See `docs/bitcoin_backends.md` for the trust model.
+    /// See SECURITY.md for the trust model.
     #[arg(long, env = FM_ESPLORA_URL_ENV)]
     esplora_url: Option<SafeUrl>,
 
@@ -550,7 +551,8 @@ async fn run_inner(
                         bitcoind_password,
                         &bitcoind_url,
                         esplora_url,
-                    )?
+                    )
+                    .await?
                     .into_dyn()
                 }
                 _ => unreachable!("ArgGroup already enforced at least one Bitcoin backend"),
@@ -752,6 +754,15 @@ mod tests {
 
     fn parse_server_opts() -> ServerOpts {
         ServerOpts::try_parse_from(server_opts_args()).expect("server opts should parse")
+    }
+
+    #[test]
+    fn both_bitcoin_backends_parse_together() {
+        let mut args = server_opts_args();
+        args.extend(["--esplora-url", "http://127.0.0.1:50002"]);
+        let opts = ServerOpts::try_parse_from(args).expect("both Bitcoin backends should parse");
+        assert!(opts.bitcoind_url.is_some());
+        assert!(opts.esplora_url.is_some());
     }
 
     fn parse_server_opts_with_enable_iroh_env(value: &str) -> ServerOpts {

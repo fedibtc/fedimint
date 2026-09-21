@@ -13,11 +13,11 @@ services:
       - FM_BITCOIN_NETWORK=bitcoin
       - FM_ESPLORA_URL=https://mempool.space/api
       # To use your own bitcoind, remove FM_ESPLORA_URL and uncomment below.
-      # This sample's pinned public image predates the sync-aware hybrid routing
-      # fixes; use one backend unless upgrading to a release containing them.
+      # This sample's pinned image predates the sync-aware hybrid routing fixes;
+      # use one backend unless upgrading to a release containing those fixes.
       # Hybrid mode trusts Esplora for chain selection. Broadcast is always
-      # bitcoind-first, with Esplora attempted only after a primary error, NOT
-      # simultaneous. See docs/bitcoin_backends.md before configuring a fallback.
+      # bitcoind-first, with Esplora attempted only after a primary error,
+      # NOT simultaneous. See SECURITY.md before configuring a trusted fallback.
       # - FM_BITCOIND_URL=http://bitcoind:8332
       # - FM_BITCOIND_USERNAME=bitcoin
       # - FM_BITCOIND_PASSWORD=bitcoin
