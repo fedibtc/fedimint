@@ -69,7 +69,7 @@ pub struct FeeConsensus {
 }
 
 impl FeeConsensus {
-    /// The mint module will charge a non-configurable base fee of one hundred
+    /// The mint module will charge a non-configurable base fee of ten
     /// millisatoshis per transaction input and output to account for the costs
     /// incurred by the federation for processing the transaction. On top of
     /// that the federation may charge a additional relative fee per input and
@@ -86,7 +86,7 @@ impl FeeConsensus {
         );
 
         Ok(Self {
-            base: Amount::from_msats(100),
+            base: Amount::from_msats(10),
             parts_per_million,
         })
     }
@@ -135,26 +135,35 @@ fn test_fee_consensus() {
 
     assert_eq!(
         fee_consensus.fee(Amount::from_msats(999)),
-        Amount::from_msats(100)
+        Amount::from_msats(10)
     );
 
     assert_eq!(
         fee_consensus.fee(Amount::from_sats(1)),
-        Amount::from_msats(100) + Amount::from_msats(1)
+        Amount::from_msats(10) + Amount::from_msats(1)
     );
 
     assert_eq!(
         fee_consensus.fee(Amount::from_sats(1000)),
-        Amount::from_sats(1) + Amount::from_msats(100)
+        Amount::from_sats(1) + Amount::from_msats(10)
     );
 
     assert_eq!(
         fee_consensus.fee(Amount::from_bitcoins(1)),
-        Amount::from_sats(100_000) + Amount::from_msats(100)
+        Amount::from_sats(100_000) + Amount::from_msats(10)
     );
 
     assert_eq!(
         fee_consensus.fee(Amount::from_bitcoins(100_000)),
-        Amount::from_bitcoins(100) + Amount::from_msats(100)
+        Amount::from_bitcoins(100) + Amount::from_msats(10)
+    );
+
+    assert_eq!(
+        fee_consensus.min_economical_denomination(),
+        Amount::from_msats(64)
+    );
+    assert_eq!(
+        fee_consensus.round_up(Amount::from_msats(65)),
+        Amount::from_msats(128)
     );
 }
