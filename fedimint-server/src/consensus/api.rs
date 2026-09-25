@@ -1342,12 +1342,11 @@ mod tests {
     #[test]
     fn legacy_peer_status_flags_peers_lagging_the_session_count() {
         let peer_status = |connected: bool, last_contribution, session_count| {
-            let (_p2p_sender, p2p_receiver) = watch::channel(connected.then_some(
-                P2PConnectionStatus {
+            let (_p2p_sender, p2p_receiver) =
+                watch::channel(connected.then_some(P2PConnectionStatus {
                     conn_type: None,
                     rtt: None,
-                },
-            ));
+                }));
             let (_ci_sender, ci_receiver) = watch::channel(last_contribution);
 
             legacy_peer_status(&p2p_receiver, &ci_receiver, session_count)

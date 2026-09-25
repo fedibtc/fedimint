@@ -26,10 +26,10 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 bincode = { workspace = true }
-ciborium = { workspace = true }
 bitcoin = { workspace = true }
 bls12_381 = { workspace = true }
 bytes = { workspace = true }
+ciborium = { workspace = true }
 fedimint-aead = { workspace = true }
 fedimint-api-client = { workspace = true }
 fedimint-connectors = { workspace = true }
@@ -76,8 +76,8 @@ url = { workspace = true }
 z32 = { workspace = true }
 
 [dev-dependencies]
-test-log = { workspace = true }
 tempfile = { workspace = true }
+test-log = { workspace = true }
 
 [build-dependencies]
 fedimint-build = { workspace = true }
