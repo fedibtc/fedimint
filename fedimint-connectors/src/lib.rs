@@ -368,9 +368,10 @@ impl fmt::Debug for ConnectorRegistry {
 }
 
 impl ConnectorRegistry {
-    /// Share guardian connections between API views with the same authentication
-    /// context. The pool keys connections by full URL; callers must use it only
-    /// with this `api_secret`. Separate registries never share pools.
+    /// Share guardian connections between API views with the same
+    /// authentication context. The pool keys connections by full URL;
+    /// callers must use it only with this `api_secret`. Separate registries
+    /// never share pools.
     pub fn guardian_connection_pool(
         &self,
         api_secret: Option<&str>,

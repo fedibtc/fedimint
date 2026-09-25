@@ -720,9 +720,9 @@ impl FederationApi {
 
     /// Get receiver for changes in the active connections
     ///
-    /// This reports all URLs in the registry/authentication-scoped pool, including
-    /// URLs belonging to other API views. Use `connection_status_stream` for a
-    /// view filtered to this API's peers.
+    /// This reports all URLs in the registry/authentication-scoped pool,
+    /// including URLs belonging to other API views. Use
+    /// `connection_status_stream` for a view filtered to this API's peers.
     pub fn get_active_connection_receiver(&self) -> watch::Receiver<BTreeSet<SafeUrl>> {
         self.connection_pool.get_active_connection_receiver()
     }
