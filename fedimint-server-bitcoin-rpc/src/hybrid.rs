@@ -3,7 +3,6 @@ mod tests;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bitcoin::{BlockHash, Transaction};
@@ -17,28 +16,12 @@ use tracing::{info, warn};
 use crate::bitcoind::BitcoindClient;
 use crate::esplora::EsploraClient;
 
-/// Maximum time each backend identity check may delay hybrid client
-/// construction.
-///
-/// This best-effort check allows normal remote latency while staying well below
-/// supervising process startup deadlines.
-const STARTUP_CHAIN_ID_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Probe one backend's chain identity without letting synchronous RPC block the
-/// task that enforces the startup deadline.
-async fn startup_chain_id(task_name: &'static str, client: DynServerBitcoinRpc) -> Result<ChainId> {
-    let probe =
-        fedimint_core::runtime::spawn(task_name, async move { client.get_chain_id().await });
-    // Timing out detaches this one-shot probe because a synchronous Core RPC
-    // cannot be cancelled. Its late result cannot update the hybrid identity.
-    tokio::time::timeout(STARTUP_CHAIN_ID_TIMEOUT, probe).await??
-}
-
 /// A local bitcoind primary and trusted Esplora fallback on one chain.
 ///
-/// Esplora is trusted for chain selection, including startup without bitcoind.
-/// A one-time startup equality check catches misconfiguration when both
-/// endpoints are available; it is not SPV or reconnection verification.
+/// Esplora is trusted for chain selection, including when bitcoind is
+/// unavailable. Construction does not probe or compare endpoint identities: a
+/// guardian's faulty backend consumes the federation's fault budget. See
+/// SECURITY.md, "Guardian Bitcoin Backends", for the limits of that redundancy.
 /// Reads remain bitcoind-first, except block counts use Esplora while Core
 /// explicitly reports initial block download. Broadcast remains primary-first.
 #[derive(Debug)]
@@ -47,14 +30,15 @@ pub struct BitcoindClientWithFallback {
     bitcoind_client: DynServerBitcoinRpc,
     /// Trusted fallback RPC.
     esplora_client: DynServerBitcoinRpc,
-    /// First chain identity obtained during startup or ordinary status reads.
+    /// First chain identity obtained during ordinary status reads.
     chain_id: OnceLock<ChainId>,
     /// Whether Core has reported completion of initial block download.
     bitcoind_ibd_complete: AtomicBool,
 }
 
 impl BitcoindClientWithFallback {
-    /// Construct and initialize a hybrid backend using two trusted endpoints.
+    /// Construct a hybrid backend using two trusted endpoints without probing
+    /// them.
     pub async fn new(
         username: String,
         password: String,
@@ -67,61 +51,23 @@ impl BitcoindClientWithFallback {
             %esplora_url,
             "Initializing bitcoin bitcoind backend with trusted esplora fallback"
         );
-        Self::from_clients(
+        Ok(Self::from_clients(
             BitcoindClient::new(username, password, bitcoind_url)?.into_dyn(),
             EsploraClient::new(esplora_url)?.into_dyn(),
-        )
-        .await
+        ))
     }
 
-    /// Perform the one-time startup identity check and build the backend.
-    async fn from_clients(
+    /// Build the backend without contacting either endpoint.
+    fn from_clients(
         bitcoind_client: DynServerBitcoinRpc,
         esplora_client: DynServerBitcoinRpc,
-    ) -> Result<Self> {
-        let (primary, fallback) = tokio::join!(
-            startup_chain_id("bitcoind-startup-chain-id", bitcoind_client.clone()),
-            startup_chain_id("esplora-startup-chain-id", esplora_client.clone()),
-        );
-        let chain_id = match (primary, fallback) {
-            (Ok(primary), Ok(fallback)) => {
-                if primary != fallback {
-                    return Err(anyhow!("Bitcoind and Esplora chain identities differ"));
-                }
-                Some(primary)
-            }
-            (Ok(chain_id), Err(_)) => {
-                warn!(
-                    target: LOG_SERVER,
-                    "Could not compare Esplora chain identity at startup; using bitcoind identity"
-                );
-                Some(chain_id)
-            }
-            (Err(_), Ok(chain_id)) => {
-                warn!(
-                    target: LOG_SERVER,
-                    "Could not compare bitcoind chain identity at startup; using trusted Esplora identity"
-                );
-                Some(chain_id)
-            }
-            (Err(_), Err(_)) => {
-                warn!(
-                    target: LOG_SERVER,
-                    "Could not check either Bitcoin backend chain identity at startup"
-                );
-                None
-            }
-        };
-        let cached_chain_id = OnceLock::new();
-        if let Some(chain_id) = chain_id {
-            let _ = cached_chain_id.set(chain_id);
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             bitcoind_client,
             esplora_client,
-            chain_id: cached_chain_id,
+            chain_id: OnceLock::new(),
             bitcoind_ibd_complete: AtomicBool::new(false),
-        })
+        }
     }
 
     async fn fallback_block_count(&self, primary: anyhow::Error) -> Result<u64> {
