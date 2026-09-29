@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
@@ -18,6 +18,7 @@ use crate::esplora::EsploraClient;
 #[derive(Debug)]
 struct State {
     chain: ChainId,
+    stall_chain: bool,
     count: u64,
     ibd: bool,
     offline: bool,
@@ -33,7 +34,38 @@ struct State {
 #[derive(Debug)]
 struct Fake {
     state: Mutex<State>,
+    chain_blocker: Mutex<Option<Arc<ChainBlocker>>>,
     url: SafeUrl,
+}
+
+/// Synchronous chain identity blocker used to model bitcoind's blocking RPC.
+#[derive(Debug, Default)]
+struct ChainBlocker {
+    released: Mutex<bool>,
+    release: Condvar,
+}
+
+impl ChainBlocker {
+    fn wait(&self) {
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.release.wait(released).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+/// Releases a synchronous fake RPC block even when its test unwinds.
+struct ChainBlockRelease(Arc<ChainBlocker>);
+
+impl Drop for ChainBlockRelease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 fn chain(network: Network) -> ChainId {
@@ -45,6 +77,7 @@ impl Fake {
         Arc::new(Self {
             state: Mutex::new(State {
                 chain: chain(Network::Bitcoin),
+                stall_chain: false,
                 count: 100,
                 ibd: false,
                 offline: false,
@@ -55,8 +88,15 @@ impl Fake {
                 calls: vec![],
                 transactions: vec![],
             }),
+            chain_blocker: Mutex::new(None),
             url: format!("http://{name}.invalid").parse().unwrap(),
         })
+    }
+
+    fn block_chain(&self) -> ChainBlockRelease {
+        let blocker = Arc::new(ChainBlocker::default());
+        *self.chain_blocker.lock().unwrap() = Some(blocker.clone());
+        ChainBlockRelease(blocker)
     }
 
     fn call(&self, method: &str) -> Result<std::sync::MutexGuard<'_, State>> {
@@ -149,7 +189,19 @@ impl IServerBitcoinRpc for Fake {
     }
 
     async fn get_chain_id(&self) -> Result<ChainId> {
-        Ok(self.call("chain")?.chain)
+        let (chain, stall) = {
+            let state = self.call("chain")?;
+            (state.chain, state.stall_chain)
+        };
+        let blocker = self.chain_blocker.lock().unwrap().clone();
+        if let Some(blocker) = blocker {
+            fedimint_core::runtime::block_in_place(|| blocker.wait());
+        }
+        if stall {
+            std::future::pending().await
+        } else {
+            Ok(chain)
+        }
     }
 }
 
@@ -372,6 +424,69 @@ async fn mismatched_startup_is_rejected() {
     );
     assert_eq!(primary.calls("fee"), 0);
     assert_eq!(fallback.calls("fee"), 0);
+}
+
+#[tokio::test]
+async fn stalled_fallback_identity_does_not_block_healthy_primary_startup() {
+    let primary = Fake::new("primary");
+    let fallback = Fake::new("fallback");
+    fallback.state.lock().unwrap().stall_chain = true;
+
+    let rpc = tokio::time::timeout(
+        Duration::from_secs(6),
+        BitcoindClientWithFallback::from_clients(primary.clone(), fallback.clone()),
+    )
+    .await
+    .expect("startup identity checks should be bounded")
+    .unwrap();
+
+    assert_eq!(rpc.get_chain_id().await.unwrap(), chain(Network::Bitcoin));
+    assert_eq!(primary.calls("chain"), 1);
+    assert_eq!(fallback.calls("chain"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_primary_identity_does_not_block_healthy_fallback_startup() {
+    let primary = Fake::new("primary");
+    let fallback = Fake::new("fallback");
+    let primary_block = primary.block_chain();
+    fallback.state.lock().unwrap().chain = chain(Network::Signet);
+
+    let rpc = tokio::time::timeout(
+        Duration::from_secs(6),
+        BitcoindClientWithFallback::from_clients(primary.clone(), fallback.clone()),
+    )
+    .await;
+    drop(primary_block);
+    let rpc = rpc
+        .expect("startup identity checks should be bounded")
+        .unwrap();
+
+    assert_eq!(rpc.get_chain_id().await.unwrap(), chain(Network::Signet));
+    assert_eq!(primary.calls("chain"), 1);
+    assert_eq!(fallback.calls("chain"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_identity_checks_are_bounded_when_both_backends_are_unavailable() {
+    let primary = Fake::new("primary");
+    let fallback = Fake::new("fallback");
+    let primary_block = primary.block_chain();
+    fallback.state.lock().unwrap().stall_chain = true;
+
+    let rpc = tokio::time::timeout(
+        Duration::from_secs(6),
+        BitcoindClientWithFallback::from_clients(primary.clone(), fallback.clone()),
+    )
+    .await;
+    drop(primary_block);
+    let rpc = rpc
+        .expect("startup identity checks should be bounded")
+        .unwrap();
+
+    assert!(rpc.chain_id.get().is_none());
+    assert_eq!(primary.calls("chain"), 1);
+    assert_eq!(fallback.calls("chain"), 1);
 }
 
 #[tokio::test]

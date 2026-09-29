@@ -3,6 +3,7 @@ mod tests;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bitcoin::{BlockHash, Transaction};
@@ -15,6 +16,23 @@ use tracing::{info, warn};
 
 use crate::bitcoind::BitcoindClient;
 use crate::esplora::EsploraClient;
+
+/// Maximum time each backend identity check may delay hybrid client
+/// construction.
+///
+/// This best-effort check allows normal remote latency while staying well below
+/// supervising process startup deadlines.
+const STARTUP_CHAIN_ID_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Probe one backend's chain identity without letting synchronous RPC block the
+/// task that enforces the startup deadline.
+async fn startup_chain_id(task_name: &'static str, client: DynServerBitcoinRpc) -> Result<ChainId> {
+    let probe =
+        fedimint_core::runtime::spawn(task_name, async move { client.get_chain_id().await });
+    // Timing out detaches this one-shot probe because a synchronous Core RPC
+    // cannot be cancelled. Its late result cannot update the hybrid identity.
+    tokio::time::timeout(STARTUP_CHAIN_ID_TIMEOUT, probe).await??
+}
 
 /// A local bitcoind primary and trusted Esplora fallback on one chain.
 ///
@@ -62,8 +80,8 @@ impl BitcoindClientWithFallback {
         esplora_client: DynServerBitcoinRpc,
     ) -> Result<Self> {
         let (primary, fallback) = tokio::join!(
-            bitcoind_client.get_chain_id(),
-            esplora_client.get_chain_id(),
+            startup_chain_id("bitcoind-startup-chain-id", bitcoind_client.clone()),
+            startup_chain_id("esplora-startup-chain-id", esplora_client.clone()),
         );
         let chain_id = match (primary, fallback) {
             (Ok(primary), Ok(fallback)) => {

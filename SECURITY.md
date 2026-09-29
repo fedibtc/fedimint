@@ -74,13 +74,16 @@ consider this correlated trust dependency.
 
 In hybrid mode (`FM_BITCOIND_URL` and `FM_ESPLORA_URL` together), available
 endpoints are compared once at startup using the height-1 block hash. A detected
-mismatch stops startup. If either or both endpoints are unavailable, the
-comparison is skipped with a warning so backend availability does not become a
-new startup requirement. The comparison is not retried after recovery. If
-neither identity was available at startup, the first later identity needed for
-ordinary status monitoring is cached without comparing endpoints. Trusted
-endpoints are expected to keep serving their configured chain, and operators
-must restart the guardian when deliberately changing chains.
+mismatch stops startup. Each identity probe has a five-second startup budget;
+an endpoint that errors or responds more slowly is treated as unavailable. If
+either or both endpoints are unavailable, the comparison is skipped with a
+warning so backend availability does not become a new startup requirement. The
+comparison is not retried after recovery, so a mismatch involving an endpoint
+that missed the startup budget is not detected. If neither identity was
+available at startup, the first later identity needed for ordinary status
+monitoring is cached without comparing endpoints. Trusted endpoints are expected
+to keep serving their configured chain, and operators must restart the guardian
+when deliberately changing chains.
 
 Reads try bitcoind first and retry only the failed request on Esplora. Fee
 estimation also falls back when Core successfully responds without an estimate,
