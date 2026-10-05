@@ -211,6 +211,52 @@ async fn test_can_attach_extra_meta_to_receive_operation() -> anyhow::Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn funding_limit_rejects_before_spending_and_allows_exact_debit() -> anyhow::Result<()> {
+    let fed = fixtures().new_fed_degraded().await;
+    let (recipient, sender) = fed.two_clients().await;
+    sender
+        .get_first_module::<DummyClientModule>()?
+        .mock_receive(sats(1000), AmountUnit::BITCOIN)
+        .await?;
+    let (_, invoice, _) = recipient
+        .get_first_module::<LightningClientModule>()?
+        .create_bolt11_invoice(
+            sats(250),
+            Bolt11InvoiceDescription::Direct(Description::new(String::new())?),
+            None,
+            (),
+            None,
+        )
+        .await?;
+    let ln = sender.get_first_module::<LightningClientModule>()?;
+    let debit = sats(250) + ln.send_fee_quote(sats(250)).await?.total().get_bitcoin();
+    let balance = sender.get_balance_for_btc().await?;
+    assert!(
+        ln.pay_bolt11_invoice_with_funding_limit(
+            None,
+            invoice.clone(),
+            (),
+            debit - Amount::from_msats(1),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(sender.get_balance_for_btc().await?, balance);
+
+    let payment = ln
+        .pay_bolt11_invoice_with_funding_limit(None, invoice, (), debit)
+        .await?;
+    let PayType::Internal(operation) = payment.payment_type else {
+        panic!("expected internal payment");
+    };
+    let mut updates = ln.subscribe_internal_pay(operation).await?.into_stream();
+    assert_eq!(updates.ok().await?, InternalPayState::Funding);
+    assert_matches!(updates.ok().await?, InternalPayState::Preimage { .. });
+    assert_eq!(sender.get_balance_for_btc().await?, balance - debit);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cannot_pay_same_internal_invoice_twice() -> anyhow::Result<()> {
     let fixtures = fixtures();
     let fed = fixtures.new_fed_degraded().await;

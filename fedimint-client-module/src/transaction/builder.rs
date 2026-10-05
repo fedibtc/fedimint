@@ -574,6 +574,7 @@ where
 pub struct TransactionBuilder {
     inputs: Vec<ClientInputBundle>,
     outputs: Vec<ClientOutputBundle>,
+    funding_limit: Option<Amounts>,
 }
 
 impl TransactionBuilder {
@@ -589,6 +590,26 @@ impl TransactionBuilder {
     pub fn with_outputs(mut self, outputs: ClientOutputBundle) -> Self {
         self.outputs.push(outputs);
         self
+    }
+
+    /// Limit the net amount drawn from primary modules, including federation
+    /// fees.
+    pub fn with_funding_limit(mut self, limit: Amounts) -> Self {
+        self.funding_limit = Some(limit);
+        self
+    }
+
+    /// Reject funding above the limit in any unit, including unapproved units.
+    pub fn verify_funding_limit(&self, funding: &Amounts) -> anyhow::Result<()> {
+        if let Some(limit) = &self.funding_limit {
+            for (unit, amount) in funding.iter() {
+                anyhow::ensure!(
+                    *amount <= limit.get(unit).copied().unwrap_or_default(),
+                    "Transaction funding exceeds the approved limit"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn build<C, R: RngCore + CryptoRng>(

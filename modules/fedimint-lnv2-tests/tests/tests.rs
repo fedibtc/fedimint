@@ -183,6 +183,57 @@ async fn can_pay_external_invoice_exactly_once() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn funding_limit_rejects_before_spending_and_allows_exact_debit() -> anyhow::Result<()> {
+    let fed = fixtures().new_fed_degraded().await;
+    let client = fed.new_client().await;
+    client
+        .get_first_module::<DummyClientModule>()?
+        .mock_receive(sats(10_000), AmountUnit::BITCOIN)
+        .await?;
+    let ln = client.get_first_module::<LightningClientModule>()?;
+    let invoice = mock::payable_invoice();
+    let routing = ln
+        .routing_info(&mock::gateway())
+        .await?
+        .expect("mock gateway");
+    let (fee, _) = routing.send_parameters(&invoice);
+    let contract = fee.add_to(invoice.amount_milli_satoshis().expect("invoice amount"));
+    let debit = contract + ln.send_fee_quote(contract).await?.total().get_bitcoin();
+    assert!(debit > contract, "the limit must include federation fees");
+    let balance = client.get_balance_for_btc().await?;
+
+    assert!(
+        ln.send_with_funding_limit(
+            invoice.clone(),
+            Some(mock::gateway()),
+            Value::Null,
+            debit - Amount::from_msats(1),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(client.get_balance_for_btc().await?, balance);
+    assert_eq!(
+        ln.get_invoice_send_status(&invoice).await?,
+        InvoiceSendStatus::NotAttempted
+    );
+
+    let operation = ln
+        .send_with_funding_limit(invoice.clone(), Some(mock::gateway()), Value::Null, debit)
+        .await?;
+    assert!(matches!(
+        ln.await_final_send_operation_state(operation).await?,
+        fedimint_lnv2_client::FinalSendOperationState::Success(_)
+    ));
+    assert_eq!(client.get_balance_for_btc().await?, balance - debit);
+    assert_eq!(
+        ln.get_invoice_send_status(&invoice).await?,
+        InvoiceSendStatus::Succeeded(operation)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn refund_failed_payment() -> anyhow::Result<()> {
     let fixtures = fixtures();
     let fed = fixtures.new_fed_degraded().await;

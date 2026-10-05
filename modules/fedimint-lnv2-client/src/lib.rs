@@ -529,12 +529,34 @@ impl LightningClientModule {
     ///
     /// The absolute fee for a payment can be calculated from the operation meta
     /// to be shown to the user in the transaction history.
-    #[allow(clippy::too_many_lines)]
     pub async fn send(
         &self,
         invoice: Bolt11Invoice,
         gateway: Option<SafeUrl>,
         custom_meta: Value,
+    ) -> Result<OperationId, SendPaymentError> {
+        self.send_inner(invoice, gateway, custom_meta, None).await
+    }
+
+    /// Pay only if the complete funding debit fits within the approved limit.
+    pub async fn send_with_funding_limit(
+        &self,
+        invoice: Bolt11Invoice,
+        gateway: Option<SafeUrl>,
+        custom_meta: Value,
+        funding_limit: Amount,
+    ) -> Result<OperationId, SendPaymentError> {
+        self.send_inner(invoice, gateway, custom_meta, Some(funding_limit))
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn send_inner(
+        &self,
+        invoice: Bolt11Invoice,
+        gateway: Option<SafeUrl>,
+        custom_meta: Value,
+        funding_limit: Option<Amount>,
     ) -> Result<OperationId, SendPaymentError> {
         let amount = invoice
             .amount_milli_satoshis()
@@ -629,6 +651,10 @@ impl LightningClientModule {
         ));
 
         let transaction = TransactionBuilder::new().with_outputs(client_output);
+        let transaction = match funding_limit {
+            Some(limit) => transaction.with_funding_limit(Amounts::new_bitcoin(limit)),
+            None => transaction,
+        };
 
         self.client_ctx
             .finalize_and_submit_transaction(

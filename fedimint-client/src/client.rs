@@ -637,6 +637,33 @@ impl Client {
             added_outputs_bundles.push(added_output_bundle);
         }
 
+        let mut funding_inputs = Amounts::ZERO;
+        let mut funding_outputs = Amounts::ZERO;
+        for input in added_inputs_bundles
+            .iter()
+            .flat_map(|bundle| bundle.inputs())
+        {
+            funding_inputs = funding_inputs
+                .checked_add(&input.amounts)
+                .context("Funding input amount overflow")?;
+        }
+        for output in added_outputs_bundles
+            .iter()
+            .flat_map(|bundle| bundle.outputs())
+        {
+            funding_outputs = funding_outputs
+                .checked_add(&output.amounts)
+                .context("Funding output amount overflow")?;
+        }
+        let mut funding = Amounts::ZERO;
+        for (unit, input) in funding_inputs.iter() {
+            let change = funding_outputs.get(unit).copied().unwrap_or_default();
+            funding = funding
+                .checked_add_unit(input.saturating_sub(change), *unit)
+                .context("Funding amount overflow")?;
+        }
+        partial_transaction.verify_funding_limit(&funding)?;
+
         // This is the range of  outputs that will be added to the transaction
         // in order to balance it. Notice that it may stay empty in case the transaction
         // is already balanced.

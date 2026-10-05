@@ -784,7 +784,8 @@ impl LightningClientModule {
         })
     }
 
-    fn get_payment_operation_id(payment_hash: &sha256::Hash, index: u16) -> OperationId {
+    /// Return the operation identifier for a recorded invoice payment attempt.
+    pub fn get_payment_operation_id(payment_hash: &sha256::Hash, index: u16) -> OperationId {
         // Copy the 32 byte payment hash and a 2 byte index to make every payment
         // attempt have a unique `OperationId`
         let mut bytes = [0; 34];
@@ -1336,6 +1337,29 @@ impl LightningClientModule {
         invoice: Bolt11Invoice,
         extra_meta: M,
     ) -> anyhow::Result<OutgoingLightningPayment> {
+        self.pay_bolt11_invoice_inner(maybe_gateway, invoice, extra_meta, None)
+            .await
+    }
+
+    /// Pay only if the complete funding debit fits within the approved limit.
+    pub async fn pay_bolt11_invoice_with_funding_limit<M: Serialize + MaybeSend + MaybeSync>(
+        &self,
+        maybe_gateway: Option<LightningGateway>,
+        invoice: Bolt11Invoice,
+        extra_meta: M,
+        funding_limit: Amount,
+    ) -> anyhow::Result<OutgoingLightningPayment> {
+        self.pay_bolt11_invoice_inner(maybe_gateway, invoice, extra_meta, Some(funding_limit))
+            .await
+    }
+
+    async fn pay_bolt11_invoice_inner<M: Serialize + MaybeSend + MaybeSync>(
+        &self,
+        maybe_gateway: Option<LightningGateway>,
+        invoice: Bolt11Invoice,
+        extra_meta: M,
+        funding_limit: Option<Amount>,
+    ) -> anyhow::Result<OutgoingLightningPayment> {
         if let Some(expires_at) = invoice.expires_at() {
             ensure!(
                 expires_at.as_secs() > fedimint_core::time::duration_since_epoch().as_secs(),
@@ -1463,6 +1487,10 @@ impl LightningClientModule {
         ));
 
         let tx = TransactionBuilder::new().with_outputs(output);
+        let tx = match funding_limit {
+            Some(limit) => tx.with_funding_limit(Amounts::new_bitcoin(limit)),
+            None => tx,
+        };
         let extra_meta =
             serde_json::to_value(extra_meta).context("Failed to serialize extra meta")?;
         let operation_meta_gen = move |change_range: OutPointRange| LightningOperationMeta {
