@@ -8,10 +8,6 @@ readme = { workspace = true }
 repository = { workspace = true }
 version = { workspace = true }
 
-[lib]
-name = "fedimint_logging"
-path = "src/lib.rs"
-
 [features]
 telemetry = [
     "tracing-opentelemetry",
@@ -20,6 +16,10 @@ telemetry = [
     "console-subscriber",
     "opentelemetry",
 ]
+
+[lib]
+name = "fedimint_logging"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow = { workspace = true }

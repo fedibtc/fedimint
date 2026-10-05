@@ -15,6 +15,10 @@ path = "bin/tests.rs"
 name = "lnv1-lnv2-swap-tests"
 path = "bin/swap_tests.rs"
 
+[[test]]
+name = "fedimint_lnv2_tests"
+path = "tests/tests.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 async-stream = { workspace = true }
@@ -47,10 +51,6 @@ serde_json = { workspace = true }
 substring = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-
-[[test]]
-name = "fedimint_lnv2_tests"
-path = "tests/tests.rs"
 
 [lints]
 workspace = true
