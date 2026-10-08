@@ -1,6 +1,7 @@
 //! Implements the client API through which users interact with the federation
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::future::pending;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -72,8 +73,7 @@ use tracing::{debug, info, warn};
 use crate::config::io::{CONSENSUS_CONFIG, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG};
 use crate::config::{ServerConfig, legacy_consensus_config_hash};
 use crate::consensus::db::{
-    AcceptedItemKey, AcceptedItemPrefix, AcceptedTransactionKey, PeerAvailabilityKey,
-    SignedSessionOutcomeKey,
+    AcceptedItemPrefix, AcceptedTransactionKey, PeerAvailabilityKey, SignedSessionOutcomeKey,
 };
 use crate::consensus::engine::get_finished_session_count_static;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
@@ -169,6 +169,10 @@ pub struct ConsensusApi {
     pub shutdown_receiver: Receiver<Option<u64>>,
     pub shutdown_sender: Sender<Option<u64>>,
     pub ord_latency_receiver: watch::Receiver<Option<Duration>>,
+    /// Notified whenever consensus accepts an item.
+    pub accepted_item_receiver: watch::Receiver<()>,
+    /// Notified whenever consensus completes a session.
+    pub completed_session_receiver: watch::Receiver<()>,
     pub p2p_status_receivers: P2PStatusReceivers,
     pub ci_status_receivers: BTreeMap<PeerId, Receiver<Option<u64>>>,
     pub bitcoin_rpc_connection: ServerBitcoinRpcMonitor,
@@ -202,6 +206,14 @@ impl ConsensusApi {
 
         debug!(target: LOG_NET_API, %txid, "Received a submitted transaction");
 
+        // Marked as seen before the transaction is checked, so that every item
+        // accepted and every session completed from here on wakes the loop below.
+        let mut accepted_item = self.accepted_item_receiver.clone();
+        let mut completed_session = self.completed_session_receiver.clone();
+
+        accepted_item.mark_unchanged();
+        completed_session.mark_unchanged();
+
         // Create read-only DB tx so that the read state is consistent
         let mut dbtx = self.db.begin_transaction_nc().await;
         // we already processed the transaction before
@@ -229,10 +241,6 @@ impl ConsensusApi {
             debug!(target: LOG_NET_API, %txid, err = %err.fmt_compact(), "Transaction rejected");
         })?;
 
-        let mut session_index = get_finished_session_count_static(&mut dbtx).await;
-
-        let mut item_index = dbtx.find_by_prefix(&AcceptedItemPrefix).await.count().await as u64;
-
         drop(dbtx);
 
         let _ = self
@@ -244,13 +252,16 @@ impl ConsensusApi {
             });
 
         loop {
-            let accepted_item_key = AcceptedItemKey(item_index);
-            let signed_session_outcome_key = SignedSessionOutcomeKey(session_index);
-
-            let session_completed = tokio::select! {
-                _ = self.db.wait_key_exists(&accepted_item_key) => false,
-                _ = self.db.wait_key_exists(&signed_session_outcome_key) => true,
+            let (changed, session_completed) = tokio::select! {
+                changed = accepted_item.changed() => (changed, false),
+                changed = completed_session.changed() => (changed, true),
             };
+
+            // The engine owns the senders for the life of the server, so this only
+            // fails at shutdown, which cancels the request anyway.
+            if changed.is_err() {
+                pending::<()>().await;
+            }
 
             let mut dbtx = self.db.begin_transaction_nc().await;
 
@@ -291,11 +302,6 @@ impl ConsensusApi {
                     .inspect_err(|err| {
                         warn!(target: LOG_NET_API, %txid, err = %err.fmt_compact(), "Unable to submit the tx into consensus");
                     });
-
-                session_index += 1;
-                item_index = 0;
-            } else {
-                item_index += 1;
             }
         }
     }
