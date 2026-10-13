@@ -50,7 +50,7 @@ use crate::consensus::db::{
     PeerAvailabilityKey, SignedSessionOutcomeKey, SignedSessionOutcomePrefix,
 };
 use crate::consensus::debug::{DebugConsensusItem, DebugConsensusItemCompact};
-use crate::consensus::peer_availability::session_participation;
+use crate::consensus::peer_availability::PeerActivity;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
 use crate::metrics::{
     CONSENSUS_ITEM_PROCESSING_DURATION_SECONDS,
@@ -83,6 +83,7 @@ pub struct ConsensusEngine {
     pub data_dir: PathBuf,
     pub db_checkpoint_retention: u64,
     pub session_timeout: Duration,
+    pub peer_activity: Arc<std::sync::Mutex<PeerActivity>>,
 }
 
 impl ConsensusEngine {
@@ -309,6 +310,7 @@ impl ConsensusEngine {
                 ),
                 Network::new(
                     connections.clone(),
+                    self.peer_activity.clone(),
                     signed_outcomes_sender,
                     signatures_sender,
                     self.db.clone(),
@@ -772,38 +774,20 @@ impl ConsensusEngine {
             .await
     }
 
-    /// Records each peer's participation in the session from its units in the
-    /// AlephBFT backup, which `complete_session` deletes afterwards.
+    /// Folds the consensus traffic since the last session into this
+    /// guardian's view of its peers' availability.
     async fn update_peer_availability(&self, dbtx: &mut DatabaseTransaction<'_>) {
-        let units: Vec<Vec<u8>> = dbtx
-            .find_by_prefix(&AlephUnitsPrefix)
-            .await
-            .map(|entry| entry.1)
-            .collect()
-            .await;
+        let now_secs = fedimint_core::time::duration_since_epoch().as_secs();
+        let activity = self.peer_activity.lock().expect("poisoned").take(now_secs);
 
-        let participation = session_participation(
-            units.iter().map(Vec::as_slice),
-            self.num_peers(),
-            self.cfg.consensus.broadcast_rounds_per_session,
-        );
-
-        // Without most of our own units we did not run this session ourselves,
-        // for example because we recovered it from our peers, so we cannot
-        // tell who else did
-        if participation[&self.identity()] < 0.5 {
-            return;
-        }
+        debug!(target: LOG_CONSENSUS, ?activity, "Peer activity since last session");
 
         let mut state = dbtx
             .get_value(&PeerAvailabilityKey)
             .await
             .unwrap_or_default();
 
-        state.update(
-            fedimint_core::time::duration_since_epoch().as_secs(),
-            &participation,
-        );
+        state.update(now_secs, &activity);
 
         dbtx.insert_entry(&PeerAvailabilityKey, &state).await;
     }

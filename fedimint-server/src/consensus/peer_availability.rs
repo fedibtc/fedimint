@@ -1,13 +1,17 @@
 //! This guardian's view of its peers' availability.
 //!
-//! When a session completes we count the units each peer created in it from
-//! the AlephBFT backup, which holds every unit added to our DAG, late or not.
-//! A unit proves its creator ran this session and kept up with consensus, so
-//! a slow peer counts while a frozen or offline one does not. The counts feed
-//! exponential moving averages with the time constants in
-//! [`PEER_AVAILABILITY_WINDOWS_SECS`] and each peer's last-seen time.
+//! A peer counts as available in a 10-second slot if it sent us any AlephBFT
+//! message in it. Every running peer sends consensus traffic all the time,
+//! including a slow one that lags behind and still runs an older session,
+//! while an offline or frozen peer, or one whose consensus is stuck, sends
+//! nothing. A slot in which we heard from fewer than `threshold - 1` peers
+//! means we were down or cut off ourselves, so it does not count.
+//!
+//! [`PeerActivity`] counts slots in memory; each completed session folds them
+//! into exponential moving averages with the time constants in
+//! [`PEER_AVAILABILITY_WINDOWS_SECS`], persisted as [`PeerAvailabilityState`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, Read, Write};
 
 use fedimint_core::encoding::{Decodable, DecodeError, Encodable};
@@ -16,23 +20,109 @@ use fedimint_core::peer_availability::{
     PEER_AVAILABILITY_WINDOWS_SECS, PeerAvailability, WindowAvailability,
 };
 use fedimint_core::{NumPeers, PeerId};
-use parity_scale_codec::Decode;
 
-/// Longest gap between two completed sessions that still counts as observed.
-/// A longer gap means we were down or stalled ourselves, and our peers'
-/// participation after it says nothing about the gap.
-const MAX_OBSERVED_GAP_SECS: f64 = 600.0;
+const SLOT_SECS: u64 = 10;
 
-/// Moving averages of each peer's participation, one per window.
+/// Slots of consensus traffic per peer since the last [`PeerActivity::take`].
+#[derive(Debug)]
+pub struct PeerActivity {
+    identity: PeerId,
+    num_peers: NumPeers,
+    slot: u64,
+    heard_in_slot: BTreeSet<PeerId>,
+    observed_slots: u32,
+    active_slots: BTreeMap<PeerId, u32>,
+    last_heard_secs: BTreeMap<PeerId, u64>,
+}
+
+/// What [`PeerActivity`] observed since it was last taken.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObservedActivity {
+    pub observed_secs: u64,
+    /// Each peer's share of the observed slots in `0.0..=1.0`
+    pub availability: BTreeMap<PeerId, f64>,
+    pub last_heard_secs: BTreeMap<PeerId, u64>,
+}
+
+impl PeerActivity {
+    pub fn new(identity: PeerId, num_peers: NumPeers) -> Self {
+        Self {
+            identity,
+            num_peers,
+            slot: 0,
+            heard_in_slot: BTreeSet::new(),
+            observed_slots: 0,
+            active_slots: BTreeMap::new(),
+            last_heard_secs: BTreeMap::new(),
+        }
+    }
+
+    /// Records a consensus message from `peer`.
+    pub fn heard(&mut self, peer: PeerId, now_secs: u64) {
+        self.advance(now_secs);
+        self.heard_in_slot.insert(peer);
+        self.last_heard_secs.insert(peer, now_secs);
+    }
+
+    /// Returns the activity of the slots closed since the last call.
+    pub fn take(&mut self, now_secs: u64) -> ObservedActivity {
+        self.advance(now_secs);
+
+        let observed_slots = std::mem::take(&mut self.observed_slots);
+        let mut active_slots = std::mem::take(&mut self.active_slots);
+
+        // We were up in every slot we observed
+        active_slots.insert(self.identity, observed_slots);
+        if 0 < observed_slots {
+            self.last_heard_secs.insert(self.identity, now_secs);
+        }
+
+        ObservedActivity {
+            observed_secs: u64::from(observed_slots) * SLOT_SECS,
+            availability: self
+                .num_peers
+                .peer_ids()
+                .filter(|_| 0 < observed_slots)
+                .map(|peer| {
+                    let active = active_slots.get(&peer).copied().unwrap_or(0);
+                    (peer, f64::from(active) / f64::from(observed_slots))
+                })
+                .collect(),
+            last_heard_secs: self.last_heard_secs.clone(),
+        }
+    }
+
+    /// Closes the current slot once `now_secs` is past it. Slots in which
+    /// nothing at all arrived are not observed.
+    fn advance(&mut self, now_secs: u64) {
+        let slot = now_secs / SLOT_SECS;
+        if slot == self.slot {
+            return;
+        }
+
+        // We never hear from ourselves
+        if self.num_peers.threshold() - 1 <= self.heard_in_slot.len() {
+            self.observed_slots += 1;
+            for peer in &self.heard_in_slot {
+                *self.active_slots.entry(*peer).or_default() += 1;
+            }
+        }
+
+        self.heard_in_slot.clear();
+        self.slot = slot;
+    }
+}
+
+/// Moving averages of each peer's availability, one per window.
 #[derive(Debug, Clone, Default, PartialEq, Encodable, Decodable)]
 pub struct PeerAvailabilityState {
     updated_at_secs: u64,
-    /// End of the last session in which each peer took part
+    /// Last time each peer sent us a consensus message
     last_seen_secs: BTreeMap<PeerId, u64>,
     /// Per window: moving average of 1 over the time we observed
     coverage: Vec<Average>,
-    /// Per window: moving average of each peer's participation
-    participation: Vec<BTreeMap<PeerId, Average>>,
+    /// Per window: moving average of each peer's availability
+    availability: Vec<BTreeMap<PeerId, Average>>,
 }
 
 /// An `f64` stored by its bits, so the averages survive restarts exactly.
@@ -56,79 +146,35 @@ impl Decodable for Average {
     }
 }
 
-/// Returns each peer's participation in a session in `0.0..=1.0`: the share of
-/// the session's rounds for which we hold a unit it created.
-///
-/// `units` are the encoded units of the AlephBFT backup. Each starts with the
-/// unit's coordinates, its round and creator.
-pub fn session_participation<'a>(
-    units: impl IntoIterator<Item = &'a [u8]>,
-    num_peers: NumPeers,
-    rounds_per_session: u16,
-) -> BTreeMap<PeerId, f64> {
-    let mut counts: BTreeMap<PeerId, u32> = num_peers.peer_ids().map(|peer| (peer, 0)).collect();
-
-    for mut unit in units {
-        let Ok((round, creator)) = <(u16, aleph_bft::NodeIndex)>::decode(&mut unit) else {
-            continue;
-        };
-
-        if round < rounds_per_session
-            && let Some(count) =
-                super::aleph_bft::to_peer_id(creator).and_then(|peer| counts.get_mut(&peer))
-        {
-            *count += 1;
-        }
-    }
-
-    counts
-        .into_iter()
-        .map(|(peer, count)| {
-            (
-                peer,
-                (f64::from(count) / f64::from(rounds_per_session)).min(1.0),
-            )
-        })
-        .collect()
-}
-
 impl PeerAvailabilityState {
-    /// Adds the participation of one completed session.
-    pub fn update(&mut self, now_secs: u64, participation: &BTreeMap<PeerId, f64>) {
-        for (peer, value) in participation {
-            if 0.0 < *value {
-                self.last_seen_secs.insert(*peer, now_secs);
-            }
+    /// Folds in the activity observed since the last update.
+    pub fn update(&mut self, now_secs: u64, activity: &ObservedActivity) {
+        for (peer, heard) in &activity.last_heard_secs {
+            let last_seen = self.last_seen_secs.entry(*peer).or_default();
+            *last_seen = (*last_seen).max(*heard);
         }
 
-        // The first session only starts the clock, since we do not know how
-        // long it took
-        if self.updated_at_secs == 0 {
-            self.updated_at_secs = now_secs;
-            return;
-        }
-
+        // Everything decays over the real elapsed time, but only the observed
+        // part of it adds new weight
         let elapsed = now_secs.saturating_sub(self.updated_at_secs) as f64;
-        let observed = elapsed.min(MAX_OBSERVED_GAP_SECS);
+        let observed = activity.observed_secs as f64;
 
         let windows = PEER_AVAILABILITY_WINDOWS_SECS.len();
         self.coverage.resize(windows, Average::default());
-        self.participation.resize(windows, BTreeMap::new());
+        self.availability.resize(windows, BTreeMap::new());
 
         for (window, window_secs) in PEER_AVAILABILITY_WINDOWS_SECS.iter().enumerate() {
-            // Everything decays over the real elapsed time, but only the
-            // observed part of it adds new weight
-            let decay = (-elapsed / *window_secs as f64).exp();
+            let decay = (-elapsed.max(observed) / *window_secs as f64).exp();
             let gain = 1.0 - (-observed / *window_secs as f64).exp();
 
             self.coverage[window].0 = self.coverage[window].0 * decay + gain;
 
-            for average in self.participation[window].values_mut() {
+            for average in self.availability[window].values_mut() {
                 average.0 *= decay;
             }
 
-            for (peer, value) in participation {
-                self.participation[window].entry(*peer).or_default().0 += gain * value;
+            for (peer, value) in &activity.availability {
+                self.availability[window].entry(*peer).or_default().0 += gain * value;
             }
         }
 
@@ -144,14 +190,14 @@ impl PeerAvailabilityState {
             windows: PEER_AVAILABILITY_WINDOWS_SECS
                 .iter()
                 .zip(&self.coverage)
-                .zip(&self.participation)
+                .zip(&self.availability)
                 .map(
-                    |((window_secs, coverage), participation)| WindowAvailability {
+                    |((window_secs, coverage), availability)| WindowAvailability {
                         window_secs: *window_secs,
-                        // Time since the last session is unobserved, so coverage
+                        // Time since the last update is unobserved, so coverage
                         // decays over it while the ratio below does not change
                         coverage_bps: to_bps(coverage.0 * (-elapsed / *window_secs as f64).exp()),
-                        peers: participation
+                        peers: availability
                             .iter()
                             .map(|(peer, average)| (*peer, to_bps(average.0 / coverage.0)))
                             .collect(),
@@ -168,50 +214,72 @@ fn to_bps(value: f64) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use parity_scale_codec::Encode;
-
     use super::*;
 
-    const SESSION_SECS: u64 = 180;
     const DAY: u64 = 86_400;
 
-    fn unit(round: u16, creator: usize) -> Vec<u8> {
-        // Coordinates, then bytes standing in for the rest of the unit
-        let mut unit = (round, aleph_bft::NodeIndex(creator)).encode();
-        unit.extend([0xab; 40]);
-        unit
+    fn peer(id: u16) -> PeerId {
+        PeerId::from(id)
     }
 
     #[test]
-    fn participation_counts_units_per_creator_within_the_session_rounds() {
-        let units: Vec<Vec<u8>> = (0..10)
-            .flat_map(|round| [unit(round, 0), unit(round, 2)])
-            .chain((0..5).map(|round| unit(round, 1)))
-            // Rounds past the session limit and unknown creators do not count
-            .chain([unit(10, 1), unit(11, 1), unit(3, 7)])
-            .collect();
+    fn counts_slots_per_peer_and_skips_slots_where_we_were_cut_off() {
+        // We are peer 0 of 4: a slot needs messages from 2 other peers
+        let mut activity = PeerActivity::new(peer(0), NumPeers::from(4));
 
-        let participation =
-            session_participation(units.iter().map(Vec::as_slice), NumPeers::from(4), 10);
+        for slot in 0..10 {
+            let now = 1_000 + slot * SLOT_SECS;
+            activity.heard(peer(1), now);
+            // Peer 2 only in the first half
+            if slot < 5 {
+                activity.heard(peer(2), now + 1);
+            }
+            activity.heard(peer(3), now + 9);
+        }
+        // 3 slots in which only peer 1 reached us: we were cut off
+        for slot in 10..13 {
+            activity.heard(peer(1), 1_000 + slot * SLOT_SECS);
+        }
 
+        let observed = activity.take(1_000 + 13 * SLOT_SECS);
+
+        assert_eq!(observed.observed_secs, 10 * SLOT_SECS);
         assert_eq!(
-            participation,
+            observed.availability,
             BTreeMap::from([
-                (PeerId::from(0), 1.0),
-                (PeerId::from(1), 0.5),
-                (PeerId::from(2), 1.0),
-                (PeerId::from(3), 0.0),
+                (peer(0), 1.0),
+                (peer(1), 1.0),
+                (peer(2), 0.5),
+                (peer(3), 1.0)
             ])
         );
+        assert_eq!(observed.last_heard_secs[&peer(1)], 1_000 + 12 * SLOT_SECS);
+        assert_eq!(
+            observed.last_heard_secs[&peer(2)],
+            1_000 + 4 * SLOT_SECS + 1
+        );
+
+        // Taking again starts from zero
+        assert_eq!(activity.take(1_000 + 14 * SLOT_SECS).observed_secs, 0);
     }
 
+    /// Updates `state` every 3 minutes from `from` to `to` with all observed
+    /// time and peer 1 up or down.
     fn run(state: &mut PeerAvailabilityState, from: u64, to: u64, peer_1_up: bool) {
-        for now in (from..to).step_by(SESSION_SECS as usize) {
-            let participation = BTreeMap::from([
-                (PeerId::from(0), 1.0),
-                (PeerId::from(1), if peer_1_up { 1.0 } else { 0.0 }),
-            ]);
-            state.update(now, &participation);
+        for now in (from..to).step_by(180) {
+            let activity = ObservedActivity {
+                observed_secs: 180,
+                availability: BTreeMap::from([
+                    (peer(0), 1.0),
+                    (peer(1), if peer_1_up { 1.0 } else { 0.0 }),
+                ]),
+                last_heard_secs: if peer_1_up {
+                    BTreeMap::from([(peer(1), now)])
+                } else {
+                    BTreeMap::new()
+                },
+            };
+            state.update(now, &activity);
         }
     }
 
@@ -219,11 +287,11 @@ mod tests {
     fn week_window_forgets_faster_than_month_window() {
         let mut state = PeerAvailabilityState::default();
         // Peer 1 is up for 20 days, then down for the last day
-        run(&mut state, 1, 20 * DAY, true);
+        run(&mut state, 180, 20 * DAY, true);
         run(&mut state, 20 * DAY, 21 * DAY, false);
 
         let report = state.report(21 * DAY);
-        let peer_1 = |window: usize| report.windows[window].peers[&PeerId::from(1)];
+        let peer_1 = |window: usize| report.windows[window].peers[&peer(1)];
 
         // Week window: the last day weighs 1 - e^(-1/7) = 13%, against 20
         // days covering 1 - e^(-20/7) = 94%, so ~86% up
@@ -231,41 +299,42 @@ mod tests {
         // Month window covers 1 - e^(-21/30) = 0.503, of which the up days
         // weigh e^(-1/30) - e^(-21/30) = 0.471, so ~93.5% up
         assert!((9_300..=9_400).contains(&peer_1(1)), "{}", peer_1(1));
-        assert_eq!(report.windows[0].peers[&PeerId::from(0)], 10_000);
+        assert_eq!(report.windows[0].peers[&peer(0)], 10_000);
 
-        // Peer 1 was last seen in the last session of day 20
-        let last_up = (1..20 * DAY).step_by(SESSION_SECS as usize).last().unwrap();
-        assert_eq!(report.last_seen_secs[&PeerId::from(1)], last_up);
+        // Peer 1 was last seen in the last update of day 20
+        let last_up = (180..20 * DAY).step_by(180).last().unwrap();
+        assert_eq!(report.last_seen_secs[&peer(1)], last_up);
     }
 
     #[test]
-    fn our_own_downtime_does_not_count_against_peers() {
+    fn unobserved_time_does_not_count_against_peers() {
         let mut state = PeerAvailabilityState::default();
-        run(&mut state, 1, 2 * DAY, true);
-        // We are down for two days. The first session after that misses
-        // peer 1, which must count for at most one capped gap, not two days.
+        run(&mut state, 180, 2 * DAY, true);
+        // We are down for two days: the next update has two days elapsed but
+        // only 3 minutes observed, in which peer 1 is down
         run(&mut state, 4 * DAY, 4 * DAY + 1, false);
-        run(&mut state, 4 * DAY + SESSION_SECS, 4 * DAY + 3_600, true);
+        run(&mut state, 4 * DAY + 180, 4 * DAY + 3_600, true);
 
         let report = state.report(4 * DAY + 3_600);
 
-        // Counting the whole gap as down would give ~43% instead
-        let peer_1 = report.windows[0].peers[&PeerId::from(1)];
-        assert!((9_900..=9_970).contains(&peer_1), "{peer_1}");
+        // Only 3 minutes of the gap count as down: ~99.8%. Counting the
+        // whole gap as down would give ~44% instead
+        let peer_1 = report.windows[0].peers[&peer(1)];
+        assert!((9_950..=9_995).contains(&peer_1), "{peer_1}");
         // We observed 2 days and an hour, decayed: ~19% of the week window
         let coverage = report.windows[0].coverage_bps;
         assert!((1_850..=2_000).contains(&coverage), "{coverage}");
     }
 
     #[test]
-    fn coverage_decays_while_no_session_completes() {
+    fn coverage_decays_while_nothing_is_observed() {
         let mut state = PeerAvailabilityState::default();
-        run(&mut state, 1, 10 * DAY, true);
+        run(&mut state, 180, 10 * DAY, true);
 
         // 10 days cover 1 - e^(-10/7) = 76% of the week window
         let running = state.report(10 * DAY).windows[0].coverage_bps;
         assert!((7_550..=7_650).contains(&running), "{running}");
-        // A day later without sessions it decays by e^(-1/7) to 66%
+        // A day later without updates it decays by e^(-1/7) to 66%
         let stalled = state.report(11 * DAY).windows[0].coverage_bps;
         assert!((6_550..=6_650).contains(&stalled), "{stalled}");
     }
@@ -273,7 +342,7 @@ mod tests {
     #[test]
     fn state_roundtrips_through_the_database_encoding() {
         let mut state = PeerAvailabilityState::default();
-        run(&mut state, 1, DAY, true);
+        run(&mut state, 180, DAY, true);
 
         let decoded = PeerAvailabilityState::consensus_decode_whole(
             &state.consensus_encode_to_vec(),

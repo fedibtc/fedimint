@@ -499,6 +499,10 @@ pub async fn run(
         data_dir,
         db_checkpoint_retention,
         session_timeout,
+        peer_activity: Arc::new(std::sync::Mutex::new(peer_availability::PeerActivity::new(
+            cfg.local.identity,
+            fedimint_core::NumPeersExt::to_num_peers(&cfg.consensus.broadcast_public_keys),
+        ))),
     }
     .run()
     .await?;
