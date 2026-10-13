@@ -37,6 +37,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
+fedimint-api-client = { workspace = true }
 
 [lints]
 workspace = true

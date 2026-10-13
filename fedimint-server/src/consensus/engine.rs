@@ -47,9 +47,10 @@ use crate::consensus::aleph_bft::spawner::Spawner;
 use crate::consensus::aleph_bft::to_node_index;
 use crate::consensus::db::{
     AcceptedItemKey, AcceptedItemPrefix, AcceptedTransactionKey, AlephUnitsPrefix,
-    SignedSessionOutcomeKey, SignedSessionOutcomePrefix,
+    PeerAvailabilityKey, SignedSessionOutcomeKey, SignedSessionOutcomePrefix,
 };
 use crate::consensus::debug::{DebugConsensusItem, DebugConsensusItemCompact};
+use crate::consensus::peer_availability::session_participation;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
 use crate::metrics::{
     CONSENSUS_ITEM_PROCESSING_DURATION_SECONDS,
@@ -771,12 +772,50 @@ impl ConsensusEngine {
             .await
     }
 
+    /// Records each peer's participation in the session from its units in the
+    /// AlephBFT backup, which `complete_session` deletes afterwards.
+    async fn update_peer_availability(&self, dbtx: &mut DatabaseTransaction<'_>) {
+        let units: Vec<Vec<u8>> = dbtx
+            .find_by_prefix(&AlephUnitsPrefix)
+            .await
+            .map(|entry| entry.1)
+            .collect()
+            .await;
+
+        let participation = session_participation(
+            units.iter().map(Vec::as_slice),
+            self.num_peers(),
+            self.cfg.consensus.broadcast_rounds_per_session,
+        );
+
+        // Without most of our own units we did not run this session ourselves,
+        // for example because we recovered it from our peers, so we cannot
+        // tell who else did
+        if participation[&self.identity()] < 0.5 {
+            return;
+        }
+
+        let mut state = dbtx
+            .get_value(&PeerAvailabilityKey)
+            .await
+            .unwrap_or_default();
+
+        state.update(
+            fedimint_core::time::duration_since_epoch().as_secs(),
+            &participation,
+        );
+
+        dbtx.insert_entry(&PeerAvailabilityKey, &state).await;
+    }
+
     pub async fn complete_session(
         &self,
         session_index: u64,
         signed_session_outcome: SignedSessionOutcome,
     ) {
         let mut dbtx = self.db.begin_transaction().await;
+
+        self.update_peer_availability(&mut dbtx.to_ref_nc()).await;
 
         dbtx.remove_by_prefix(&AlephUnitsPrefix).await;
 

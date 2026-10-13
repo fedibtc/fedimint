@@ -2047,3 +2047,61 @@ mod fedimint_migration_tests {
         .await
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_availability_reports_the_offline_peer() -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+
+    use fedimint_api_client::api::FederationApiExt as _;
+    use fedimint_core::endpoint_constants::PEER_AVAILABILITY_ENDPOINT;
+    use fedimint_core::module::ApiRequestErased;
+    use fedimint_core::peer_availability::{PeerAvailability, merge_peer_availability};
+    use fedimint_core::{NumPeers, PeerId};
+
+    let fixtures = fixtures();
+    // Peers 0, 1 and 2 run, peer 3 never starts
+    let fed = fixtures.new_fed_degraded().await;
+    let client = fed.new_client().await;
+    let offline = PeerId::from(3);
+
+    let reports = retry(
+        "availability from every online peer",
+        aggressive_backoff_long(),
+        || async {
+            let mut reports = BTreeMap::new();
+            for peer in fed.online_peer_ids() {
+                let report: PeerAvailability = client
+                    .api()
+                    .request_single_peer(
+                        PEER_AVAILABILITY_ENDPOINT.to_owned(),
+                        ApiRequestErased::default(),
+                        peer,
+                    )
+                    .await?;
+                // The first recorded session only starts the clock
+                if report.windows.is_empty() {
+                    bail!("no session recorded yet by {peer}");
+                }
+                reports.insert(peer, report);
+            }
+            Ok(reports)
+        },
+    )
+    .await?;
+
+    for (reporter, report) in &reports {
+        let day = &report.windows[0];
+        assert_eq!(day.peers[&offline], 0, "{reporter}: {day:?}");
+        for peer in fed.online_peer_ids() {
+            assert!(9_000 <= day.peers[&peer], "{reporter}: {day:?}");
+        }
+    }
+
+    let merged = merge_peer_availability(&reports, NumPeers::from(4));
+    assert_eq!(merged[0][&offline], 0);
+    for peer in fed.online_peer_ids() {
+        assert!(9_000 <= merged[0][&peer], "{merged:?}");
+    }
+
+    Ok(())
+}

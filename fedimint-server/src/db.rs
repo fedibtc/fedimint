@@ -20,6 +20,8 @@ pub enum DbKeyPrefix {
     ApiAnnouncements = 0x06,
     ServerInfo = 0x07,
     GuardianMetadata = 0x08,
+    // Fedi fork: kept away from upstream's next prefixes
+    PeerAvailability = 0x40,
 
     DatabaseVersion = fedimint_core::db::DbKeyPrefix::DatabaseVersion as u8,
     ClientBackup = fedimint_core::db::DbKeyPrefix::ClientBackup as u8,

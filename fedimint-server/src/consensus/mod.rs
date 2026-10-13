@@ -4,6 +4,7 @@ pub mod db;
 pub mod debug;
 pub mod engine;
 mod iroh_api;
+pub mod peer_availability;
 pub mod transaction;
 
 use std::collections::BTreeMap;

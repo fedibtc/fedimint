@@ -327,6 +327,8 @@ impl DatabaseDump {
                     "API Announcements"
                 );
             }
+            // Local moving averages, served by the `peer_availability` endpoint
+            server_db::DbKeyPrefix::PeerAvailability => {}
             server_db::DbKeyPrefix::GuardianMetadata => {
                 push_db_pair_items_no_serde!(
                     dbtx,

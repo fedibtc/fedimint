@@ -16,6 +16,7 @@ use fedimint_server_core::migration::{
 use futures::StreamExt;
 use serde::Serialize;
 
+use crate::consensus::peer_availability::PeerAvailabilityState;
 use crate::db::DbKeyPrefix;
 
 #[derive(Clone, Debug, Encodable, Decodable)]
@@ -64,6 +65,16 @@ impl_db_record!(
 impl_db_lookup!(
     key = SignedSessionOutcomeKey,
     query_prefix = SignedSessionOutcomePrefix
+);
+
+#[derive(Debug, Encodable, Decodable)]
+pub struct PeerAvailabilityKey;
+
+impl_db_record!(
+    key = PeerAvailabilityKey,
+    value = PeerAvailabilityState,
+    db_prefix = DbKeyPrefix::PeerAvailability,
+    notify_on_modify = false,
 );
 
 #[derive(Debug, Encodable, Decodable)]
