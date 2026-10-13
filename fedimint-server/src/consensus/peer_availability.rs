@@ -5,7 +5,7 @@
 //! A unit proves its creator ran this session and kept up with consensus, so
 //! a slow peer counts while a frozen or offline one does not. The counts feed
 //! exponential moving averages with the time constants in
-//! [`PEER_AVAILABILITY_WINDOWS_SECS`].
+//! [`PEER_AVAILABILITY_WINDOWS_SECS`] and each peer's last-seen time.
 
 use std::collections::BTreeMap;
 use std::io::{Error, Read, Write};
@@ -27,6 +27,8 @@ const MAX_OBSERVED_GAP_SECS: f64 = 600.0;
 #[derive(Debug, Clone, Default, PartialEq, Encodable, Decodable)]
 pub struct PeerAvailabilityState {
     updated_at_secs: u64,
+    /// End of the last session in which each peer took part
+    last_seen_secs: BTreeMap<PeerId, u64>,
     /// Per window: moving average of 1 over the time we observed
     coverage: Vec<Average>,
     /// Per window: moving average of each peer's participation
@@ -93,6 +95,12 @@ pub fn session_participation<'a>(
 impl PeerAvailabilityState {
     /// Adds the participation of one completed session.
     pub fn update(&mut self, now_secs: u64, participation: &BTreeMap<PeerId, f64>) {
+        for (peer, value) in participation {
+            if 0.0 < *value {
+                self.last_seen_secs.insert(*peer, now_secs);
+            }
+        }
+
         // The first session only starts the clock, since we do not know how
         // long it took
         if self.updated_at_secs == 0 {
@@ -132,6 +140,7 @@ impl PeerAvailabilityState {
         let elapsed = now_secs.saturating_sub(self.updated_at_secs) as f64;
 
         PeerAvailability {
+            last_seen_secs: self.last_seen_secs.clone(),
             windows: PEER_AVAILABILITY_WINDOWS_SECS
                 .iter()
                 .zip(&self.coverage)
@@ -207,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn day_window_forgets_faster_than_month_window() {
+    fn week_window_forgets_faster_than_month_window() {
         let mut state = PeerAvailabilityState::default();
         // Peer 1 is up for 20 days, then down for the last day
         run(&mut state, 1, 20 * DAY, true);
@@ -216,12 +225,17 @@ mod tests {
         let report = state.report(21 * DAY);
         let peer_1 = |window: usize| report.windows[window].peers[&PeerId::from(1)];
 
-        // Day window: weight of the last day is 1 - e^-1 = 63%, so ~37% up
-        assert!((3_600..=3_750).contains(&peer_1(0)), "{}", peer_1(0));
+        // Week window: the last day weighs 1 - e^(-1/7) = 13%, against 20
+        // days covering 1 - e^(-20/7) = 94%, so ~86% up
+        assert!((8_550..=8_650).contains(&peer_1(0)), "{}", peer_1(0));
         // Month window covers 1 - e^(-21/30) = 0.503, of which the up days
         // weigh e^(-1/30) - e^(-21/30) = 0.471, so ~93.5% up
-        assert!((9_300..=9_400).contains(&peer_1(2)), "{}", peer_1(2));
+        assert!((9_300..=9_400).contains(&peer_1(1)), "{}", peer_1(1));
         assert_eq!(report.windows[0].peers[&PeerId::from(0)], 10_000);
+
+        // Peer 1 was last seen in the last session of day 20
+        let last_up = (1..20 * DAY).step_by(SESSION_SECS as usize).last().unwrap();
+        assert_eq!(report.last_seen_secs[&PeerId::from(1)], last_up);
     }
 
     #[test]
@@ -235,13 +249,12 @@ mod tests {
 
         let report = state.report(4 * DAY + 3_600);
 
-        // Day window: old up data 0.117 and the last hour 0.041 against 600 s
-        // down weighing 0.007, so ~96% up
+        // Counting the whole gap as down would give ~43% instead
         let peer_1 = report.windows[0].peers[&PeerId::from(1)];
-        assert!((9_500..=9_650).contains(&peer_1), "{peer_1}");
-        // We observed little of the last day
+        assert!((9_900..=9_970).contains(&peer_1), "{peer_1}");
+        // We observed 2 days and an hour, decayed: ~19% of the week window
         let coverage = report.windows[0].coverage_bps;
-        assert!((1_550..=1_750).contains(&coverage), "{coverage}");
+        assert!((1_850..=2_000).contains(&coverage), "{coverage}");
     }
 
     #[test]
@@ -249,10 +262,12 @@ mod tests {
         let mut state = PeerAvailabilityState::default();
         run(&mut state, 1, 10 * DAY, true);
 
-        assert!(9_900 < state.report(10 * DAY).windows[0].coverage_bps);
-        // A day later without sessions, the day window covers e^-1 = 37%
+        // 10 days cover 1 - e^(-10/7) = 76% of the week window
+        let running = state.report(10 * DAY).windows[0].coverage_bps;
+        assert!((7_550..=7_650).contains(&running), "{running}");
+        // A day later without sessions it decays by e^(-1/7) to 66%
         let stalled = state.report(11 * DAY).windows[0].coverage_bps;
-        assert!((3_600..=3_750).contains(&stalled), "{stalled}");
+        assert!((6_550..=6_650).contains(&stalled), "{stalled}");
     }
 
     #[test]

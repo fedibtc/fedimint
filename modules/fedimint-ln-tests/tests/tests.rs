@@ -2084,23 +2084,33 @@ async fn peer_availability_reports_the_offline_peer() -> anyhow::Result<()> {
                 }
                 reports.insert(peer, report);
             }
+            // Right after startup the guardians' coverage differs by whole
+            // sessions, which can exclude a report; wait until it evens out
+            let merged = merge_peer_availability(&reports, NumPeers::from(4));
+            if merged.windows[0].len() < 4 {
+                bail!("not every peer has enough usable reports yet: {merged:?}");
+            }
             Ok(reports)
         },
     )
     .await?;
 
     for (reporter, report) in &reports {
-        let day = &report.windows[0];
-        assert_eq!(day.peers[&offline], 0, "{reporter}: {day:?}");
+        let week = &report.windows[0];
+        assert_eq!(week.peers[&offline], 0, "{reporter}: {week:?}");
+        assert!(!report.last_seen_secs.contains_key(&offline), "{report:?}");
         for peer in fed.online_peer_ids() {
-            assert!(9_000 <= day.peers[&peer], "{reporter}: {day:?}");
+            assert!(9_000 <= week.peers[&peer], "{reporter}: {week:?}");
+            assert!(report.last_seen_secs.contains_key(&peer), "{report:?}");
         }
     }
 
     let merged = merge_peer_availability(&reports, NumPeers::from(4));
-    assert_eq!(merged[0][&offline], 0);
+    assert_eq!(merged.windows[0][&offline], 0);
+    assert!(!merged.last_seen_secs.contains_key(&offline));
     for peer in fed.online_peer_ids() {
-        assert!(9_000 <= merged[0][&peer], "{merged:?}");
+        assert!(9_000 <= merged.windows[0][&peer], "{merged:?}");
+        assert!(merged.last_seen_secs.contains_key(&peer), "{merged:?}");
     }
 
     Ok(())
