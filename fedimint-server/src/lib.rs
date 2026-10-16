@@ -67,9 +67,7 @@ use crate::config::driven::{
     ensure_no_config_artifacts, install_staging, prepare_staging, read_frame, validate_run_dkg,
     write_frame,
 };
-use crate::config::io::{
-    PLAINTEXT_PASSWORD, plaintext_display_write, write_server_config, write_server_config_encrypted,
-};
+use crate::config::io::write_server_config;
 use crate::config::setup::{ConfigGenOutcome, SetupApi};
 use crate::db::{ServerInfo, ServerInfoKey};
 use crate::fedimint_core::net::peers::IP2PConnections;
@@ -561,8 +559,6 @@ pub async fn run_driven(
         .await?;
 
         let parent_message: ParentMessage = read_frame(&mut control).await?;
-        let ParentMessage::RunDkg { api_auth, .. } = &parent_message;
-        let password = api_auth.clone();
         let params = match validate_run_dkg(parent_message, &settings) {
             Ok(params) => params,
             Err(error) => {
@@ -645,12 +641,13 @@ pub async fn run_driven(
             }
         };
 
+        // The same plaintext layout interactive setup writes. The API
+        // password is not persisted: the parent injects it through the
+        // password environment on every start, as it did for this one.
         let persist_result = (|| {
-            plaintext_display_write(&password, &staging.join(PLAINTEXT_PASSWORD))?;
-            write_server_config_encrypted(
+            write_server_config(
                 &cfg,
                 &staging,
-                &password,
                 &module_init_registry,
                 force_api_secrets.get_active(),
             )?;

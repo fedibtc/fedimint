@@ -91,25 +91,47 @@ fn consensus_code_version_preserves_opaque_test_values() {
 }
 
 #[test]
-fn driven_config_keeps_encrypted_layout_and_restarts_with_disk_password() {
+fn legacy_encrypted_layout_still_reads_with_disk_password() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let config = config("0.12.0+fedi");
     let password = "test-seat-password";
+    let salt = fedimint_aead::random_salt();
     super::io::plaintext_display_write(
         &password,
         &directory.path().join(super::io::PLAINTEXT_PASSWORD),
     )
-    .expect("write restart password");
-    super::io::write_server_config_encrypted(
-        &config,
-        directory.path(),
-        password,
-        &fedimint_server_core::ServerModuleInitRegistry::default(),
-        None,
+    .expect("write legacy password");
+    super::io::plaintext_display_write(&salt, &directory.path().join(super::io::SALT_FILE))
+        .expect("write legacy salt");
+    let key = fedimint_aead::get_encryption_key(password, &salt).expect("derive legacy key");
+    for (name, value) in [
+        (
+            super::io::LOCAL_CONFIG,
+            serde_json::to_vec(&config.local).unwrap(),
+        ),
+        (
+            super::io::CONSENSUS_CONFIG,
+            serde_json::to_vec(&config.consensus).unwrap(),
+        ),
+    ] {
+        std::fs::write(
+            directory
+                .path()
+                .join(name)
+                .with_extension(super::io::JSON_EXT),
+            value,
+        )
+        .expect("write legacy public config");
+    }
+    fedimint_aead::encrypted_write(
+        serde_json::to_vec(&config.private).expect("serialize private config"),
+        &key,
+        directory
+            .path()
+            .join(super::io::PRIVATE_CONFIG)
+            .with_extension(super::io::ENCRYPTED_EXT),
     )
-    .expect("write encrypted configuration");
-    assert!(directory.path().join("private.encrypt").exists());
-    assert!(directory.path().join("private.salt").exists());
+    .expect("write legacy encrypted private config");
     assert!(!directory.path().join("private.json").exists());
     let restored =
         super::io::read_server_config(directory.path()).expect("read encrypted configuration");
@@ -117,7 +139,7 @@ fn driven_config_keeps_encrypted_layout_and_restarts_with_disk_password() {
         serde_json::to_value(config).expect("serialize original"),
         serde_json::to_value(restored).expect("serialize restored"),
     );
-    std::fs::write(
+    fedimint_core::util::write_overwrite(
         directory.path().join(super::io::PLAINTEXT_PASSWORD),
         "wrong",
     )
