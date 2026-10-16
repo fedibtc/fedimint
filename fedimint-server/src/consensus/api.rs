@@ -72,7 +72,7 @@ use tracing::{debug, info, warn};
 use crate::config::io::{CONSENSUS_CONFIG, JSON_EXT, LOCAL_CONFIG, PRIVATE_CONFIG};
 use crate::config::{ServerConfig, legacy_consensus_config_hash};
 use crate::consensus::db::{
-    AcceptedItemKey, AcceptedItemPrefix, AcceptedTransactionKey, PeerAvailabilityKey,
+    AcceptedItemPrefix, AcceptedTransactionKey, PeerAvailabilityKey,
     SignedSessionOutcomeKey,
 };
 use crate::consensus::engine::get_finished_session_count_static;

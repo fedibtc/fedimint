@@ -725,8 +725,8 @@ pub(crate) fn prepare_staging(final_path: &Path) -> anyhow::Result<PathBuf> {
     Ok(staging)
 }
 
-/// Refuse to treat a password-less final directory as disposable when any
-/// formed-federation artifact remains.
+/// Refuse to treat a final directory without a consensus config as disposable
+/// when any formed-federation artifact remains.
 pub(crate) fn ensure_no_config_artifacts(final_path: &Path) -> anyhow::Result<()> {
     let artifacts = [
         final_path.join(SALT_FILE),
@@ -742,7 +742,7 @@ pub(crate) fn ensure_no_config_artifacts(final_path: &Path) -> anyhow::Result<()
     ];
     if let Some(evidence) = artifacts.iter().find(|path| path.exists()) {
         anyhow::bail!(
-            "The plaintext password is absent, but existing configuration artifact '{}' makes the data directory non-disposable",
+            "The consensus config is absent, but existing configuration artifact '{}' makes the data directory non-disposable",
             evidence.display()
         );
     }
@@ -818,7 +818,8 @@ mod tests {
                 enabled_modules: None,
                 federation_size: (index == 0).then_some(4),
                 network: bitcoin::Network::Regtest,
-                fedimint_version: "0.12.0".to_string(),
+                fedimint_version: fedimint_core::version::DkgVersion::parse("0.13.0")
+                    .expect("valid version"),
             })
             .collect();
         let codes: Vec<_> = codes
