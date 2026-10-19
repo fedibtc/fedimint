@@ -44,5 +44,8 @@ uniffi = { workspace = true, optional = true }
 [dev-dependencies]
 assert_matches = { workspace = true }
 
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+jsonrpsee = { workspace = true, features = ["server"] }
+
 [lints]
 workspace = true
