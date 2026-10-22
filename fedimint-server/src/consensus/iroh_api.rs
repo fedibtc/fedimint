@@ -25,7 +25,7 @@ use crate::metrics::{
     IROH_API_CONNECTION_DURATION_SECONDS, IROH_API_CONNECTION_IDLE_TIMEOUT_TOTAL,
     IROH_API_CONNECTIONS_ACTIVE, IROH_API_REQUEST_DURATION_SECONDS, IROH_API_REQUEST_RESPONSE_CODE,
 };
-use crate::net::api::HasApiContext;
+use crate::net::api::{HasApiContext, with_api_endpoint_timeout};
 
 /// How long an Iroh API connection may stay idle before the server closes it.
 const IROH_API_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -426,13 +426,10 @@ async fn await_response(api: &IrohApiState, request: IrohApiRequest) -> Result<V
                 .get(&method)
                 .ok_or_else(|| ApiError::not_found(method.clone()))?;
 
-            let (state, context) = api.consensus.context(&request.request, None).await;
-
-            run_handler(
-                None,
-                &method,
-                (endpoint.handler)(state, context, request.request),
-            )
+            run_handler(None, &method, async {
+                let (state, context) = api.consensus.context(&request.request, None).await;
+                (endpoint.handler)(state, context, request.request).await
+            })
             .await
         }
         ApiMethod::Module(module_id, method) => {
@@ -443,23 +440,20 @@ async fn await_response(api: &IrohApiState, request: IrohApiRequest) -> Result<V
                 .get(&method)
                 .ok_or_else(|| ApiError::not_found(method.clone()))?;
 
-            let (state, context) = api
-                .consensus
-                .context(&request.request, Some(module_id))
-                .await;
-
-            run_handler(
-                Some(module_id),
-                &method,
-                (endpoint.handler)(state, context, request.request),
-            )
+            run_handler(Some(module_id), &method, async {
+                let (state, context) = api
+                    .consensus
+                    .context(&request.request, Some(module_id))
+                    .await;
+                (endpoint.handler)(state, context, request.request).await
+            })
             .await
         }
     }
 }
 
-/// Runs an API endpoint handler, turning a panic into an error response for the
-/// caller that triggered it.
+/// Runs an API endpoint with the same deadline as WebSocket requests, turning a
+/// timeout or panic into an error response for the caller that triggered it.
 ///
 /// Iroh API requests run on the root task group, so an escaping panic would
 /// trip the task group's panic guard and shut the whole guardian down. The
@@ -473,7 +467,7 @@ async fn run_handler(
     // could end up with an inconsistent state. In practice most API functions are
     // only reading and the few that do write anything are atomic. Lastly, this is
     // only the last line of defense.
-    AssertUnwindSafe(handler)
+    AssertUnwindSafe(with_api_endpoint_timeout(handler))
         .catch_unwind()
         .await
         .unwrap_or_else(|_| {
@@ -559,6 +553,7 @@ mod tests {
     use iroh_next::{EndpointAddr, RelayMode, SecretKey, TransportAddr};
 
     use super::*;
+    use crate::net::api::API_ENDPOINT_TIMEOUT;
 
     const TEST_ALPN: &[u8] = b"fedimint-iroh-api-adapter-test";
 
@@ -781,6 +776,98 @@ mod tests {
         .expect_err("a panicking module handler is reported as a server error");
 
         assert_eq!(error.code, 500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handler_results_before_deadline_are_preserved() {
+        for module_id in [None, Some(3)] {
+            let response = run_handler(module_id, "test_endpoint", async {
+                fedimint_core::runtime::sleep(API_ENDPOINT_TIMEOUT / 2).await;
+                Ok(serde_json::json!({"answer": 42}))
+            })
+            .await
+            .expect("a handler that completes within the budget succeeds");
+            assert_eq!(response, serde_json::json!({"answer": 42}));
+
+            let error = run_handler(module_id, "test_endpoint", async {
+                Err(ApiError::unauthorized())
+            })
+            .await
+            .expect_err("endpoint errors are not replaced by a timeout");
+            assert_eq!(error.code, 401);
+            assert_eq!(error.message, "Invalid authorization");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handler_deadline_returns_timeout_and_drops_pending_work() {
+        for module_id in [None, Some(3)] {
+            let limit = Arc::new(Semaphore::new(1));
+            let permit = limit.clone().acquire_owned().await.unwrap();
+            let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel::<()>();
+            let handler = async move {
+                // Model resources owned by a parked endpoint, independently of its
+                // transport's response-writing lifetime.
+                let _permit = permit;
+                let _dropped = dropped_tx;
+                pending().await
+            };
+            let mut response = Box::pin(run_handler(module_id, "test_endpoint", handler));
+
+            assert!(poll!(response.as_mut()).is_pending());
+            tokio::time::advance(
+                API_ENDPOINT_TIMEOUT
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("the endpoint deadline exceeds one millisecond"),
+            )
+            .await;
+            assert!(poll!(response.as_mut()).is_pending());
+            assert_eq!(limit.available_permits(), 0);
+            assert!(matches!(
+                dropped_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let std::task::Poll::Ready(response) = poll!(response.as_mut()) else {
+                panic!("the handler must stop when its request budget expires");
+            };
+            let error = response.expect_err("the handler budget is exhausted");
+            assert_eq!(error.code, -32000);
+            assert_eq!(error.message, "Request timeout");
+            assert_eq!(
+                serde_json::to_value(&error).unwrap(),
+                serde_json::json!({"code": -32000, "message": "Request timeout"})
+            );
+            assert_eq!(limit.available_permits(), 1);
+            assert!(matches!(
+                dropped_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_handler_wrapper_before_deadline_drops_pending_work() {
+        let limit = Arc::new(Semaphore::new(1));
+        let permit = limit.clone().acquire_owned().await.unwrap();
+        let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let handler = async move {
+            let _permit = permit;
+            let _dropped = dropped_tx;
+            pending().await
+        };
+        let mut response = Box::pin(run_handler(None, "test_endpoint", handler));
+
+        assert!(poll!(response.as_mut()).is_pending());
+        assert_eq!(limit.available_permits(), 0);
+        drop(response);
+
+        assert_eq!(limit.available_permits(), 1);
+        assert!(matches!(
+            dropped_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     #[tokio::test]
