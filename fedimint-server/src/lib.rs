@@ -35,7 +35,7 @@ use bitcoin::hashes::hex::FromHex as _;
 use config::ServerConfig;
 use config::io::read_server_config;
 pub use connection_limits::ConnectionLimits;
-pub use consensus::engine::ConsensusStop;
+pub use consensus::engine::{ConsensusStop, ShutdownRequest};
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::P2PMessage;
 use fedimint_core::db::{Database, DatabaseTransaction, IDatabaseTransactionOpsCoreTyped as _};

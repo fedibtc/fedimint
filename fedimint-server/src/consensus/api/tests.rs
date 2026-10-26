@@ -257,14 +257,32 @@ async fn admin_metadata_update_preserves_persisted_iroh_endpoint() {
 
 #[test]
 fn repeated_shutdown_after_current_session_keeps_the_earliest_boundary() {
+    use super::{ScheduledShutdown, ShutdownRequest, schedule_shutdown_after};
+    let after = |session| {
+        Some(ScheduledShutdown {
+            session,
+            request: ShutdownRequest::AfterCurrentSession,
+        })
+    };
+    let at = |session| {
+        Some(ScheduledShutdown {
+            session,
+            request: ShutdownRequest::AtSession,
+        })
+    };
     let mut scheduled = None;
-    assert!(super::schedule_shutdown_after(&mut scheduled, 5));
-    assert_eq!(scheduled, Some(5));
+    assert!(schedule_shutdown_after(&mut scheduled, 5));
+    assert_eq!(scheduled, after(5));
     // Asked again in a later session: the shutdown is already due.
-    assert!(!super::schedule_shutdown_after(&mut scheduled, 6));
-    assert_eq!(scheduled, Some(5));
+    assert!(!schedule_shutdown_after(&mut scheduled, 6));
+    assert_eq!(scheduled, after(5));
     // A shutdown scheduled for a later session is brought forward.
-    let mut scheduled = Some(9);
-    assert!(super::schedule_shutdown_after(&mut scheduled, 7));
-    assert_eq!(scheduled, Some(7));
+    let mut scheduled = at(9);
+    assert!(schedule_shutdown_after(&mut scheduled, 7));
+    assert_eq!(scheduled, after(7));
+    // A shutdown already due by then keeps its session but now reports
+    // the request that was made after it.
+    let mut scheduled = at(3);
+    assert!(schedule_shutdown_after(&mut scheduled, 7));
+    assert_eq!(scheduled, after(3));
 }
