@@ -155,7 +155,7 @@ impl ConsensusEngine {
 
             info!(target: LOG_CONSENSUS, "Session {session_index} completed");
 
-            if Some(session_index) == self.shutdown_receiver.borrow().to_owned() {
+            if self.shutdown_due(session_index) {
                 break;
             }
         }
@@ -203,7 +203,7 @@ impl ConsensusEngine {
 
             info!(target: LOG_CONSENSUS, ?session_index, "Completed consensus session");
 
-            if Some(session_index) == self.shutdown_receiver.borrow().to_owned() {
+            if self.shutdown_due(session_index) {
                 info!(target: LOG_CONSENSUS, "Initiating shutdown, waiting for peers to complete the session...");
 
                 sleep(Duration::from_mins(1)).await;
@@ -215,6 +215,16 @@ impl ConsensusEngine {
         info!(target: LOG_CONSENSUS, "Consensus task shut down");
 
         Ok(())
+    }
+
+    /// A shutdown scheduled for session `n` takes effect at the first session
+    /// boundary at or after `n`. The caller cannot know whether the session it
+    /// read as current ends before its request lands; with this rule the
+    /// request still takes effect at the next boundary instead of never.
+    fn shutdown_due(&self, completed_session: u64) -> bool {
+        self.shutdown_receiver
+            .borrow()
+            .is_some_and(|scheduled| scheduled <= completed_session)
     }
 
     pub async fn run_session(
