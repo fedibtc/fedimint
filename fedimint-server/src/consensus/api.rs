@@ -471,10 +471,12 @@ impl ConsensusApi {
     /// consensus loop shuts down at the first session boundary at or after
     /// the scheduled session, so a session that completes while this request
     /// is handled defers the shutdown to the end of the next one instead of
-    /// cancelling it.
+    /// cancelling it. Repeating the request never moves a shutdown that is
+    /// already due by then to a later session.
     async fn shutdown_after_current_session(&self) {
         let current_session = self.session_count();
-        self.shutdown_sender.send_replace(Some(current_session));
+        self.shutdown_sender
+            .send_if_modified(|scheduled| schedule_shutdown_after(scheduled, current_session));
     }
 
     async fn get_federation_audit(&self) -> ApiResult<AuditSummary> {
@@ -1292,6 +1294,16 @@ pub(crate) async fn backup_statistics_static(
     }
 
     backup_stats
+}
+
+/// Schedules a shutdown after `current_session` unless one is already due by
+/// then. Returns whether the schedule changed.
+fn schedule_shutdown_after(scheduled: &mut Option<u64>, current_session: u64) -> bool {
+    if scheduled.is_some_and(|scheduled| scheduled <= current_session) {
+        return false;
+    }
+    *scheduled = Some(current_session);
+    true
 }
 
 #[cfg(test)]

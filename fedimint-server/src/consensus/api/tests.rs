@@ -254,3 +254,17 @@ async fn admin_metadata_update_preserves_persisted_iroh_endpoint() {
         signed.tagged_hash()
     );
 }
+
+#[test]
+fn repeated_shutdown_after_current_session_keeps_the_earliest_boundary() {
+    let mut scheduled = None;
+    assert!(super::schedule_shutdown_after(&mut scheduled, 5));
+    assert_eq!(scheduled, Some(5));
+    // Asked again in a later session: the shutdown is already due.
+    assert!(!super::schedule_shutdown_after(&mut scheduled, 6));
+    assert_eq!(scheduled, Some(5));
+    // A shutdown scheduled for a later session is brought forward.
+    let mut scheduled = Some(9);
+    assert!(super::schedule_shutdown_after(&mut scheduled, 7));
+    assert_eq!(scheduled, Some(7));
+}
