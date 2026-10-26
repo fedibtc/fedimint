@@ -68,6 +68,24 @@ const DB_CHECKPOINTS_DIR: &str = "db_checkpoints";
 /// than a couple of these means something is wrong beyond a stale snapshot.
 const MAX_ITEM_PROCESSING_ATTEMPTS: usize = 10;
 
+/// How an admin scheduled a shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownRequest {
+    /// `shutdown` for a given session.
+    AtSession,
+    /// `shutdown_after_current_session`.
+    AfterCurrentSession,
+}
+
+/// A shutdown scheduled through the admin API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledShutdown {
+    /// Consensus shuts down at the first session boundary at or after the
+    /// completion of this session.
+    pub session: u64,
+    pub request: ShutdownRequest,
+}
+
 /// Why the consensus loop returned without an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusStop {
@@ -76,7 +94,7 @@ pub enum ConsensusStop {
     TaskShutdown,
     /// A scheduled shutdown took effect after its session completed, so this
     /// guardian holds no units of an unfinished session.
-    ScheduledShutdown,
+    ScheduledShutdown(ShutdownRequest),
 }
 
 /// Runs the main server consensus loop
@@ -86,7 +104,7 @@ pub struct ConsensusEngine {
     pub federation_api: DynGlobalApi,
     pub cfg: ServerConfig,
     pub submission_receiver: Receiver<ConsensusItem>,
-    pub shutdown_receiver: watch::Receiver<Option<u64>>,
+    pub shutdown_receiver: watch::Receiver<Option<ScheduledShutdown>>,
     pub connections: DynP2PConnections<P2PMessage>,
     pub ci_status_senders: BTreeMap<PeerId, watch::Sender<Option<u64>>>,
     pub ord_latency_sender: watch::Sender<Option<Duration>>,
@@ -173,8 +191,9 @@ impl ConsensusEngine {
 
             info!(target: LOG_CONSENSUS, "Session {session_index} completed");
 
-            if shutdown_due(*self.shutdown_receiver.borrow(), session_index) {
-                return Ok(ConsensusStop::ScheduledShutdown);
+            let due = due_shutdown(*self.shutdown_receiver.borrow(), session_index);
+            if let Some(request) = due {
+                return Ok(ConsensusStop::ScheduledShutdown(request));
             }
         }
 
@@ -221,12 +240,13 @@ impl ConsensusEngine {
 
             info!(target: LOG_CONSENSUS, ?session_index, "Completed consensus session");
 
-            if shutdown_due(*self.shutdown_receiver.borrow(), session_index) {
+            let due = due_shutdown(*self.shutdown_receiver.borrow(), session_index);
+            if let Some(request) = due {
                 info!(target: LOG_CONSENSUS, "Initiating shutdown, waiting for peers to complete the session...");
 
                 sleep(Duration::from_mins(1)).await;
 
-                return Ok(ConsensusStop::ScheduledShutdown);
+                return Ok(ConsensusStop::ScheduledShutdown(request));
             }
         }
 
@@ -1221,12 +1241,17 @@ impl ConsensusEngine {
     }
 }
 
-/// Whether a shutdown scheduled for session `scheduled` takes effect once
-/// `completed_session` has completed: at the first session boundary at or
-/// after the scheduled session, so a schedule that arrives after its session
-/// completed still stops at the next boundary rather than never.
-fn shutdown_due(scheduled: Option<u64>, completed_session: u64) -> bool {
-    scheduled.is_some_and(|scheduled| scheduled <= completed_session)
+/// The request of a shutdown that takes effect now that `completed_session`
+/// has completed: at the first session boundary at or after the scheduled
+/// session, so a schedule that arrives after its session completed still
+/// stops at the next boundary rather than never.
+fn due_shutdown(
+    scheduled: Option<ScheduledShutdown>,
+    completed_session: u64,
+) -> Option<ShutdownRequest> {
+    scheduled
+        .filter(|scheduled| scheduled.session <= completed_session)
+        .map(|scheduled| scheduled.request)
 }
 
 pub async fn get_finished_session_count_static(dbtx: &mut DatabaseTransaction<'_>) -> u64 {
@@ -1239,14 +1264,20 @@ pub async fn get_finished_session_count_static(dbtx: &mut DatabaseTransaction<'_
 
 #[cfg(test)]
 mod tests {
-    use super::shutdown_due;
+    use super::{ScheduledShutdown, ShutdownRequest, due_shutdown};
 
     #[test]
     fn shutdown_takes_effect_at_the_first_boundary_at_or_after_its_session() {
-        assert!(!shutdown_due(None, 0));
-        assert!(!shutdown_due(Some(5), 4));
-        assert!(shutdown_due(Some(5), 5));
+        let at = |session| {
+            Some(ScheduledShutdown {
+                session,
+                request: ShutdownRequest::AtSession,
+            })
+        };
+        assert_eq!(due_shutdown(None, 0), None);
+        assert_eq!(due_shutdown(at(5), 4), None);
+        assert_eq!(due_shutdown(at(5), 5), Some(ShutdownRequest::AtSession));
         // Scheduled while session 5 was completing: the next boundary.
-        assert!(shutdown_due(Some(5), 6));
+        assert_eq!(due_shutdown(at(5), 6), Some(ShutdownRequest::AtSession));
     }
 }
