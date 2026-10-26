@@ -33,9 +33,10 @@ use fedimint_core::endpoint_constants::{
     GUARDIAN_METADATA_ENDPOINT, INVITE_CODE_ENDPOINT, P2P_CONNECTION_STATUS_ENDPOINT,
     PEER_AVAILABILITY_ENDPOINT, RECOVER_ENDPOINT, SERVER_CONFIG_CONSENSUS_HASH_ENDPOINT,
     SESSION_COUNT_ENDPOINT, SESSION_STATUS_ENDPOINT, SESSION_STATUS_V2_ENDPOINT,
-    SETUP_STATUS_ENDPOINT, SHUTDOWN_ENDPOINT, SIGN_API_ANNOUNCEMENT_ENDPOINT,
-    SIGN_GUARDIAN_METADATA_ENDPOINT, STATUS_ENDPOINT, SUBMIT_API_ANNOUNCEMENT_ENDPOINT,
-    SUBMIT_GUARDIAN_METADATA_ENDPOINT, SUBMIT_TRANSACTION_ENDPOINT, VERSION_ENDPOINT,
+    SETUP_STATUS_ENDPOINT, SHUTDOWN_AFTER_CURRENT_SESSION_ENDPOINT, SHUTDOWN_ENDPOINT,
+    SIGN_API_ANNOUNCEMENT_ENDPOINT, SIGN_GUARDIAN_METADATA_ENDPOINT, STATUS_ENDPOINT,
+    SUBMIT_API_ANNOUNCEMENT_ENDPOINT, SUBMIT_GUARDIAN_METADATA_ENDPOINT,
+    SUBMIT_TRANSACTION_ENDPOINT, VERSION_ENDPOINT,
 };
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::invite_code::InviteCode;
@@ -464,6 +465,16 @@ impl ConsensusApi {
 
     fn shutdown(&self, index: Option<u64>) {
         self.shutdown_sender.send_replace(index);
+    }
+
+    /// Schedules a shutdown for the session that is running now. The
+    /// consensus loop shuts down at the first session boundary at or after
+    /// the scheduled session, so a session that completes while this request
+    /// is handled defers the shutdown to the end of the next one instead of
+    /// cancelling it.
+    async fn shutdown_after_current_session(&self) {
+        let current_session = self.session_count();
+        self.shutdown_sender.send_replace(Some(current_session));
     }
 
     async fn get_federation_audit(&self) -> ApiResult<AuditSummary> {
@@ -1123,6 +1134,14 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             ApiVersion::new(0, 3),
             async |fedimint: &ConsensusApi, context, index: Option<u64>| -> () {
                 fedimint.shutdown(index);
+                Ok(())
+            }
+        },
+        admin_api_endpoint! {
+            SHUTDOWN_AFTER_CURRENT_SESSION_ENDPOINT,
+            ApiVersion::new(0, 10),
+            async |fedimint: &ConsensusApi, context, _v: ()| -> () {
+                fedimint.shutdown_after_current_session().await;
                 Ok(())
             }
         },

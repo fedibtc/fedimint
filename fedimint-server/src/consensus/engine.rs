@@ -159,7 +159,7 @@ impl ConsensusEngine {
 
             info!(target: LOG_CONSENSUS, "Session {session_index} completed");
 
-            if Some(session_index) == self.shutdown_receiver.borrow().to_owned() {
+            if shutdown_due(*self.shutdown_receiver.borrow(), session_index) {
                 break;
             }
         }
@@ -207,7 +207,7 @@ impl ConsensusEngine {
 
             info!(target: LOG_CONSENSUS, ?session_index, "Completed consensus session");
 
-            if Some(session_index) == self.shutdown_receiver.borrow().to_owned() {
+            if shutdown_due(*self.shutdown_receiver.borrow(), session_index) {
                 info!(target: LOG_CONSENSUS, "Initiating shutdown, waiting for peers to complete the session...");
 
                 sleep(Duration::from_mins(1)).await;
@@ -1207,10 +1207,32 @@ impl ConsensusEngine {
     }
 }
 
+/// Whether a shutdown scheduled for session `scheduled` takes effect once
+/// `completed_session` has completed: at the first session boundary at or
+/// after the scheduled session, so a schedule that arrives after its session
+/// completed still stops at the next boundary rather than never.
+fn shutdown_due(scheduled: Option<u64>, completed_session: u64) -> bool {
+    scheduled.is_some_and(|scheduled| scheduled <= completed_session)
+}
+
 pub async fn get_finished_session_count_static(dbtx: &mut DatabaseTransaction<'_>) -> u64 {
     dbtx.find_by_prefix_sorted_descending(&SignedSessionOutcomePrefix)
         .await
         .next()
         .await
         .map_or(0, |entry| (entry.0.0) + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shutdown_due;
+
+    #[test]
+    fn shutdown_takes_effect_at_the_first_boundary_at_or_after_its_session() {
+        assert!(!shutdown_due(None, 0));
+        assert!(!shutdown_due(Some(5), 4));
+        assert!(shutdown_due(Some(5), 5));
+        // Scheduled while session 5 was completing: the next boundary.
+        assert!(shutdown_due(Some(5), 6));
+    }
 }
