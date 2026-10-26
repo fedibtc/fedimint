@@ -35,6 +35,7 @@ use bitcoin::hashes::hex::FromHex as _;
 use config::ServerConfig;
 use config::io::read_server_config;
 pub use connection_limits::ConnectionLimits;
+pub use consensus::engine::ConsensusStop;
 use fedimint_connectors::ConnectorRegistry;
 use fedimint_core::config::P2PMessage;
 use fedimint_core::db::{Database, DatabaseTransaction, IDatabaseTransactionOpsCoreTyped as _};
@@ -160,7 +161,7 @@ pub async fn run(
     session_timeout: Duration,
     p2p_max_connection_age: Option<Duration>,
     iroh_api_limits: ConnectionLimits,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ConsensusStop> {
     run_with_iroh_p2p_relays(
         data_dir,
         auth_ui,
@@ -205,7 +206,7 @@ pub async fn run_with_iroh_p2p_relays(
     p2p_max_connection_age: Option<Duration>,
     iroh_api_limits: ConnectionLimits,
     iroh_p2p_relays: Vec<SafeUrl>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ConsensusStop> {
     run_with_iroh_p2p_relays_and_next_api(
         data_dir,
         auth_ui,
@@ -252,7 +253,7 @@ pub async fn run_with_iroh_p2p_relays_and_next_api(
     iroh_api_limits: ConnectionLimits,
     iroh_p2p_relays: Vec<SafeUrl>,
     iroh_next_api_settings: Option<IrohNextApiSettings>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ConsensusStop> {
     let (cfg, connections, p2p_status_receivers) = match get_config(&data_dir)? {
         Some(cfg) => {
             let connector = if cfg.consensus.iroh_endpoints.is_empty() {
@@ -372,7 +373,7 @@ async fn run_consensus(
     session_timeout: Duration,
     iroh_next_api_settings: Option<IrohNextApiSettings>,
     consensus_started: impl Future<Output = anyhow::Result<()>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ConsensusStop> {
     let decoders = module_init_registry.decoders_strict(
         cfg.consensus
             .modules
@@ -409,7 +410,7 @@ async fn run_consensus(
 
     consensus_started.await?;
 
-    Box::pin(consensus::run(
+    let stop = Box::pin(consensus::run(
         connectors,
         service_connectors,
         auth_ui,
@@ -441,7 +442,7 @@ async fn run_consensus(
 
     task_group.shutdown();
 
-    Ok(())
+    Ok(stop)
 }
 
 /// Run setup exclusively over the inherited driven-DKG control socket.
@@ -469,7 +470,7 @@ pub async fn run_driven(
     p2p_max_connection_age: Option<Duration>,
     iroh_p2p_relays: Vec<SafeUrl>,
     iroh_next_api_settings: Option<IrohNextApiSettings>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ConsensusStop> {
     let mut control = inherited_control_socket().await?;
 
     let existing_config = if data_dir.exists() {
@@ -742,7 +743,7 @@ pub async fn run_driven(
     _p2p_max_connection_age: Option<Duration>,
     _iroh_p2p_relays: Vec<SafeUrl>,
     _iroh_next_api_settings: Option<IrohNextApiSettings>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ConsensusStop> {
     anyhow::bail!("Driven DKG requires an AF_UNIX control socket")
 }
 

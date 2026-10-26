@@ -68,6 +68,17 @@ const DB_CHECKPOINTS_DIR: &str = "db_checkpoints";
 /// than a couple of these means something is wrong beyond a stale snapshot.
 const MAX_ITEM_PROCESSING_ATTEMPTS: usize = 10;
 
+/// Why the consensus loop returned without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusStop {
+    /// The task group is shutting down; the current session may be
+    /// unfinished.
+    TaskShutdown,
+    /// A scheduled shutdown took effect after its session completed, so this
+    /// guardian holds no units of an unfinished session.
+    ScheduledShutdown,
+}
+
 /// Runs the main server consensus loop
 pub struct ConsensusEngine {
     pub modules: ServerModuleRegistry,
@@ -96,7 +107,7 @@ impl ConsensusEngine {
     }
 
     #[instrument(target = LOG_CONSENSUS, name = "run", skip_all, fields(id=%self.cfg.local.identity))]
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(self) -> anyhow::Result<ConsensusStop> {
         if self.num_peers().total() == 1 {
             self.run_single_guardian(self.task_group.make_handle())
                 .await
@@ -105,7 +116,10 @@ impl ConsensusEngine {
         }
     }
 
-    pub async fn run_single_guardian(&self, task_handle: TaskHandle) -> anyhow::Result<()> {
+    pub async fn run_single_guardian(
+        &self,
+        task_handle: TaskHandle,
+    ) -> anyhow::Result<ConsensusStop> {
         assert_eq!(self.num_peers(), NumPeers::from(1));
 
         self.initialize_checkpoint_directory(self.get_finished_session_count().await)?;
@@ -156,16 +170,16 @@ impl ConsensusEngine {
             info!(target: LOG_CONSENSUS, "Session {session_index} completed");
 
             if shutdown_due(*self.shutdown_receiver.borrow(), session_index) {
-                break;
+                return Ok(ConsensusStop::ScheduledShutdown);
             }
         }
 
         info!(target: LOG_CONSENSUS, "Consensus task shut down");
 
-        Ok(())
+        Ok(ConsensusStop::TaskShutdown)
     }
 
-    pub async fn run_consensus(&self, task_handle: TaskHandle) -> anyhow::Result<()> {
+    pub async fn run_consensus(&self, task_handle: TaskHandle) -> anyhow::Result<ConsensusStop> {
         // We need four peers to run the atomic broadcast
         assert!(self.num_peers().total() >= 4);
 
@@ -198,7 +212,7 @@ impl ConsensusEngine {
             .context("Consensus session timed out, exiting...")?;
 
             if session.is_none() {
-                return Ok(());
+                return Ok(ConsensusStop::TaskShutdown);
             }
 
             info!(target: LOG_CONSENSUS, ?session_index, "Completed consensus session");
@@ -208,13 +222,13 @@ impl ConsensusEngine {
 
                 sleep(Duration::from_mins(1)).await;
 
-                break;
+                return Ok(ConsensusStop::ScheduledShutdown);
             }
         }
 
         info!(target: LOG_CONSENSUS, "Consensus task shut down");
 
-        Ok(())
+        Ok(ConsensusStop::TaskShutdown)
     }
 
     pub async fn run_session(

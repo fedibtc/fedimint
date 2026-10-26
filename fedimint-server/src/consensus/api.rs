@@ -455,10 +455,12 @@ impl ConsensusApi {
     /// consensus loop shuts down at the first session boundary at or after
     /// the scheduled session, so a session that completes while this request
     /// is handled defers the shutdown to the end of the next one instead of
-    /// cancelling it.
+    /// cancelling it. Repeating the request never moves a shutdown that is
+    /// already due by then to a later session.
     async fn shutdown_after_current_session(&self) {
         let current_session = self.session_count().await;
-        self.shutdown_sender.send_replace(Some(current_session));
+        self.shutdown_sender
+            .send_if_modified(|scheduled| schedule_shutdown_after(scheduled, current_session));
     }
 
     async fn get_federation_audit(&self) -> ApiResult<AuditSummary> {
@@ -1278,6 +1280,16 @@ pub(crate) async fn backup_statistics_static(
     backup_stats
 }
 
+/// Schedules a shutdown after `current_session` unless one is already due by
+/// then. Returns whether the schedule changed.
+fn schedule_shutdown_after(scheduled: &mut Option<u64>, current_session: u64) -> bool {
+    if scheduled.is_some_and(|scheduled| scheduled <= current_session) {
+        return false;
+    }
+    *scheduled = Some(current_session);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1293,6 +1305,20 @@ mod tests {
 
     use super::*;
     use crate::net::api::guardian_metadata::GuardianMetadataKey;
+
+    #[test]
+    fn repeated_shutdown_after_current_session_keeps_the_earliest_boundary() {
+        let mut scheduled = None;
+        assert!(schedule_shutdown_after(&mut scheduled, 5));
+        assert_eq!(scheduled, Some(5));
+        // Asked again in a later session: the shutdown is already due.
+        assert!(!schedule_shutdown_after(&mut scheduled, 6));
+        assert_eq!(scheduled, Some(5));
+        // A shutdown scheduled for a later session is brought forward.
+        let mut scheduled = Some(9);
+        assert!(schedule_shutdown_after(&mut scheduled, 7));
+        assert_eq!(scheduled, Some(7));
+    }
 
     /// `AWAIT_OUTPUTS_OUTCOMES` is public and unauthenticated, and the range it
     /// takes has no validation of its own. A single request used to size a
