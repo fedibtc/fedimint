@@ -42,7 +42,7 @@ use fedimint_server::config::driven::FM_DKG_CTRL_ENV;
 use fedimint_server::config::io::{DB_FILE, PLAINTEXT_PASSWORD};
 use fedimint_server::core::ServerModuleInitRegistry;
 use fedimint_server::net::api::ApiSecrets;
-use fedimint_server::{ConsensusStop, IrohNextApiSettings};
+use fedimint_server::{ConsensusStop, IrohNextApiSettings, ShutdownRequest};
 use fedimint_server_bitcoin_rpc::BitcoindClientWithFallback;
 use fedimint_server_bitcoin_rpc::bitcoind::BitcoindClient;
 use fedimint_server_bitcoin_rpc::esplora::EsploraClient;
@@ -74,13 +74,15 @@ use crate::metrics::APP_START_TS;
 /// Time we will wait before forcefully shutting down tasks
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Exit code of a fedimintd that stopped because a scheduled shutdown took
-/// effect at a session boundary: its last session completed and no later
-/// session began, so it signed no units of an unfinished session.
+/// Exit code of a fedimintd that stopped because a shutdown requested through
+/// `shutdown_after_current_session` took effect at a session boundary: its
+/// last session completed and no later session began, so it signed no units
+/// of an unfinished session.
 ///
 /// Only that path exits with this code. Every other exit, including a
-/// session timeout, a failed main task, a panic, a signal, or a failed task
-/// shutdown, exits with a different code or by signal.
+/// shutdown scheduled for a given session through `shutdown`, a session
+/// timeout, a failed main task, a panic, a signal, or a failed task shutdown,
+/// exits with a different code or by signal.
 pub const SESSION_BOUNDARY_EXIT_CODE: i32 = 3;
 
 #[derive(Parser)]
@@ -687,7 +689,7 @@ async fn run_inner(
             );
             panic!("fedimintd main task failed");
         });
-        if stop == ConsensusStop::ScheduledShutdown {
+        if stop == ConsensusStop::ScheduledShutdown(ShutdownRequest::AfterCurrentSession) {
             main_stopped_at_session_boundary.store(true, Ordering::SeqCst);
         }
     });

@@ -76,7 +76,9 @@ use crate::consensus::db::{
     AcceptedItemKey, AcceptedItemPrefix, AcceptedTransactionKey, PeerAvailabilityKey,
     SignedSessionOutcomeKey,
 };
-use crate::consensus::engine::get_finished_session_count_static;
+use crate::consensus::engine::{
+    ScheduledShutdown, ShutdownRequest, get_finished_session_count_static,
+};
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
 use crate::metrics::{BACKUP_WRITE_SIZE_BYTES, STORED_BACKUPS_COUNT};
 use crate::net::api::HasApiContext;
@@ -167,8 +169,8 @@ pub struct ConsensusApi {
     pub force_api_secret: Option<String>,
     /// For sending API events to consensus such as transactions
     pub submission_sender: async_channel::Sender<ConsensusItem>,
-    pub shutdown_receiver: Receiver<Option<u64>>,
-    pub shutdown_sender: Sender<Option<u64>>,
+    pub shutdown_receiver: Receiver<Option<ScheduledShutdown>>,
+    pub shutdown_sender: Sender<Option<ScheduledShutdown>>,
     pub ord_latency_receiver: watch::Receiver<Option<Duration>>,
     pub p2p_status_receivers: P2PStatusReceivers,
     pub ci_status_receivers: BTreeMap<PeerId, Receiver<Option<u64>>>,
@@ -407,7 +409,10 @@ impl ConsensusApi {
 
     pub async fn get_federation_status(&self) -> ApiResult<LegacyFederationStatus> {
         let session_count = self.session_count().await;
-        let scheduled_shutdown = self.shutdown_receiver.borrow().to_owned();
+        let scheduled_shutdown = self
+            .shutdown_receiver
+            .borrow()
+            .map(|scheduled| scheduled.session);
 
         let status_by_peer = self
             .p2p_status_receivers
@@ -448,7 +453,11 @@ impl ConsensusApi {
     }
 
     fn shutdown(&self, index: Option<u64>) {
-        self.shutdown_sender.send_replace(index);
+        self.shutdown_sender
+            .send_replace(index.map(|session| ScheduledShutdown {
+                session,
+                request: ShutdownRequest::AtSession,
+            }));
     }
 
     /// Schedules a shutdown for the session that is running now. The
@@ -457,6 +466,10 @@ impl ConsensusApi {
     /// is handled defers the shutdown to the end of the next one instead of
     /// cancelling it. Repeating the request never moves a shutdown that is
     /// already due by then to a later session.
+    ///
+    /// Unlike `shutdown`, the resulting stop is reported as
+    /// [`ShutdownRequest::AfterCurrentSession`], so the process running the
+    /// server can tell it apart from a shutdown scheduled for a given session.
     async fn shutdown_after_current_session(&self) {
         let current_session = self.session_count().await;
         self.shutdown_sender
@@ -1280,13 +1293,24 @@ pub(crate) async fn backup_statistics_static(
     backup_stats
 }
 
-/// Schedules a shutdown after `current_session` unless one is already due by
-/// then. Returns whether the schedule changed.
-fn schedule_shutdown_after(scheduled: &mut Option<u64>, current_session: u64) -> bool {
-    if scheduled.is_some_and(|scheduled| scheduled <= current_session) {
+/// Schedules a shutdown after `current_session`, keeping the session of a
+/// shutdown that is already due by then. Returns whether the schedule changed.
+fn schedule_shutdown_after(
+    scheduled: &mut Option<ScheduledShutdown>,
+    current_session: u64,
+) -> bool {
+    let session = scheduled
+        .map(|scheduled| scheduled.session)
+        .filter(|session| *session <= current_session)
+        .unwrap_or(current_session);
+    let after_current_session = Some(ScheduledShutdown {
+        session,
+        request: ShutdownRequest::AfterCurrentSession,
+    });
+    if *scheduled == after_current_session {
         return false;
     }
-    *scheduled = Some(current_session);
+    *scheduled = after_current_session;
     true
 }
 
@@ -1308,16 +1332,33 @@ mod tests {
 
     #[test]
     fn repeated_shutdown_after_current_session_keeps_the_earliest_boundary() {
+        let after = |session| {
+            Some(ScheduledShutdown {
+                session,
+                request: ShutdownRequest::AfterCurrentSession,
+            })
+        };
+        let at = |session| {
+            Some(ScheduledShutdown {
+                session,
+                request: ShutdownRequest::AtSession,
+            })
+        };
         let mut scheduled = None;
         assert!(schedule_shutdown_after(&mut scheduled, 5));
-        assert_eq!(scheduled, Some(5));
+        assert_eq!(scheduled, after(5));
         // Asked again in a later session: the shutdown is already due.
         assert!(!schedule_shutdown_after(&mut scheduled, 6));
-        assert_eq!(scheduled, Some(5));
+        assert_eq!(scheduled, after(5));
         // A shutdown scheduled for a later session is brought forward.
-        let mut scheduled = Some(9);
+        let mut scheduled = at(9);
         assert!(schedule_shutdown_after(&mut scheduled, 7));
-        assert_eq!(scheduled, Some(7));
+        assert_eq!(scheduled, after(7));
+        // A shutdown already due by then keeps its session but now reports
+        // the request that was made after it.
+        let mut scheduled = at(3);
+        assert!(schedule_shutdown_after(&mut scheduled, 7));
+        assert_eq!(scheduled, after(3));
     }
 
     /// `AWAIT_OUTPUTS_OUTCOMES` is public and unauthenticated, and the range it
