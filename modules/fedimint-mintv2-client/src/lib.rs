@@ -488,12 +488,91 @@ impl ClientModule for MintClientModule {
         dbtx: &mut DatabaseTransaction<'_>,
         operation_id: OperationId,
         unit: AmountUnit,
-        mut input_amount: Amount,
-        mut output_amount: Amount,
+        input_amount: Amount,
+        output_amount: Amount,
     ) -> anyhow::Result<(
         ClientInputBundle<MintInput, MintClientStateMachines>,
         ClientOutputBundle<MintOutput, MintClientStateMachines>,
     )> {
+        let (notes, denominations) = self
+            .select_inputs_and_change(dbtx, unit, input_amount, output_amount)
+            .await?;
+        let inputs = Self::create_input_bundle(operation_id, notes, false, self.cfg.amount_unit);
+        let outputs = self.create_output_bundle(operation_id, denominations).await;
+        let sender = self.balance_update_sender.clone();
+        dbtx.on_commit(move || sender.send_replace(()));
+        Ok((inputs, outputs))
+    }
+
+    async fn quote_final_inputs_and_outputs(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        _operation_id: OperationId,
+        unit: AmountUnit,
+        input_amount: Amount,
+        output_amount: Amount,
+    ) -> anyhow::Result<FeeQuoteRequest> {
+        let (notes, denominations) = self
+            .select_inputs_and_change(dbtx, unit, input_amount, output_amount)
+            .await?;
+        Ok(FeeQuoteRequest {
+            input_amount: Amounts::new_custom(unit, notes.iter().map(SpendableNote::amount).sum()),
+            output_amount: Amounts::new_custom(
+                unit,
+                denominations.iter().map(|d| d.amount()).sum(),
+            ),
+            input_fee: Amounts::new_custom(
+                unit,
+                notes
+                    .iter()
+                    .map(|note| self.cfg.fee_consensus.fee(note.amount()))
+                    .sum(),
+            ),
+            output_fee: Amounts::new_custom(
+                unit,
+                denominations
+                    .iter()
+                    .map(|d| self.cfg.fee_consensus.fee(d.amount()))
+                    .sum(),
+            ),
+        })
+    }
+
+    async fn await_primary_module_output(
+        &self,
+        operation_id: OperationId,
+        outpoint: OutPoint,
+    ) -> anyhow::Result<()> {
+        self.await_output_sm_success(operation_id, outpoint).await
+    }
+
+    async fn get_balance(&self, dbtx: &mut DatabaseTransaction<'_>, unit: AmountUnit) -> Amount {
+        if unit != self.cfg.amount_unit {
+            return Amount::ZERO;
+        }
+
+        self.get_count_by_denomination_dbtx(dbtx)
+            .await
+            .into_iter()
+            .map(|(denomination, count)| denomination.amount().mul_u64(count))
+            .sum()
+    }
+
+    async fn subscribe_balance_changes(&self) -> BoxStream<'static, ()> {
+        Box::pin(tokio_stream::wrappers::WatchStream::new(
+            self.balance_update_sender.subscribe(),
+        ))
+    }
+}
+
+impl MintClientModule {
+    async fn select_inputs_and_change(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        unit: AmountUnit,
+        mut input_amount: Amount,
+        mut output_amount: Amount,
+    ) -> anyhow::Result<(Vec<SpendableNote>, Vec<Denomination>)> {
         if unit != self.cfg.amount_unit {
             anyhow::bail!("Module can only handle its configured amount unit");
         }
@@ -548,9 +627,6 @@ impl ClientModule for MintClientModule {
         // We sort the notes by denomination to minimize the leaked information.
         spendable_notes.sort_by_key(|note| note.denomination);
 
-        let input_bundle =
-            Self::create_input_bundle(operation_id, spendable_notes, false, self.cfg.amount_unit);
-
         let mut denominations = represent_amount_with_fees(
             input_amount.saturating_sub(output_amount),
             &self.cfg.fee_consensus,
@@ -562,42 +638,9 @@ impl ClientModule for MintClientModule {
         // We sort the amounts to minimize the leaked information.
         denominations.sort();
 
-        let output_bundle = self.create_output_bundle(operation_id, denominations).await;
-
-        let sender = self.balance_update_sender.clone();
-        dbtx.on_commit(move || sender.send_replace(()));
-
-        Ok((input_bundle, output_bundle))
+        Ok((spendable_notes, denominations))
     }
 
-    async fn await_primary_module_output(
-        &self,
-        operation_id: OperationId,
-        outpoint: OutPoint,
-    ) -> anyhow::Result<()> {
-        self.await_output_sm_success(operation_id, outpoint).await
-    }
-
-    async fn get_balance(&self, dbtx: &mut DatabaseTransaction<'_>, unit: AmountUnit) -> Amount {
-        if unit != self.cfg.amount_unit {
-            return Amount::ZERO;
-        }
-
-        self.get_count_by_denomination_dbtx(dbtx)
-            .await
-            .into_iter()
-            .map(|(denomination, count)| denomination.amount().mul_u64(count))
-            .sum()
-    }
-
-    async fn subscribe_balance_changes(&self) -> BoxStream<'static, ()> {
-        Box::pin(tokio_stream::wrappers::WatchStream::new(
-            self.balance_update_sender.subscribe(),
-        ))
-    }
-}
-
-impl MintClientModule {
     async fn select_funding_input(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -1532,3 +1575,6 @@ fn represent_amount(mut remaining_amount: Amount) -> Vec<Denomination> {
 
     denominations
 }
+
+#[cfg(test)]
+mod tests;
