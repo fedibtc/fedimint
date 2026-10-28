@@ -293,25 +293,46 @@ impl<S: MetaSource> MetaSource for MetaModuleMetaSourceWithFallback<S> {
             FetchKind::Background => backoff_util::background_backoff(),
         };
 
-        let maybe_meta_module_meta = get_meta_module_value(client_config, api, backoff)
-            .await
-            .map(|meta| {
-                Result::<_, anyhow::Error>::Ok(MetaValues {
-                    values: serde_json::from_slice(meta.value.as_slice())?,
-                    revision: meta.revision,
-                })
-            })
-            .transpose()?;
-
-        // If we couldn't fetch valid meta values from the meta module for any reason,
-        // fall back to the legacy meta source
-        if let Some(maybe_meta_module_meta) = maybe_meta_module_meta {
-            Ok(maybe_meta_module_meta)
-        } else {
-            self.legacy
-                .fetch(client_config, api, fetch_kind, last_revision)
-                .await
+        match meta_module_source(
+            get_meta_module_value(client_config, api, backoff).await,
+            last_revision,
+        ) {
+            MetaModuleSource::Consensus(meta) => Ok(MetaValues {
+                values: serde_json::from_slice(meta.value.as_slice())?,
+                revision: meta.revision,
+            }),
+            MetaModuleSource::Legacy => {
+                self.legacy
+                    .fetch(client_config, api, fetch_kind, last_revision)
+                    .await
+            }
+            MetaModuleSource::KeepStored(error) => Err(error),
         }
+    }
+}
+
+/// Where [`MetaModuleMetaSourceWithFallback`] takes the meta values from.
+#[derive(Debug)]
+enum MetaModuleSource {
+    /// The meta module's consensus value.
+    Consensus(MetaConsensusValue),
+    /// The legacy source: the federation has no meta module or no value in
+    /// it, or the module could not be reached and nothing is stored yet.
+    Legacy,
+    /// The module could not be reached. Keep the stored values: the legacy
+    /// values would replace the federation's current meta with stale config
+    /// values until the next successful fetch.
+    KeepStored(anyhow::Error),
+}
+
+/// `None` when the federation has no meta module.
+type MetaModuleValue = Option<anyhow::Result<Option<MetaConsensusValue>>>;
+
+fn meta_module_source(value: MetaModuleValue, last_revision: Option<u64>) -> MetaModuleSource {
+    match value {
+        Some(Ok(Some(consensus))) => MetaModuleSource::Consensus(consensus),
+        Some(Err(error)) if last_revision.is_some() => MetaModuleSource::KeepStored(error),
+        None | Some(Ok(None) | Err(_)) => MetaModuleSource::Legacy,
     }
 }
 
@@ -319,34 +340,71 @@ async fn get_meta_module_value(
     client_config: &ClientConfig,
     api: &DynGlobalApi,
     backoff: FibonacciBackoff,
-) -> Option<MetaConsensusValue> {
-    match client_config.get_first_module_by_kind_cfg(KIND) {
-        Ok((instance_id, _)) => {
-            let meta_api = api.with_module(instance_id);
-
-            let overrides_res = retry("fetch_meta_values", backoff, || async {
-                Ok(meta_api.get_consensus(DEFAULT_META_KEY).await?)
-            })
-            .await;
-
-            match overrides_res {
-                Ok(Some(consensus)) => Some(consensus),
-                Ok(None) => {
-                    debug!(target: LOG_CLIENT_MODULE_META, "Meta module returned no consensus value");
-                    None
-                }
-                Err(e) => {
-                    warn!(target: LOG_CLIENT_MODULE_META, "Failed to fetch meta module consensus value: {}", e);
-                    None
-                }
-            }
-        }
-        _ => None,
+) -> MetaModuleValue {
+    let (instance_id, _) = client_config.get_first_module_by_kind_cfg(KIND).ok()?;
+    let meta_api = api.with_module(instance_id);
+    let consensus = retry("fetch_meta_values", backoff, || async {
+        Ok(meta_api.get_consensus(DEFAULT_META_KEY).await?)
+    })
+    .await
+    .inspect_err(|e| {
+        warn!(target: LOG_CLIENT_MODULE_META, "Failed to fetch meta module consensus value: {}", e);
+    });
+    if let Ok(None) = consensus {
+        debug!(target: LOG_CLIENT_MODULE_META, "Meta module returned no consensus value");
     }
+    Some(consensus)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{MetaModuleSource, meta_module_source};
+
+    fn consensus(revision: u64) -> MetaConsensusValue {
+        MetaConsensusValue {
+            revision,
+            value: MetaValue::from(br#"{"federation_name":"Current name"}"#.as_slice()),
+        }
+    }
+
+    #[test]
+    fn unreachable_meta_module_keeps_stored_values() {
+        for stored in [0, 1] {
+            assert!(matches!(
+                meta_module_source(Some(Err(anyhow::anyhow!("unreachable"))), Some(stored)),
+                MetaModuleSource::KeepStored(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn unreachable_meta_module_without_stored_values_uses_legacy() {
+        assert!(matches!(
+            meta_module_source(Some(Err(anyhow::anyhow!("unreachable"))), None),
+            MetaModuleSource::Legacy
+        ));
+    }
+
+    #[test]
+    fn absent_meta_value_uses_legacy_even_with_stored_values() {
+        assert!(matches!(
+            meta_module_source(Some(Ok(None)), Some(1)),
+            MetaModuleSource::Legacy
+        ));
+        assert!(matches!(
+            meta_module_source(None, Some(1)),
+            MetaModuleSource::Legacy
+        ));
+    }
+
+    #[test]
+    fn consensus_value_replaces_stored_values() {
+        match meta_module_source(Some(Ok(Some(consensus(4)))), Some(9)) {
+            MetaModuleSource::Consensus(value) => assert_eq!(value, consensus(4)),
+            other => panic!("expected the consensus value, got {other:?}"),
+        }
+    }
+
     use fedimint_meta_common::MetaValue;
     use serde_json::json;
 
