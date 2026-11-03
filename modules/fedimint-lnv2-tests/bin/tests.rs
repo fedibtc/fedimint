@@ -64,6 +64,8 @@ enum Commands {
     LnurlRecovery,
     /// Two clients racing to pay the same invoice settle exactly once
     DuplicatePayment,
+    /// Guardians adopt gateways from their peers; needs FM_LNV2_GATEWAY_SYNC
+    GatewaySync,
 }
 
 #[tokio::main]
@@ -104,6 +106,9 @@ async fn main() -> anyhow::Result<()> {
                 Some(Commands::DuplicatePayment) => {
                     pegin_gateways(&dev_fed).await?;
                     test_duplicate_payment(&dev_fed, &process_mgr).await?;
+                }
+                Some(Commands::GatewaySync) => {
+                    test_gateway_sync(&dev_fed).await?;
                 }
                 None => {
                     // Run all tests if no subcommand is specified
@@ -592,6 +597,73 @@ async fn test_fees(
     }
 
     Ok(())
+}
+
+async fn test_gateway_sync(dev_fed: &DevJitFed) -> anyhow::Result<()> {
+    if devimint::util::is_backwards_compatibility_test() {
+        info!("Older guardians do not sync gateways, skipping");
+        return Ok(());
+    }
+
+    ensure!(
+        std::env::var("FM_LNV2_GATEWAY_SYNC").is_ok_and(|value| value == "1"),
+        "the guardians need FM_LNV2_GATEWAY_SYNC=1"
+    );
+
+    let client = dev_fed
+        .fed()
+        .await?
+        .new_joined_client("lnv2-test-gateway-sync-client")
+        .await?;
+
+    let straggler = dev_fed.fed().await?.members.len() - 1;
+    let gateway = "https://gateway-sync.example/".to_string();
+
+    info!("Adding a gateway to every guardian but one...");
+
+    for peer in 0..straggler {
+        assert!(add_gateway(&client, peer, &gateway).await?);
+    }
+
+    retry(
+        "Waiting for the remaining guardian to adopt the gateway".to_string(),
+        backoff_util::background_backoff(),
+        || async {
+            ensure!(peer_gateways(&client, straggler).await?.contains(&gateway));
+
+            Ok(())
+        },
+    )
+    .await?;
+
+    info!("Testing that a syncing guardian refuses removal...");
+
+    ensure!(
+        remove_gateway(&client, straggler, &gateway).await.is_err(),
+        "removing a gateway must be refused"
+    );
+    ensure!(peer_gateways(&client, straggler).await?.contains(&gateway));
+
+    Ok(())
+}
+
+async fn peer_gateways(client: &Client, peer: usize) -> anyhow::Result<Vec<String>> {
+    Ok(cmd!(
+        client,
+        "module",
+        "lnv2",
+        "gateways",
+        "list",
+        "--peer",
+        peer.to_string()
+    )
+    .out_json()
+    .await?
+    .as_array()
+    .expect("JSON Value is not an array")
+    .iter()
+    .map(|gateway| gateway.as_str().expect("gateway is a string").to_owned())
+    .collect())
 }
 
 async fn add_gateway(client: &Client, peer: usize, gateway: &String) -> anyhow::Result<bool> {

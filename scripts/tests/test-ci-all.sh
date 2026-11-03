@@ -163,6 +163,11 @@ function lnv2_module_duplicate_payment() {
 }
 export -f lnv2_module_duplicate_payment
 
+function lnv2_module_gateway_sync() {
+  fm-run-test "${FUNCNAME[0]}" env FM_OFFLINE_NODES=0 FM_LNV2_GATEWAY_SYNC=1 ./scripts/tests/lnv2-module-test.sh gateway-sync
+}
+export -f lnv2_module_gateway_sync
+
 function lnv2_mintv2_walletv2_lightning_payments() {
   # v2 modules are not supported by older versions, so we skip for backwards-compatibility tests
   if [ -z "${FM_BACKWARDS_COMPATIBILITY_TEST:-}" ]; then
@@ -483,6 +488,7 @@ tests_to_run_in_parallel+=(
   "lnv2_module_gateway_registration"
   "lnv2_module_payments"
   "lnv2_module_duplicate_payment"
+  "lnv2_module_gateway_sync"
   "lnv2_mintv2_walletv2_lightning_payments"
   "lnv2_module_lnurl_pay"
   "lnv2_module_lnurl_recovery"

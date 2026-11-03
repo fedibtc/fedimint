@@ -4165,6 +4165,7 @@ dependencies = [
  "async-trait",
  "bls12_381",
  "erased-serde",
+ "fedimint-api-client",
  "fedimint-core",
  "fedimint-lnv2-common",
  "fedimint-logging",

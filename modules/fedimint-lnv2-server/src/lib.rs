@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, ensure};
 use bls12_381::{G1Projective, Scalar};
+use fedimint_api_client::api::{DynModuleApi, FederationApiExt};
 use fedimint_core::config::{
     ServerModuleConfig, ServerModuleConsensusConfig, TypedServerModuleConfig,
     TypedServerModuleConsensusConfig,
@@ -20,14 +21,16 @@ use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
-use fedimint_core::envs::{FM_ENABLE_MODULE_LNV2_ENV, is_env_var_set_opt};
+use fedimint_core::envs::{
+    FM_ENABLE_MODULE_LNV2_ENV, is_env_var_set, is_env_var_set_opt, is_running_in_test_env,
+};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    Amounts, ApiEndpoint, ApiError, ApiVersion, CoreConsensusVersion, InputMeta,
+    Amounts, ApiEndpoint, ApiError, ApiRequestErased, ApiVersion, CoreConsensusVersion, InputMeta,
     ModuleConsensusVersion, ModuleInit, TransactionItemAmounts, admin_api_endpoint,
     public_api_endpoint,
 };
-use fedimint_core::task::timeout;
+use fedimint_core::task::{sleep, timeout};
 use fedimint_core::time::duration_since_epoch;
 use fedimint_core::util::SafeUrl;
 use fedimint_core::{
@@ -57,6 +60,7 @@ use fedimint_server_core::{
     ConfigGenModuleArgs, EnvVarDoc, ServerModule, ServerModuleInit, ServerModuleInitArgs,
 };
 use futures::StreamExt;
+use futures::future::join_all;
 use group::Curve;
 use group::ff::Field;
 use rand::rngs::OsRng;
@@ -64,7 +68,7 @@ use strum::IntoEnumIterator;
 use tpe::{
     AggregatePublicKey, DecryptionKeyShare, PublicKeyShare, SecretKeyShare, derive_pk_share,
 };
-use tracing::trace;
+use tracing::{info, trace};
 
 use crate::db::{
     BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, DecryptionKeyShareKey,
@@ -235,10 +239,16 @@ impl ServerModuleInit for LightningInit {
     }
 
     fn get_documented_env_vars(&self) -> Vec<EnvVarDoc> {
-        vec![EnvVarDoc {
-            name: FM_ENABLE_MODULE_LNV2_ENV,
-            description: "Set to 0/false to disable the LNv2 Lightning module. Enabled by default.",
-        }]
+        vec![
+            EnvVarDoc {
+                name: FM_ENABLE_MODULE_LNV2_ENV,
+                description: "Set to 0/false to disable the LNv2 Lightning module. Enabled by default.",
+            },
+            EnvVarDoc {
+                name: FM_LNV2_GATEWAY_SYNC_ENV,
+                description: "Set to 1/true to add gateways a threshold of the other guardians list, and to refuse gateway removal.",
+            },
+        ]
     }
 
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
@@ -254,10 +264,25 @@ impl ServerModuleInit for LightningInit {
                 .get();
         }
 
+        let gateway_sync = is_env_var_set(FM_LNV2_GATEWAY_SYNC_ENV);
+
+        if gateway_sync {
+            args.task_group().spawn_cancellable(
+                "lnv2-gateway-sync",
+                Lightning::sync_gateways(
+                    args.db().clone(),
+                    args.module_api().clone(),
+                    args.our_peer_id(),
+                    args.num_peers().threshold(),
+                ),
+            );
+        }
+
         Ok(Lightning {
             cfg: args.cfg().to_typed()?,
             db: args.db().clone(),
             server_bitcoin_rpc_monitor: args.server_bitcoin_rpc_monitor(),
+            gateway_sync,
         })
     }
 
@@ -410,6 +435,8 @@ pub struct Lightning {
     cfg: LightningConfig,
     db: Database,
     server_bitcoin_rpc_monitor: ServerBitcoinRpcMonitor,
+    /// [`FM_LNV2_GATEWAY_SYNC_ENV`]
+    gateway_sync: bool,
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -745,7 +772,11 @@ impl ServerModule for Lightning {
             admin_api_endpoint! {
                 REMOVE_GATEWAY_ENDPOINT,
                 ApiVersion::new(0, 0),
-                async |_module: &Lightning, context, gateway: SafeUrl| -> bool {
+                async |module: &Lightning, context, gateway: SafeUrl| -> bool {
+                    // Sync would re-add it from the peers.
+                    if module.gateway_sync {
+                        return Err(ApiError::bad_request("Gateway sync is enabled".to_string()));
+                    }
 
                     let db = context.db();
 
@@ -957,6 +988,43 @@ impl Lightning {
             .await
     }
 
+    /// Every interval, add each gateway that a threshold of the other peers
+    /// list. Gateway lists are local, so a guardian that was down while its
+    /// peers' admins added a gateway would otherwise never learn it. At most
+    /// `max_evil` peers are faulty, so a threshold of listings includes an
+    /// honest guardian whose admin added the gateway.
+    async fn sync_gateways(db: Database, api: DynModuleApi, our_peer_id: PeerId, threshold: usize) {
+        let interval = if is_running_in_test_env() {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(10 * 60)
+        };
+
+        loop {
+            sleep(interval).await;
+
+            let listings = join_all(
+                api.all_peers()
+                    .iter()
+                    .filter(|&&peer| peer != our_peer_id)
+                    .map(|&peer| {
+                        api.request_single_peer::<BTreeSet<SafeUrl>>(
+                            GATEWAYS_ENDPOINT.to_owned(),
+                            ApiRequestErased::default(),
+                            peer,
+                        )
+                    }),
+            )
+            .await;
+
+            for gateway in threshold_gateways(listings.into_iter().flatten(), threshold) {
+                if Self::add_gateway(db.clone(), gateway.clone()).await {
+                    info!(target: LOG_MODULE_LNV2, %gateway, "Added a gateway a threshold of peers list");
+                }
+            }
+        }
+    }
+
     pub async fn consensus_block_count_ui(&self) -> u64 {
         self.consensus_block_count(&mut self.db.begin_transaction_nc().await)
             .await
@@ -980,6 +1048,28 @@ impl Lightning {
     }
 }
 
+/// Opt-in to gateway sync: each guardian adds every gateway a threshold of
+/// the other guardians list, and refuses gateway removal.
+pub const FM_LNV2_GATEWAY_SYNC_ENV: &str = "FM_LNV2_GATEWAY_SYNC";
+
+/// Every gateway in at least `threshold` of the peers' `listings`.
+fn threshold_gateways(
+    listings: impl IntoIterator<Item = BTreeSet<SafeUrl>>,
+    threshold: usize,
+) -> Vec<SafeUrl> {
+    let mut listed_by = BTreeMap::<SafeUrl, usize>::new();
+
+    for gateway in listings.into_iter().flatten() {
+        *listed_by.entry(gateway).or_default() += 1;
+    }
+
+    listed_by
+        .into_iter()
+        .filter(|(_, peers)| *peers >= threshold)
+        .map(|(gateway, _)| gateway)
+        .collect()
+}
+
 fn observe_funded_contract(
     dbtx: &mut DatabaseTransaction<'_>,
     direction: &'static str,
@@ -990,4 +1080,32 @@ fn observe_funded_contract(
             .with_label_values(&[direction])
             .observe(amount.sats_f64());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use fedimint_core::util::SafeUrl;
+
+    use crate::threshold_gateways;
+
+    #[test]
+    fn counts_each_peer_once() {
+        let url = |value: &str| SafeUrl::parse(value).expect("test URL is valid");
+        let quorum = url("https://quorum.example/");
+        let minority = url("https://minority.example/");
+
+        let listings = vec![
+            BTreeSet::from([quorum.clone(), minority.clone()]),
+            BTreeSet::from([quorum.clone(), minority.clone()]),
+            BTreeSet::from([quorum.clone()]),
+        ];
+
+        assert_eq!(
+            threshold_gateways(listings.clone(), 3),
+            vec![quorum.clone()]
+        );
+        assert_eq!(threshold_gateways(listings, 2), vec![minority, quorum]);
+    }
 }
