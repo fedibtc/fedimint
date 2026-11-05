@@ -239,6 +239,16 @@ async fn receive_reports_confirmation_progress() -> anyhow::Result<()> {
     // The two deposits sit at different stages, so neither may mask the other.
     let progress = module.address_receive_progress(&address).await?.deposits;
 
+    // The query across all addresses must agree, and keep the address.
+    let all = module.all_receive_progress().await;
+    assert!(all.iter().all(|(paid, _, _)| *paid == address));
+    assert_eq!(
+        all.into_iter()
+            .map(|(_, outpoint, deposit)| (outpoint, deposit))
+            .collect::<Vec<_>>(),
+        progress
+    );
+
     let mined = lookup_progress(&progress, mined_outpoint);
     let unmined = lookup_progress(&progress, unmined_outpoint);
 
