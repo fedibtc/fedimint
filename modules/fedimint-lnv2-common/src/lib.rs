@@ -33,6 +33,31 @@ use tpe::AggregateDecryptionKey;
 
 use crate::contracts::{IncomingContract, OutgoingContract};
 
+/// The Lightning payments one guardian counted, as returned by
+/// [`endpoint_constants::VOLUME_STATS_ENDPOINT`].
+///
+/// A guardian counts payments as it settles them, bucketed by the day of the
+/// consensus unix time. Windows end at the current consensus day, so
+/// "7 days" covers the current day and the six before it.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LightningVolumeStats {
+    pub last_7_days: LightningVolume,
+    pub last_30_days: LightningVolume,
+}
+
+/// The payments settled in one window. Refunded or cancelled payments are not
+/// counted.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LightningVolume {
+    /// The amount of incoming contracts that their recipient claimed.
+    pub received: Amount,
+    /// The amount of outgoing contracts that the gateway claimed.
+    pub sent: Amount,
+    /// Whether this guardian counted for the whole window. This is true when
+    /// counting started when the federation formed, or before the window began.
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Bolt11InvoiceDescription {
     Direct(String),
