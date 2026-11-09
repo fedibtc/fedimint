@@ -60,6 +60,7 @@ use fedimint_logging::LOG_MODULE_WALLETV2;
 use fedimint_server_core::bitcoin_rpc::ServerBitcoinRpcMonitor;
 use fedimint_server_core::config::{PeerHandleOps, PeerHandleOpsExt};
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
+use fedimint_server_core::volume::VolumeWindow;
 use fedimint_server_core::{
     ConfigGenModuleArgs, EnvVarDoc, ServerModule, ServerModuleInit, ServerModuleInitArgs,
 };
@@ -70,11 +71,12 @@ use fedimint_walletv2_common::config::{
 use fedimint_walletv2_common::endpoint_constants::{
     CONSENSUS_BLOCK_COUNT_ENDPOINT, CONSENSUS_FEERATE_ENDPOINT, FEDERATION_WALLET_ENDPOINT,
     OUTPUT_INFO_SLICE_ENDPOINT, PENDING_TRANSACTION_CHAIN_ENDPOINT, RECEIVE_FEE_ENDPOINT,
-    SEND_FEE_ENDPOINT, TRANSACTION_CHAIN_ENDPOINT, TRANSACTION_ID_ENDPOINT,
+    SEND_FEE_ENDPOINT, TRANSACTION_CHAIN_ENDPOINT, TRANSACTION_ID_ENDPOINT, VOLUME_STATS_ENDPOINT,
 };
 use fedimint_walletv2_common::{
-    FederationWallet, MODULE_CONSENSUS_VERSION, TxInfo, WalletInputError, WalletOutputError,
-    descriptor, is_potential_receive, tweak_public_key,
+    BLOCKS_PER_DAY, FederationWallet, MODULE_CONSENSUS_VERSION, TxInfo, WalletInputError,
+    WalletOutputError, WalletVolume, WalletVolumeStats, descriptor, is_potential_receive,
+    tweak_public_key,
 };
 use futures::StreamExt;
 use miniscript::descriptor::Wsh;
@@ -88,6 +90,7 @@ use tracing::{debug, info};
 use crate::db::{
     BlockCountVoteKey, BlockCountVotePrefix, FeeRateVoteKey, FeeRateVotePrefix, TxInfoKey,
     TxInfoPrefix, UnconfirmedTxKey, UnconfirmedTxPrefix, UnsignedTxKey, UnsignedTxPrefix,
+    VolumeDay, VolumeDayKey, VolumeDayPrefix, VolumeStartKey, VolumeStartPrefix,
 };
 use crate::metrics::{
     WALLET_BLOCK_COUNT, WALLET_INOUT_FEES_SATS, WALLET_INOUT_SATS, WALLET_PEGIN_FEES_SATS,
@@ -260,6 +263,26 @@ impl ModuleInit for WalletInit {
                         FederationWallet,
                         wallet,
                         "Federation Wallet"
+                    );
+                }
+                DbKeyPrefix::VolumeDay => {
+                    push_db_pair_items!(
+                        dbtx,
+                        VolumeDayPrefix,
+                        VolumeDayKey,
+                        VolumeDay,
+                        wallet,
+                        "Wallet Volume Days"
+                    );
+                }
+                DbKeyPrefix::VolumeStart => {
+                    push_db_pair_items!(
+                        dbtx,
+                        VolumeStartPrefix,
+                        VolumeStartKey,
+                        u64,
+                        wallet,
+                        "Wallet Volume Start"
                     );
                 }
             }
@@ -485,6 +508,16 @@ impl ServerModule for Wallet {
         consensus_item: WalletConsensusItem,
         peer: PeerId,
     ) -> anyhow::Result<()> {
+        // Consensus items arrive every session, so this marks the start of
+        // counting no later than the first session that counts. A deposit or
+        // withdrawal can still be processed earlier in that session, at the
+        // same block count, which is why the day counting started on is never
+        // complete.
+        if dbtx.get_value(&VolumeStartKey).await.is_none() {
+            let now = self.consensus_block_count(dbtx).await;
+            dbtx.insert_new_entry(&VolumeStartKey, &now).await;
+        }
+
         match consensus_item {
             WalletConsensusItem::BlockCount(block_count_vote) => {
                 self.process_block_count(dbtx, block_count_vote, peer).await
@@ -656,6 +689,9 @@ impl ServerModule for Wallet {
 
         calculate_pegin_metrics(dbtx, amount, fee);
 
+        self.count_volume(dbtx, |day| day.deposited += tracked_output.value)
+            .await;
+
         Ok(InputMeta {
             amount: TransactionItemAmounts {
                 amounts: Amounts::new_bitcoin(amount),
@@ -793,6 +829,9 @@ impl ServerModule for Wallet {
 
         calculate_pegout_metrics(dbtx, amount, fee);
 
+        self.count_volume(dbtx, |day| day.withdrawn += output.value)
+            .await;
+
         Ok(TransactionItemAmounts {
             amounts: Amounts::new_bitcoin(amount),
             fees: Amounts::new_bitcoin(fee),
@@ -825,6 +864,15 @@ impl ServerModule for Wallet {
 
     fn api_endpoints(&self) -> Vec<ApiEndpoint<Self>> {
         vec![
+            public_api_endpoint! {
+                VOLUME_STATS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Wallet, context, _params: ()| -> WalletVolumeStats {
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+                    Ok(module.volume_stats(&mut dbtx).await)
+                }
+            },
             public_api_endpoint! {
                 CONSENSUS_BLOCK_COUNT_ENDPOINT,
                 ApiVersion::new(0, 0),
@@ -1171,6 +1219,54 @@ impl Wallet {
 
             sleep(common::sleep_duration()).await;
         }
+    }
+
+    /// Add a processed flow to the current volume day.
+    async fn count_volume(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        add: impl FnOnce(&mut VolumeDay),
+    ) {
+        let key = VolumeDayKey(self.consensus_block_count(dbtx).await / BLOCKS_PER_DAY);
+        let mut day = dbtx.get_value(&key).await.unwrap_or_default();
+        add(&mut day);
+        dbtx.insert_entry(&key, &day).await;
+    }
+
+    async fn volume_stats(&self, dbtx: &mut DatabaseTransaction<'_>) -> WalletVolumeStats {
+        let now = self.consensus_block_count(dbtx).await;
+        let start = dbtx.get_value(&VolumeStartKey).await;
+
+        WalletVolumeStats {
+            last_7_days: Self::volume(dbtx, now, start, 7).await,
+            last_30_days: Self::volume(dbtx, now, start, 30).await,
+        }
+    }
+
+    async fn volume(
+        dbtx: &mut DatabaseTransaction<'_>,
+        now: u64,
+        start: Option<u64>,
+        days: u64,
+    ) -> WalletVolume {
+        let window = VolumeWindow::new(now / BLOCKS_PER_DAY, days);
+
+        let mut volume = WalletVolume {
+            deposited: Amount::ZERO,
+            withdrawn: Amount::ZERO,
+            complete: window.is_complete(start, BLOCKS_PER_DAY),
+        };
+
+        let mut stream = dbtx
+            .find_by_range(VolumeDayKey(window.first_day)..VolumeDayKey(window.end_day))
+            .await;
+
+        while let Some((_, day)) = stream.next().await {
+            volume.deposited += day.deposited;
+            volume.withdrawn += day.withdrawn;
+        }
+
+        volume
     }
 
     pub async fn consensus_block_count(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
