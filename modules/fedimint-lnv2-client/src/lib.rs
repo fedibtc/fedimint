@@ -16,12 +16,13 @@ mod send_sm;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_stream::stream;
 use bitcoin::hashes::{Hash, sha256};
 use bitcoin::secp256k1;
 use db::{DbKeyPrefix, GatewayKey, IncomingContractStreamIndexKey};
-use fedimint_api_client::api::DynModuleApi;
+use fedimint_api_client::api::{DynModuleApi, ServerError};
 use fedimint_client_module::module::init::{ClientModuleInit, ClientModuleInitArgs};
 use fedimint_client_module::module::recovery::NoModuleBackup;
 use fedimint_client_module::module::{ClientContext, ClientModule, OutPointRange};
@@ -42,7 +43,8 @@ use fedimint_core::module::{
 use fedimint_core::secp256k1::SECP256K1;
 use fedimint_core::task::TaskGroup;
 use fedimint_core::time::duration_since_epoch;
-use fedimint_core::util::SafeUrl;
+use fedimint_core::util::backoff_util::{self, custom_backoff};
+use fedimint_core::util::{self as util, SafeUrl};
 use fedimint_core::{Amount, PeerId, apply, async_trait_maybe_send};
 use fedimint_derive_secret::{ChildId, DerivableSecret};
 use fedimint_lnv2_common::config::LightningClientConfig;
@@ -76,6 +78,13 @@ const EXPIRATION_DELTA_LIMIT: u64 = 1440;
 
 /// A two hour buffer in case either the client or gateway go offline
 const CONTRACT_CONFIRMATION_BUFFER: u64 = 12;
+
+/// Backoff for a gateway request made while the user waits: three retries,
+/// with about two seconds of waiting between them in total. The requests
+/// themselves are not bounded by this.
+fn gateway_request_backoff() -> backoff_util::FibonacciBackoff {
+    custom_backoff(Duration::from_millis(250), Duration::from_secs(1), Some(3))
+}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,14 +518,26 @@ impl LightningClientModule {
 
     /// Requests the `RoutingInfo`, including fee information, from the gateway
     /// available at the `SafeUrl`.
+    ///
+    /// A failed request is retried a few times, so that one dropped or slow
+    /// request does not make the gateway look offline. The request is a read,
+    /// so retrying it is safe.
     pub async fn routing_info(
         &self,
         gateway: &SafeUrl,
     ) -> Result<Option<RoutingInfo>, RoutingInfoError> {
-        self.gateway_conn
-            .routing_info(gateway.clone(), &self.federation_id)
-            .await
-            .map_err(|_| RoutingInfoError::FailedToRequestRoutingInfo)
+        util::retry(
+            "gateway-routing-info",
+            gateway_request_backoff(),
+            || async {
+                self.gateway_conn
+                    .routing_info(gateway.clone(), &self.federation_id)
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+        )
+        .await
+        .map_err(|_| RoutingInfoError::FailedToRequestRoutingInfo)
     }
 
     /// Pay an invoice. For testing you can optionally specify a gateway to
@@ -1006,16 +1027,6 @@ impl LightningClientModule {
             return Err(ReceiveError::InvoiceExpiryTooLong);
         }
 
-        let (ephemeral_tweak, ephemeral_pk) = tweak::generate(recipient_static_pk);
-
-        let encryption_seed = ephemeral_tweak
-            .consensus_hash::<sha256::Hash>()
-            .to_byte_array();
-
-        let preimage = encryption_seed
-            .consensus_hash::<sha256::Hash>()
-            .to_byte_array();
-
         let (gateway, routing_info) = match gateway {
             Some(gateway) => (
                 gateway.clone(),
@@ -1042,6 +1053,64 @@ impl LightningClientModule {
         if contract_amount < MINIMUM_INCOMING_CONTRACT_AMOUNT {
             return Err(ReceiveError::AmountTooSmall);
         }
+
+        // The gateway registers each payment hash once, so a request whose
+        // response was lost cannot be repeated with the same contract. Each
+        // attempt creates a new contract instead. Nothing is stored before the
+        // invoice arrives, and the gateway lets an unused registration expire.
+        let (contract, preimage, invoice) = util::retry(
+            "gateway-bolt11-invoice",
+            gateway_request_backoff(),
+            || async {
+                self.request_invoice_for_new_contract(
+                    recipient_static_pk,
+                    &gateway,
+                    &routing_info,
+                    contract_amount,
+                    amount,
+                    description.clone(),
+                    expiry_secs,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+            },
+        )
+        .await
+        .map_err(|e| ReceiveError::FailedToConnectToGateway(e.to_string()))?;
+
+        if invoice.payment_hash() != &preimage.consensus_hash() {
+            return Err(ReceiveError::InvalidInvoice);
+        }
+
+        if invoice.amount_milli_satoshis() != Some(amount.msats) {
+            return Err(ReceiveError::IncorrectInvoiceAmount);
+        }
+
+        Ok((gateway, contract, invoice))
+    }
+
+    /// Creates a new incoming contract locked to a public key derived from
+    /// `recipient_static_pk` and requests its invoice from `gateway`.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_invoice_for_new_contract(
+        &self,
+        recipient_static_pk: PublicKey,
+        gateway: &SafeUrl,
+        routing_info: &RoutingInfo,
+        contract_amount: Amount,
+        amount: Amount,
+        description: Bolt11InvoiceDescription,
+        expiry_secs: u32,
+    ) -> Result<(IncomingContract, [u8; 32], Bolt11Invoice), ServerError> {
+        let (ephemeral_tweak, ephemeral_pk) = tweak::generate(recipient_static_pk);
+
+        let encryption_seed = ephemeral_tweak
+            .consensus_hash::<sha256::Hash>()
+            .to_byte_array();
+
+        let preimage = encryption_seed
+            .consensus_hash::<sha256::Hash>()
+            .to_byte_array();
 
         let expiration = duration_since_epoch()
             .as_secs()
@@ -1076,18 +1145,9 @@ impl LightningClientModule {
                 description,
                 expiry_secs,
             )
-            .await
-            .map_err(|e| ReceiveError::FailedToConnectToGateway(e.to_string()))?;
+            .await?;
 
-        if invoice.payment_hash() != &preimage.consensus_hash() {
-            return Err(ReceiveError::InvalidInvoice);
-        }
-
-        if invoice.amount_milli_satoshis() != Some(amount.msats) {
-            return Err(ReceiveError::IncorrectInvoiceAmount);
-        }
-
-        Ok((gateway, contract, invoice))
+        Ok((contract, preimage, invoice))
     }
 
     // Receive an incoming contract locked to a public key derived from our
