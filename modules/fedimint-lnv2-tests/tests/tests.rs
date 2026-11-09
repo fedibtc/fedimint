@@ -2,13 +2,17 @@ mod mock;
 
 use std::pin::pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_stream::stream;
+use fedimint_api_client::api::FederationApiExt as _;
 use fedimint_client::ClientHandleArc;
-use fedimint_client::transaction::{ClientInput, ClientInputBundle, TransactionBuilder};
+use fedimint_client::transaction::{
+    ClientInput, ClientInputBundle, ClientOutput, ClientOutputBundle, TransactionBuilder,
+};
 use fedimint_client_module::module::ClientModule;
 use fedimint_core::core::{IntoDynInstance, OperationId};
-use fedimint_core::module::{AmountUnit, Amounts};
+use fedimint_core::module::{AmountUnit, Amounts, ApiRequestErased};
 use fedimint_core::util::NextOrPending as _;
 use fedimint_core::{Amount, OutPoint, sats};
 use fedimint_dummy_client::{DummyClientInit, DummyClientModule};
@@ -21,8 +25,10 @@ use fedimint_lnv2_client::{
     InvoiceSendStatus, LightningClientInit, LightningClientModule, LightningOperationMeta,
     ReceiveOperationState, SendOperationState, SendPaymentError,
 };
+use fedimint_lnv2_common::endpoint_constants::VOLUME_STATS_ENDPOINT;
 use fedimint_lnv2_common::{
-    Bolt11InvoiceDescription, KIND, LightningInput, LightningInputV0, OutgoingWitness,
+    Bolt11InvoiceDescription, KIND, LightningInput, LightningInputV0, LightningOutput,
+    LightningOutputV0, LightningVolume, LightningVolumeStats, OutgoingWitness,
 };
 use fedimint_lnv2_server::LightningInit;
 use fedimint_logging::LOG_TEST;
@@ -393,6 +399,188 @@ async fn claiming_outgoing_contract_triggers_success() -> anyhow::Result<()> {
         update.status,
         SendPaymentStatus::Success(MOCK_INVOICE_PREIMAGE)
     );
+
+    Ok(())
+}
+
+/// Read the lnv2 volume every peer agrees on.
+async fn volume_stats(client: &ClientHandleArc) -> anyhow::Result<LightningVolumeStats> {
+    let lnv2_module_id = client
+        .get_first_instance(&LightningClientModule::kind())
+        .expect("the fixture federation runs lnv2");
+
+    Ok(client
+        .api()
+        .with_module(lnv2_module_id)
+        .request_current_consensus(
+            VOLUME_STATS_ENDPOINT.to_string(),
+            ApiRequestErased::default(),
+        )
+        .await?)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn volume_stats_count_only_settled_payments() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_degraded().await;
+    let sender = fed.new_client().await;
+    let recipient = fed.new_client().await;
+
+    // Until the first session completes, the consensus unix time is zero and
+    // settled payments would land on day zero, outside every window.
+    while sender.api().session_count().await? < 1 {
+        fedimint_core::task::sleep_in_test(
+            "waiting for the consensus clock",
+            Duration::from_millis(100),
+        )
+        .await;
+    }
+
+    sender
+        .get_first_module::<DummyClientModule>()?
+        .mock_receive(sats(100_000), AmountUnit::BITCOIN)
+        .await?;
+
+    let lnv2_module_id = sender
+        .get_first_instance(&LightningClientModule::kind())
+        .expect("the fixture federation runs lnv2");
+
+    // A send the gateway fails is refunded, so it must not count.
+    let refunded = sender
+        .get_first_module::<LightningClientModule>()?
+        .send(
+            mock::unpayable_invoice(),
+            Some(mock::gateway()),
+            Value::Null,
+        )
+        .await?;
+
+    let mut sub = sender
+        .get_first_module::<LightningClientModule>()?
+        .subscribe_send_operation_state_updates(refunded)
+        .await?
+        .into_stream();
+
+    assert_eq!(sub.ok().await?, SendOperationState::Funding);
+    assert_eq!(sub.ok().await?, SendOperationState::Funded);
+    assert_eq!(sub.ok().await?, SendOperationState::Refunding);
+    assert_eq!(sub.ok().await?, SendOperationState::Refunded);
+
+    // A send the gateway claims counts as sent, at its contract amount.
+    let claimed = sender
+        .get_first_module::<LightningClientModule>()?
+        .send(mock::crash_invoice(), Some(mock::gateway()), Value::Null)
+        .await?;
+
+    let mut sub = sender
+        .get_first_module::<LightningClientModule>()?
+        .subscribe_send_operation_state_updates(claimed)
+        .await?
+        .into_stream();
+
+    assert_eq!(sub.ok().await?, SendOperationState::Funding);
+    assert_eq!(sub.ok().await?, SendOperationState::Funded);
+
+    let (outgoing, txid) = match sender
+        .operation_log()
+        .get_operation(claimed)
+        .await
+        .ok_or(anyhow::anyhow!("Operation not found"))?
+        .meta::<LightningOperationMeta>()
+    {
+        LightningOperationMeta::Send(meta) => (meta.contract, meta.change_outpoint_range.txid),
+        _ => panic!("Operation Meta is not a Send variant"),
+    };
+
+    sender
+        .finalize_and_submit_transaction(
+            OperationId::new_random(),
+            "Claiming Outgoing Contract",
+            |_| (),
+            TransactionBuilder::new().with_inputs(
+                ClientInputBundle::new_no_sm(vec![ClientInput::<LightningInput> {
+                    input: LightningInput::V0(LightningInputV0::Outgoing(
+                        OutPoint { txid, out_idx: 0 },
+                        OutgoingWitness::Claim(MOCK_INVOICE_PREIMAGE),
+                    )),
+                    amounts: Amounts::new_bitcoin(outgoing.amount),
+                    keys: vec![mock::gateway_keypair()],
+                }])
+                .into_dyn(lnv2_module_id),
+            ),
+        )
+        .await
+        .expect("Failed to claim outgoing contract");
+
+    assert_eq!(
+        sub.ok().await?,
+        SendOperationState::Success(MOCK_INVOICE_PREIMAGE)
+    );
+
+    // A receive counts once its recipient claims the incoming contract. The
+    // sender stands in for the gateway and funds the contract.
+    let receive = recipient
+        .get_first_module::<LightningClientModule>()?
+        .receive(
+            Amount::from_sats(3_000),
+            3600,
+            Bolt11InvoiceDescription::Direct(String::new()),
+            Some(mock::gateway()),
+            Value::Null,
+        )
+        .await?
+        .1;
+
+    let incoming = match recipient
+        .operation_log()
+        .get_operation(receive)
+        .await
+        .ok_or(anyhow::anyhow!("Operation not found"))?
+        .meta::<LightningOperationMeta>()
+    {
+        LightningOperationMeta::Receive(meta) => meta.contract,
+        _ => panic!("Operation Meta is not a Receive variant"),
+    };
+
+    sender
+        .finalize_and_submit_transaction(
+            OperationId::new_random(),
+            "Funding Incoming Contract",
+            |_| (),
+            TransactionBuilder::new().with_outputs(
+                ClientOutputBundle::new_no_sm(vec![ClientOutput::<LightningOutput> {
+                    output: LightningOutput::V0(LightningOutputV0::Incoming(incoming.clone())),
+                    amounts: Amounts::new_bitcoin(incoming.commitment.amount),
+                }])
+                .into_dyn(lnv2_module_id),
+            ),
+        )
+        .await
+        .expect("Failed to fund incoming contract");
+
+    let mut sub = recipient
+        .get_first_module::<LightningClientModule>()?
+        .subscribe_receive_operation_state_updates(receive)
+        .await?
+        .into_stream();
+
+    assert_eq!(sub.ok().await?, ReceiveOperationState::Pending);
+    assert_eq!(sub.ok().await?, ReceiveOperationState::Claiming);
+    assert_eq!(sub.ok().await?, ReceiveOperationState::Claimed);
+
+    // Counting the refunded send, or the receive before its claim, would
+    // change these totals.
+    let expected = LightningVolume {
+        received: incoming.commitment.amount,
+        sent: outgoing.amount,
+        // The federation formed with the counting code, so both windows are
+        // covered from the start.
+        complete: true,
+    };
+
+    let stats = volume_stats(&sender).await?;
+    assert_eq!(stats.last_7_days, expected);
+    assert_eq!(stats.last_30_days, expected);
 
     Ok(())
 }
@@ -790,6 +978,11 @@ mod db {
                         // the v0 snapshot holds no rows under them, so there
                         // is nothing to validate. Seeding them would widen
                         // decode coverage for the next migration.
+                    }
+                    DbKeyPrefix::VolumeDay | DbKeyPrefix::VolumeStart => {
+                        // Written only by consensus processing in versions
+                        // that count volume, which never back-fill, so the v0
+                        // snapshot holds no rows under them.
                     }
                 }
             }
