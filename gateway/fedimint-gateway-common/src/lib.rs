@@ -254,6 +254,12 @@ pub struct ReceiveEcashResponse {
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct GatewayBalances {
     pub onchain_balance_sats: u64,
+    /// The part of `onchain_balance_sats` that the gateway can send on-chain
+    /// now. The fee of a send also comes out of it, so it is not the largest
+    /// amount a recipient can receive. `None` from gateways that do not
+    /// report it.
+    #[serde(default)]
+    pub spendable_onchain_balance_sats: Option<u64>,
     pub lightning_balance_msats: u64,
     pub ecash_balances: Vec<FederationBalanceInfo>,
     pub inbound_lightning_liquidity_msats: u64,
@@ -851,5 +857,27 @@ mod tests {
         let request: ConnectPeerRequest =
             serde_json::from_str(&json).expect("can deserialize request");
         assert_eq!(request.node_address.host_with_port(), "127.0.0.1:9735");
+    }
+
+    #[test]
+    fn gateway_balances_spendable_onchain_is_optional() {
+        let older: GatewayBalances = serde_json::from_value(serde_json::json!({
+            "onchain_balance_sats": 100_000,
+            "lightning_balance_msats": 0,
+            "ecash_balances": [],
+            "inbound_lightning_liquidity_msats": 0,
+        }))
+        .expect("balances without the spendable field");
+        assert_eq!(older.spendable_onchain_balance_sats, None);
+
+        let current: GatewayBalances = serde_json::from_value(serde_json::json!({
+            "onchain_balance_sats": 100_000,
+            "spendable_onchain_balance_sats": 40_000,
+            "lightning_balance_msats": 0,
+            "ecash_balances": [],
+            "inbound_lightning_liquidity_msats": 0,
+        }))
+        .expect("balances with the spendable field");
+        assert_eq!(current.spendable_onchain_balance_sats, Some(40_000));
     }
 }
