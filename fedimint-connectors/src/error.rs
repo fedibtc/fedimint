@@ -70,6 +70,33 @@ pub enum ServerError {
 }
 
 impl ServerError {
+    /// A fixed code for what failed, safe to share: never the error text,
+    /// which can carry peer addresses and URLs.
+    pub fn failure_kind(&self) -> &'static str {
+        match self {
+            ServerError::Connection(error) => crate::iroh::connection_failure_kind(error),
+            ServerError::Transport(error)
+                if error
+                    .downcast_ref::<crate::iroh::RequestTimedOut>()
+                    .is_some() =>
+            {
+                "request_timeout"
+            }
+            ServerError::Transport(_) => "transport",
+            ServerError::ResponseDeserialization(_) | ServerError::InvalidResponse(_) => {
+                "invalid_response"
+            }
+            ServerError::ServerError(_)
+            | ServerError::InvalidRequest(_)
+            | ServerError::InvalidRpcId(_)
+            | ServerError::ConditionFailed(_) => "rejected",
+            ServerError::InvalidPeerId { .. }
+            | ServerError::InvalidPeerUrl { .. }
+            | ServerError::InvalidEndpoint(_)
+            | ServerError::InternalClientError(_) => "client",
+        }
+    }
+
     pub fn is_unusual(&self) -> bool {
         match self {
             ServerError::ResponseDeserialization(_)
@@ -99,5 +126,53 @@ impl ServerError {
         if unusual {
             warn!(target: LOG_CLIENT_NET_API, error = %self,%context, %peer_id, "Unusual ServerError");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::iroh::RequestTimedOut;
+
+    /// The kinds name the path that failed from typed sources, and from the
+    /// stable endpoint's own missing-address error, without passing any
+    /// error text on.
+    #[test]
+    fn failures_are_classified_by_their_typed_source() {
+        let timed_out = ServerError::Transport(
+            RequestTimedOut {
+                method: "await_signed_session_outcome".to_owned(),
+                timeout: Duration::from_secs(3600),
+            }
+            .into(),
+        );
+        assert_eq!(timed_out.failure_kind(), "request_timeout");
+        assert_eq!(
+            ServerError::Transport(anyhow::anyhow!("stream reset")).failure_kind(),
+            "transport"
+        );
+        let handshake = ServerError::Connection(
+            anyhow::Error::new(iroh::endpoint::ConnectionError::TimedOut)
+                .context("failed connecting to remote endpoint"),
+        );
+        assert_eq!(handshake.failure_kind(), "connect_timeout");
+        let no_address = ServerError::Connection(anyhow::anyhow!(
+            "No addressing information for NodeId(abc), unable to connect"
+        ));
+        assert_eq!(no_address.failure_kind(), "no_address");
+        assert_eq!(
+            ServerError::Connection(anyhow::anyhow!("refused")).failure_kind(),
+            "connect_failed"
+        );
+        assert_eq!(
+            ServerError::InvalidResponse(anyhow::anyhow!("bad")).failure_kind(),
+            "invalid_response"
+        );
+        assert_eq!(
+            ServerError::ServerError(anyhow::anyhow!("no")).failure_kind(),
+            "rejected"
+        );
     }
 }

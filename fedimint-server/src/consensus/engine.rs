@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aleph_bft::Keychain as KeychainTrait;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail};
 use async_channel::Receiver;
 use fedimint_api_client::api::{DynGlobalApi, FederationApiExt, ServerError};
 use fedimint_api_client::query::FilterMap;
@@ -50,6 +50,7 @@ use crate::consensus::db::{
     SignedSessionOutcomeKey, SignedSessionOutcomePrefix,
 };
 use crate::consensus::debug::{DebugConsensusItem, DebugConsensusItemCompact};
+use crate::consensus::outcome_download::ObservedFederationApi;
 use crate::consensus::peer_availability::PeerActivity;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
 use crate::metrics::{
@@ -85,6 +86,25 @@ pub struct ScheduledShutdown {
     pub session: u64,
     pub request: ShutdownRequest,
 }
+
+/// The consensus loop gave up on a session that did not complete within the
+/// session timeout, so the process exits for its supervisor to restart it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTimedOut {
+    pub session_index: u64,
+}
+
+impl std::fmt::Display for SessionTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Consensus session {} timed out, exiting...",
+            self.session_index
+        )
+    }
+}
+
+impl std::error::Error for SessionTimedOut {}
 
 /// Why the consensus loop returned without an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,12 +247,21 @@ impl ConsensusEngine {
             // has been observed to resolve stuck sessions. Since AlephBFT
             // persists its units to the database this is equivalent to a crash
             // and therefore safe.
-            let session = tokio::time::timeout(
+            let Ok(session) = tokio::time::timeout(
                 self.session_timeout,
                 self.run_session(self.connections.clone(), session_index),
             )
             .await
-            .context("Consensus session timed out, exiting...")?;
+            else {
+                warn!(
+                    target: LOG_CONSENSUS,
+                    safe_to_share = true,
+                    session_index,
+                    timeout_secs = self.session_timeout.as_secs(),
+                    "Consensus session timed out"
+                );
+                return Err(SessionTimedOut { session_index }.into());
+            };
 
             if session.is_none() {
                 return Ok(ConsensusStop::TaskShutdown);
@@ -1225,7 +1254,8 @@ impl ConsensusEngine {
             }
         };
 
-        federation_api
+        // Each failed request is counted for a rate-limited shareable event.
+        ObservedFederationApi::new(federation_api.clone(), index)
             .request_with_strategy_retry(
                 FilterMap::new(filter_map.clone()),
                 AWAIT_SIGNED_SESSION_OUTCOME_ENDPOINT.to_string(),
@@ -1264,7 +1294,7 @@ pub async fn get_finished_session_count_static(dbtx: &mut DatabaseTransaction<'_
 
 #[cfg(test)]
 mod tests {
-    use super::{ScheduledShutdown, ShutdownRequest, due_shutdown};
+    use super::{ScheduledShutdown, SessionTimedOut, ShutdownRequest, due_shutdown};
 
     #[test]
     fn shutdown_takes_effect_at_the_first_boundary_at_or_after_its_session() {
@@ -1279,5 +1309,22 @@ mod tests {
         assert_eq!(due_shutdown(at(5), 5), Some(ShutdownRequest::AtSession));
         // Scheduled while session 5 was completing: the next boundary.
         assert_eq!(due_shutdown(at(5), 6), Some(ShutdownRequest::AtSession));
+    }
+
+    /// fedimintd names the exit reason by downcasting the error the
+    /// consensus loop returns, which callers may have wrapped in context.
+    #[test]
+    fn a_session_timeout_is_recognized_through_added_context() {
+        let error: anyhow::Error = SessionTimedOut { session_index: 7 }.into();
+        let wrapped = error.context("running consensus").context("server main");
+        assert_eq!(
+            wrapped.downcast_ref::<SessionTimedOut>(),
+            Some(&SessionTimedOut { session_index: 7 })
+        );
+        assert!(
+            anyhow::anyhow!("other failure")
+                .downcast_ref::<SessionTimedOut>()
+                .is_none()
+        );
     }
 }

@@ -42,7 +42,7 @@ use fedimint_server::config::driven::FM_DKG_CTRL_ENV;
 use fedimint_server::config::io::{DB_FILE, PLAINTEXT_PASSWORD};
 use fedimint_server::core::ServerModuleInitRegistry;
 use fedimint_server::net::api::ApiSecrets;
-use fedimint_server::{ConsensusStop, IrohNextApiSettings, ShutdownRequest};
+use fedimint_server::{ConsensusStop, IrohNextApiSettings, SessionTimedOut, ShutdownRequest};
 use fedimint_server_bitcoin_rpc::BitcoindClientWithFallback;
 use fedimint_server_bitcoin_rpc::bitcoind::BitcoindClient;
 use fedimint_server_bitcoin_rpc::esplora::EsploraClient;
@@ -680,11 +680,17 @@ async fn run_inner(
                 error = format_args!("{err:#}"),
                 "fedimintd main task failed"
             );
+            let reason = if err.downcast_ref::<SessionTimedOut>().is_some() {
+                "session_timeout"
+            } else {
+                "other"
+            };
             error!(
                 target: LOG_SERVER,
                 safe_to_share = true,
                 stage = "server_main",
                 failure_kind = "fatal",
+                reason,
                 "fedimintd main task failed"
             );
             panic!("fedimintd main task failed");

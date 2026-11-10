@@ -54,6 +54,50 @@ const IROH_REQUEST_TIMEOUT_LONG_POLL: Duration = Duration::from_secs(60 * 60);
 const IROH_REQUEST_TIMEOUT_ERROR_CODE: u32 = 1;
 const IROH_REQUEST_TIMEOUT_ERROR_REASON: &[u8] = b"request timeout";
 
+/// An iroh API request that outlived its budget. A typed source, so that
+/// [`ServerError::failure_kind`] can name it without reading error text.
+#[derive(Debug, thiserror::Error)]
+#[error("iroh request {method} timed out after {timeout:?}")]
+pub(crate) struct RequestTimedOut {
+    pub(crate) method: String,
+    pub(crate) timeout: Duration,
+}
+
+/// The fixed failure kind of an iroh connection error: whether no address
+/// was known for the peer, the handshake timed out, or it failed otherwise.
+pub(crate) fn connection_failure_kind(error: &anyhow::Error) -> &'static str {
+    use iroh_next::endpoint::{ConnectError, ConnectWithOptsError, ConnectionError};
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<ConnectError>() {
+            return match error {
+                ConnectError::Connect {
+                    source: ConnectWithOptsError::NoAddress { .. },
+                    ..
+                } => "no_address",
+                ConnectError::Connection {
+                    source: ConnectionError::TimedOut,
+                    ..
+                } => "connect_timeout",
+                _ => "connect_failed",
+            };
+        }
+        if let Some(iroh::endpoint::ConnectionError::TimedOut) =
+            cause.downcast_ref::<iroh::endpoint::ConnectionError>()
+        {
+            return "connect_timeout";
+        }
+    }
+    // The stable endpoint reports a missing address only as text; the text
+    // selects a fixed code and is never passed on.
+    if error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("No addressing information"))
+    {
+        return "no_address";
+    }
+    "connect_failed"
+}
+
 /// Request timeout strategy: long-poll endpoints (`await_*` / `wait_*`)
 /// get the long bound, everything else gets the default. The string match
 /// is a heuristic; it covers all currently-defined fedimint long-poll
@@ -806,9 +850,13 @@ impl IGuardianConnection for Connection {
                     iroh::endpoint::VarInt::from_u32(IROH_REQUEST_TIMEOUT_ERROR_CODE),
                     IROH_REQUEST_TIMEOUT_ERROR_REASON,
                 );
-                return Err(ServerError::Transport(anyhow::anyhow!(
-                    "iroh request {method_str} timed out after {timeout:?}"
-                )));
+                return Err(ServerError::Transport(
+                    RequestTimedOut {
+                        method: method_str,
+                        timeout,
+                    }
+                    .into(),
+                ));
             }
         };
 
@@ -873,9 +921,13 @@ impl IGuardianConnection for iroh_next::endpoint::Connection {
                     iroh_next::endpoint::VarInt::from_u32(IROH_REQUEST_TIMEOUT_ERROR_CODE),
                     IROH_REQUEST_TIMEOUT_ERROR_REASON,
                 );
-                return Err(ServerError::Transport(anyhow::anyhow!(
-                    "iroh request {method_str} timed out after {timeout:?}"
-                )));
+                return Err(ServerError::Transport(
+                    RequestTimedOut {
+                        method: method_str,
+                        timeout,
+                    }
+                    .into(),
+                ));
             }
         };
 
