@@ -3278,6 +3278,7 @@ dependencies = [
 name = "fedimint-connectors"
 version = "0.13.0"
 dependencies = [
+ "anyhow",
  "arti-client",
  "async-trait",
  "aws-lc-sys 0.41.0",

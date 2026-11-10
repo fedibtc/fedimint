@@ -4,6 +4,7 @@ pub mod db;
 pub mod debug;
 pub mod engine;
 mod iroh_api;
+mod outcome_download;
 pub mod peer_availability;
 mod session_cache;
 pub mod transaction;

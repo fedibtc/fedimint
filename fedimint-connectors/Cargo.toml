@@ -68,6 +68,7 @@ webpki-roots = { workspace = true }
 jsonrpsee-wasm-client = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

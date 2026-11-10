@@ -53,10 +53,12 @@ impl aleph_bft::BackupReader for BackupReader {
         }
 
         if stored != 0 {
+            // Counts of stored and of distinct units only; never unit contents.
             info!(
                 target: LOG_CONSENSUS,
-                units_len = %stored,
-                unique_units_len = %loaded.len(),
+                safe_to_share = true,
+                units_len = stored,
+                unique_units_len = loaded.len(),
                 "Recovering from an in-session-shutdown"
             );
         }
