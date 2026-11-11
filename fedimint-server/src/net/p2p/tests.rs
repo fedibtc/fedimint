@@ -21,7 +21,7 @@ use crate::metrics::{
 };
 use crate::net::p2p_connection::{
     DynConnectionStatusUpdates, DynIP2PFrame, DynP2PConnection, IP2PConnection, IP2PFrame,
-    P2PCongestionStats, P2PTransportStats,
+    P2PPathKey, P2PTransportStats,
 };
 use crate::net::p2p_connector::{DynP2PConnector, IP2PConnector};
 
@@ -89,9 +89,9 @@ impl FakeConnectionControl {
         self.disconnect.notify_one();
     }
 
-    fn set_transport(&self, transport: P2PTransportStats, rtt: Duration) {
+    fn set_transport(&self, transport: P2PTransportStats, rtt: Option<Duration>) {
         *self.transport.lock().expect("transport mutex poisoned") = Some(transport);
-        *self.rtt.lock().expect("rtt mutex poisoned") = Some(rtt);
+        *self.rtt.lock().expect("rtt mutex poisoned") = rtt;
     }
 
     fn subscriptions(&self) -> usize {
@@ -125,11 +125,11 @@ impl IP2PConnection<u64> for FakeConnection {
     }
 
     fn transport_stats(&self) -> Option<P2PTransportStats> {
-        *self
-            .control
+        self.control
             .transport
             .lock()
             .expect("transport mutex poisoned")
+            .clone()
     }
 
     fn connection_type(&self) -> Option<ConnectionType> {
@@ -374,24 +374,27 @@ fn transport(
     sent_bytes: u64,
     received_bytes: u64,
     lost_packets: u64,
-    events: u64,
-    window_bytes: u64,
+    congestion_events: &[(P2PPathKey, u64)],
+    congestion_window_bytes: Option<u64>,
 ) -> P2PTransportStats {
     P2PTransportStats {
         sent_bytes,
         received_bytes,
         lost_packets,
-        congestion: Some(P2PCongestionStats {
-            events,
-            window_bytes,
-        }),
+        congestion_events: congestion_events.iter().copied().collect(),
+        congestion_window_bytes,
     }
 }
 
+fn path(id: u32) -> P2PPathKey {
+    P2PPathKey::IrohV1(iroh_next::endpoint::PathId::from(id))
+}
+
 #[tokio::test(start_paused = true)]
-async fn transport_metrics_accumulate_across_connections_and_path_restarts() {
+async fn transport_metrics_accumulate_across_connections_and_paths() {
+    let rtt = Some(Duration::from_millis(40));
     let first = FakeConnectionControl::new(ConnectionType::Direct);
-    first.set_transport(transport(1000, 300, 2, 3, 5000), Duration::from_millis(40));
+    first.set_transport(transport(1000, 300, 2, &[(path(0), 10)], Some(5000)), rtt);
     let mut harness = StatusMachineHarness::spawn_for_peer(
         FakeConnection::new(first.clone()),
         None,
@@ -407,7 +410,7 @@ async fn transport_metrics_accumulate_across_connections_and_path_restarts() {
         sent_bytes: 1000,
         received_bytes: 300,
         lost_packets: 2,
-        congestion_events: 3,
+        congestion_events: 10,
         congestion_window_bytes: Some(5000),
         rtt_seconds: Some(0.04),
     })
@@ -415,21 +418,53 @@ async fn transport_metrics_accumulate_across_connections_and_path_restarts() {
     runtime::sleep(Duration::from_mins(1)).await;
     assert_eq!(transport_metrics().sent_bytes, 1000);
 
-    // A new selected path restarts the congestion event count at 1. The
-    // replacement connection starts its own counters.
-    first.set_transport(transport(1500, 300, 2, 1, 4000), Duration::from_millis(40));
+    // The connection migrates to a path that has already counted more
+    // events than the old one. All of the new path's events count.
+    first.set_transport(
+        transport(1500, 300, 2, &[(path(0), 10), (path(1), 15)], Some(4000)),
+        rtt,
+    );
+    wait_for_transport_metrics(TransportMetrics {
+        sent_bytes: 1500,
+        received_bytes: 300,
+        lost_packets: 2,
+        congestion_events: 10 + 15,
+        congestion_window_bytes: Some(4000),
+        rtt_seconds: Some(0.04),
+    })
+    .await;
+
+    // The old path closes. With no selected path and no RTT estimate, the
+    // gauges show nothing rather than stale values.
+    first.set_transport(transport(1600, 300, 2, &[(path(1), 16)], None), None);
+    wait_for_transport_metrics(TransportMetrics {
+        sent_bytes: 1600,
+        received_bytes: 300,
+        lost_packets: 2,
+        congestion_events: 10 + 16,
+        congestion_window_bytes: None,
+        rtt_seconds: None,
+    })
+    .await;
+
+    // The replacement connection starts its own counters. Counts of the
+    // replaced connection since the last refresh are recorded first.
+    first.set_transport(transport(1700, 310, 3, &[(path(1), 17)], None), None);
     let second = FakeConnectionControl::new(ConnectionType::Direct);
-    second.set_transport(transport(1800, 50, 0, 0, 9000), Duration::from_millis(90));
+    second.set_transport(
+        transport(1800, 50, 0, &[(P2PPathKey::Single, 0)], Some(9000)),
+        Some(Duration::from_millis(90)),
+    );
     harness
         .connection_sender
         .send(Arc::new(FakeConnection::new(second.clone())))
         .await
         .expect("state machine accepts replacement");
     wait_for_transport_metrics(TransportMetrics {
-        sent_bytes: 1500 + 1800,
-        received_bytes: 300 + 50,
-        lost_packets: 2,
-        congestion_events: 3 + 1,
+        sent_bytes: 1700 + 1800,
+        received_bytes: 310 + 50,
+        lost_packets: 3,
+        congestion_events: 10 + 17,
         congestion_window_bytes: Some(9000),
         rtt_seconds: Some(0.09),
     })
@@ -437,16 +472,19 @@ async fn transport_metrics_accumulate_across_connections_and_path_restarts() {
 
     // Counters added after the last refresh are recorded on disconnect, and
     // the peer has no current RTT or window afterwards.
-    second.set_transport(transport(2000, 60, 1, 2, 9000), Duration::from_millis(90));
+    second.set_transport(
+        transport(2000, 60, 1, &[(P2PPathKey::Single, 2)], Some(9000)),
+        Some(Duration::from_millis(90)),
+    );
     second.disconnect();
     harness.wait_for_status(ExpectedStatus::Disconnected).await;
     assert_eq!(
         transport_metrics(),
         TransportMetrics {
-            sent_bytes: 1500 + 2000,
-            received_bytes: 300 + 60,
-            lost_packets: 2 + 1,
-            congestion_events: 3 + 1 + 2,
+            sent_bytes: 1700 + 2000,
+            received_bytes: 310 + 60,
+            lost_packets: 3 + 1,
+            congestion_events: 10 + 17 + 2,
             congestion_window_bytes: None,
             rtt_seconds: None,
         }
