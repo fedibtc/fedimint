@@ -27,8 +27,12 @@ use tokio::sync::{Notify, watch};
 use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{Instrument, debug, info, info_span, warn};
 
-use crate::metrics::{PEER_CONNECT_COUNT, PEER_DISCONNECT_COUNT, PEER_MESSAGES_COUNT};
-use crate::net::p2p_connection::{DynConnectionStatusUpdates, DynP2PConnection};
+use crate::metrics::{
+    PEER_CONNECT_COUNT, PEER_DISCONNECT_COUNT, PEER_MESSAGES_COUNT, PEER_TRANSPORT_BYTES,
+    PEER_TRANSPORT_CONGESTION_EVENTS, PEER_TRANSPORT_CONGESTION_WINDOW_BYTES,
+    PEER_TRANSPORT_LOST_PACKETS, PEER_TRANSPORT_RTT_SECONDS,
+};
+use crate::net::p2p_connection::{DynConnectionStatusUpdates, DynP2PConnection, P2PTransportStats};
 use crate::net::p2p_connector::DynP2PConnector;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -285,6 +289,13 @@ const RECEIVE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// means the peer no longer reads the connection.
 const SEND_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// How much a transport counter grew since it was recorded. A counter below
+/// its recorded value restarted, for example on a new path, so all of it is
+/// new.
+fn counter_increase(current: u64, recorded: u64) -> u64 {
+    current.checked_sub(recorded).unwrap_or(current)
+}
+
 /// Why the send half of the connection stopped.
 enum SendHalt<M> {
     /// The state machine is shutting down.
@@ -378,9 +389,13 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
 
         tokio::pin!(send_loop, receive_loop);
 
+        // What this connection's counters were when last added to the metrics.
+        let mut recorded_transport = P2PTransportStats::default();
+
         loop {
             tokio::select! {
                 halt = &mut send_loop => {
+                    self.record_transport(&connection, &mut recorded_transport);
                     // A frame may be part way through `read_to_end`, which is not
                     // cancel-safe, so the receive half is stopped between frames
                     // rather than dropped here. Shutdown is the exception: nothing
@@ -408,6 +423,7 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                     };
                 },
                 halt = &mut receive_loop => {
+                    self.record_transport(&connection, &mut recorded_transport);
                     return Some(self.disconnect(match halt {
                         ReceiveHalt::Failed(e) => e,
                         ReceiveHalt::Stopped => anyhow!("Receive half stopped unprompted"),
@@ -427,6 +443,7 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                     // provide. Only `rtt` needs this; transport changes still
                     // arrive on the status update stream above.
                     self.refresh_status(&connection);
+                    self.record_transport(&connection, &mut recorded_transport);
                 },
             }
         }
@@ -541,6 +558,45 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
         });
     }
 
+    /// Adds the transport counters that `connection` accumulated since
+    /// `recorded` to the peer metrics, and publishes its current RTT and
+    /// congestion window.
+    fn record_transport(&self, connection: &DynP2PConnection<M>, recorded: &mut P2PTransportStats) {
+        let Some(current) = connection.transport_stats() else {
+            return;
+        };
+        let labels = [self.our_id_str.as_str(), self.peer_id_str.as_str()];
+        for (direction, current, recorded) in [
+            ("outgoing", current.sent_bytes, recorded.sent_bytes),
+            ("incoming", current.received_bytes, recorded.received_bytes),
+        ] {
+            PEER_TRANSPORT_BYTES
+                .with_label_values(&[labels[0], labels[1], direction])
+                .inc_by(counter_increase(current, recorded));
+        }
+        PEER_TRANSPORT_LOST_PACKETS
+            .with_label_values(&labels)
+            .inc_by(counter_increase(
+                current.lost_packets,
+                recorded.lost_packets,
+            ));
+        if let Some(congestion) = current.congestion {
+            let recorded_events = recorded.congestion.map_or(0, |recorded| recorded.events);
+            PEER_TRANSPORT_CONGESTION_EVENTS
+                .with_label_values(&labels)
+                .inc_by(counter_increase(congestion.events, recorded_events));
+            PEER_TRANSPORT_CONGESTION_WINDOW_BYTES
+                .with_label_values(&labels)
+                .set(i64::try_from(congestion.window_bytes).unwrap_or(i64::MAX));
+        }
+        if let Some(rtt) = connection.rtt() {
+            PEER_TRANSPORT_RTT_SECONDS
+                .with_label_values(&labels)
+                .set(rtt.as_secs_f64());
+        }
+        *recorded = current;
+    }
+
     fn disconnect(&self, error: anyhow::Error) -> P2PConnectionSMState<M> {
         let last_error = error.fmt_compact().to_string();
 
@@ -553,6 +609,10 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
         PEER_DISCONNECT_COUNT
             .with_label_values(&[&self.our_id_str, &self.peer_id_str])
             .inc();
+        // A disconnected peer has no current RTT or congestion window.
+        let labels = [self.our_id_str.as_str(), self.peer_id_str.as_str()];
+        let _ = PEER_TRANSPORT_CONGESTION_WINDOW_BYTES.remove_label_values(&labels);
+        let _ = PEER_TRANSPORT_RTT_SECONDS.remove_label_values(&labels);
 
         P2PConnectionSMState::Disconnected {
             backoff: api_networking_backoff(),

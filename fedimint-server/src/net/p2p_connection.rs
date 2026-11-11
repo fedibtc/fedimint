@@ -34,6 +34,25 @@ pub type DynIP2PFrame<M> = Box<dyn IP2PFrame<M>>;
 /// may have changed.
 pub type DynConnectionStatusUpdates = Pin<Box<dyn Stream<Item = ()> + Send + 'static>>;
 
+/// Transport counters of one live connection, cumulative since it was
+/// established, and its current congestion window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct P2PTransportStats {
+    pub sent_bytes: u64,
+    pub received_bytes: u64,
+    pub lost_packets: u64,
+    /// Congestion state of the selected path, if one is selected.
+    pub congestion: Option<P2PCongestionStats>,
+}
+
+/// Congestion state of the path that currently carries a connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct P2PCongestionStats {
+    /// Cumulative on this path. A path change can restart the count.
+    pub events: u64,
+    pub window_bytes: u64,
+}
+
 #[async_trait]
 pub trait IP2PFrame<M>: Send + 'static {
     /// Read the entire frame from the connection and deserialize it into a
@@ -73,6 +92,12 @@ pub trait IP2PConnection<M>: Send + Sync + 'static {
 
     /// Get the transport type currently backing this live connection.
     fn connection_type(&self) -> Option<ConnectionType> {
+        None
+    }
+
+    /// Get the transport counters of this live connection, if the transport
+    /// keeps them.
+    fn transport_stats(&self) -> Option<P2PTransportStats> {
         None
     }
 
@@ -228,6 +253,19 @@ where
     fn rtt(&self) -> Option<Duration> {
         Some(iroh::endpoint::Connection::rtt(self))
     }
+
+    fn transport_stats(&self) -> Option<P2PTransportStats> {
+        let stats = iroh::endpoint::Connection::stats(self);
+        Some(P2PTransportStats {
+            sent_bytes: stats.udp_tx.bytes,
+            received_bytes: stats.udp_rx.bytes,
+            lost_packets: stats.path.lost_packets,
+            congestion: Some(P2PCongestionStats {
+                events: stats.path.congestion_events,
+                window_bytes: stats.path.cwnd,
+            }),
+        })
+    }
 }
 
 /// Implementations of the P2P traits for Iroh 1.0.
@@ -276,6 +314,27 @@ where
             .iter()
             .find(iroh_next::endpoint::Path::is_selected)
             .and_then(|path| IrohV1Connection::rtt(self, path.id()))
+    }
+
+    fn transport_stats(&self) -> Option<P2PTransportStats> {
+        let stats = IrohV1Connection::stats(self);
+        let congestion = self
+            .paths()
+            .iter()
+            .find(iroh_next::endpoint::Path::is_selected)
+            .map(|path| {
+                let path = path.stats();
+                P2PCongestionStats {
+                    events: path.congestion_events,
+                    window_bytes: path.cwnd,
+                }
+            });
+        Some(P2PTransportStats {
+            sent_bytes: stats.udp_tx.bytes,
+            received_bytes: stats.udp_rx.bytes,
+            lost_packets: stats.lost_packets,
+            congestion,
+        })
     }
 
     fn connection_type(&self) -> Option<ConnectionType> {

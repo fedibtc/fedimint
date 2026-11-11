@@ -10,9 +10,10 @@ use fedimint_core::backup::ClientBackupKeyPrefix;
 use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped};
 use fedimint_core::task::{TaskGroup, sleep};
 use fedimint_metrics::prometheus::{
-    HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
-    register_histogram_vec_with_registry, register_int_counter_with_registry,
-    register_int_gauge_vec_with_registry, register_int_gauge_with_registry,
+    GaugeVec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    register_gauge_vec_with_registry, register_histogram_vec_with_registry,
+    register_int_counter_with_registry, register_int_gauge_vec_with_registry,
+    register_int_gauge_with_registry,
 };
 use fedimint_metrics::{
     Histogram, REGISTRY, histogram_opts, opts, register_histogram_with_registry,
@@ -271,6 +272,64 @@ pub(crate) static PEER_MESSAGES_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|
     register_int_counter_vec_with_registry!(
         opts!("peer_messages_total", "Messages with the peer",),
         &["self_id", "peer_id", "direction"],
+        REGISTRY
+    )
+    .unwrap()
+});
+
+/// UDP payload bytes of the transport connection to the peer, by direction.
+pub(crate) static PEER_TRANSPORT_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        opts!(
+            "peer_transport_bytes_total",
+            "UDP bytes on the connection to the peer",
+        ),
+        &["self_id", "peer_id", "direction"],
+        REGISTRY
+    )
+    .unwrap()
+});
+pub(crate) static PEER_TRANSPORT_LOST_PACKETS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        opts!(
+            "peer_transport_lost_packets_total",
+            "Packets sent to the peer that the transport declared lost",
+        ),
+        &["self_id", "peer_id"],
+        REGISTRY
+    )
+    .unwrap()
+});
+pub(crate) static PEER_TRANSPORT_CONGESTION_EVENTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        opts!(
+            "peer_transport_congestion_events_total",
+            "Congestion events on the selected path to the peer",
+        ),
+        &["self_id", "peer_id"],
+        REGISTRY
+    )
+    .unwrap()
+});
+pub(crate) static PEER_TRANSPORT_CONGESTION_WINDOW_BYTES: LazyLock<IntGaugeVec> =
+    LazyLock::new(|| {
+        register_int_gauge_vec_with_registry!(
+            opts!(
+                "peer_transport_congestion_window_bytes",
+                "Congestion window of the selected path to a connected peer",
+            ),
+            &["self_id", "peer_id"],
+            REGISTRY
+        )
+        .unwrap()
+    });
+pub(crate) static PEER_TRANSPORT_RTT_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec_with_registry!(
+        opts!(
+            "peer_transport_rtt_seconds",
+            "Round-trip time estimate of the connection to a connected peer",
+        ),
+        &["self_id", "peer_id"],
         REGISTRY
     )
     .unwrap()
