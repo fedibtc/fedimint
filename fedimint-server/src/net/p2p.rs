@@ -291,13 +291,6 @@ const METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// means the peer no longer reads the connection.
 const SEND_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// How much a transport counter grew since it was recorded. A counter below
-/// its recorded value restarted, for example on a new path, so all of it is
-/// new.
-fn counter_increase(current: u64, recorded: u64) -> u64 {
-    current.checked_sub(recorded).unwrap_or(current)
-}
-
 /// Why the send half of the connection stopped.
 enum SendHalt<M> {
     /// The state machine is shutting down.
@@ -560,27 +553,38 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
         ] {
             PEER_TRANSPORT_BYTES
                 .with_label_values(&[labels[0], labels[1], direction])
-                .inc_by(counter_increase(current, recorded));
+                .inc_by(current.saturating_sub(recorded));
         }
         PEER_TRANSPORT_LOST_PACKETS
             .with_label_values(&labels)
-            .inc_by(counter_increase(
-                current.lost_packets,
-                recorded.lost_packets,
-            ));
-        if let Some(congestion) = current.congestion {
-            let recorded_events = recorded.congestion.map_or(0, |recorded| recorded.events);
-            PEER_TRANSPORT_CONGESTION_EVENTS
+            .inc_by(current.lost_packets.saturating_sub(recorded.lost_packets));
+        // Each path counts its own events, so a path the connection
+        // migrates to adds everything it counted since it was last recorded.
+        let congestion_events: u64 = current
+            .congestion_events
+            .iter()
+            .map(|(path, events)| {
+                events.saturating_sub(recorded.congestion_events.get(path).copied().unwrap_or(0))
+            })
+            .sum();
+        PEER_TRANSPORT_CONGESTION_EVENTS
+            .with_label_values(&labels)
+            .inc_by(congestion_events);
+        match current.congestion_window_bytes {
+            Some(window) => PEER_TRANSPORT_CONGESTION_WINDOW_BYTES
                 .with_label_values(&labels)
-                .inc_by(counter_increase(congestion.events, recorded_events));
-            PEER_TRANSPORT_CONGESTION_WINDOW_BYTES
-                .with_label_values(&labels)
-                .set(i64::try_from(congestion.window_bytes).unwrap_or(i64::MAX));
+                .set(i64::try_from(window).unwrap_or(i64::MAX)),
+            None => {
+                let _ = PEER_TRANSPORT_CONGESTION_WINDOW_BYTES.remove_label_values(&labels);
+            }
         }
-        if let Some(rtt) = connection.rtt() {
-            PEER_TRANSPORT_RTT_SECONDS
+        match connection.rtt() {
+            Some(rtt) => PEER_TRANSPORT_RTT_SECONDS
                 .with_label_values(&labels)
-                .set(rtt.as_secs_f64());
+                .set(rtt.as_secs_f64()),
+            None => {
+                let _ = PEER_TRANSPORT_RTT_SECONDS.remove_label_values(&labels);
+            }
         }
         *recorded = current;
     }
