@@ -342,7 +342,7 @@ impl ServerOpts {
 ///   different vendors, usually with a different set of modules. DKG requires
 ///   the same major and minor release and exact optional vendor identity, while
 ///   allowing patch and prerelease differences. The suffix must be non-empty
-///   valid SemVer build metadata.
+///   valid `SemVer` build metadata.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     module_init_registry: ServerModuleInitRegistry,
@@ -505,6 +505,10 @@ async fn run_inner(
         network: server_opts.bitcoin_network,
         available_modules: module_init_registry.kinds(),
         default_modules: module_init_registry.default_modules(),
+        available_module_params: fedimint_server::config::build_module_params_registry(
+            &module_init_registry,
+            &module_init_registry.kinds(),
+        ),
     };
 
     let driven_dkg = is_env_var_set(FM_DKG_CTRL_ENV);

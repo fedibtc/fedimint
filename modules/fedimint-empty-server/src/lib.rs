@@ -81,6 +81,7 @@ impl ModuleInit for EmptyInit {
 #[async_trait]
 impl ServerModuleInit for EmptyInit {
     type Module = Empty;
+    type Params = ();
 
     /// Returns the version of this module
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
@@ -97,6 +98,7 @@ impl ServerModuleInit for EmptyInit {
         &self,
         peers: &[PeerId],
         _args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         // Generate a config for each peer
         peers
@@ -116,6 +118,7 @@ impl ServerModuleInit for EmptyInit {
         &self,
         _peers: &(dyn PeerHandleOps + Send + Sync),
         _args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
         Ok(EmptyConfig {
             private: EmptyConfigPrivate,

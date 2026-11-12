@@ -216,6 +216,7 @@ impl ModuleInit for LightningInit {
 #[apply(async_trait_maybe_send!)]
 impl ServerModuleInit for LightningInit {
     type Module = Lightning;
+    type Params = ();
 
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
         &[MODULE_CONSENSUS_VERSION]
@@ -256,6 +257,7 @@ impl ServerModuleInit for LightningInit {
         &self,
         peers: &[PeerId],
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> BTreeMap<PeerId, ServerModuleConfig> {
         let sks = threshold_crypto::SecretKeySet::random(peers.to_num_peers().degree(), &mut OsRng);
         let pks = sks.public_keys();
@@ -287,6 +289,7 @@ impl ServerModuleInit for LightningInit {
         &self,
         peers: &(dyn PeerHandleOps + Send + Sync),
         args: &ConfigGenModuleArgs,
+        _params: &Self::Params,
     ) -> anyhow::Result<ServerModuleConfig> {
         let (polynomial, mut sks) = peers.run_dkg_g1().await?;
 
@@ -1750,7 +1753,7 @@ mod tests {
             network: Network::Regtest,
             disable_base_fees: false,
         };
-        let server_cfg = ServerModuleInit::trusted_dealer_gen(&LightningInit, &peers, &args);
+        let server_cfg = ServerModuleInit::trusted_dealer_gen(&LightningInit, &peers, &args, &());
 
         let client_cfg = ServerModuleInit::get_client_config(
             &LightningInit,

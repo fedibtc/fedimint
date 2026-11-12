@@ -75,6 +75,8 @@ url = { workspace = true }
 z32 = { workspace = true }
 
 [dev-dependencies]
+fedimint-mint-common = { workspace = true }
+fedimint-mint-server = { workspace = true }
 tempfile = { workspace = true }
 test-log = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

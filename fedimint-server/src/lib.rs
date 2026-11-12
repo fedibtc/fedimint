@@ -471,7 +471,7 @@ pub async fn run_driven(
     iroh_p2p_relays: Vec<SafeUrl>,
     iroh_next_api_settings: Option<IrohNextApiSettings>,
 ) -> anyhow::Result<ConsensusStop> {
-    let mut control = inherited_control_socket().await?;
+    let mut control = inherited_control_socket()?;
 
     let existing_config = if data_dir.exists() {
         match get_config_if_present_strict(&data_dir) {
@@ -753,7 +753,7 @@ fn bounded_reason(reason: &str) -> String {
 }
 
 #[cfg(unix)]
-async fn inherited_control_socket() -> anyhow::Result<tokio::net::UnixStream> {
+fn inherited_control_socket() -> anyhow::Result<tokio::net::UnixStream> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
     anyhow::ensure!(

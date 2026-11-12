@@ -485,7 +485,7 @@ impl ConsensusApi {
     /// Unlike `shutdown`, the resulting stop is reported as
     /// [`ShutdownRequest::AfterCurrentSession`], so the process running the
     /// server can tell it apart from a shutdown scheduled for a given session.
-    async fn shutdown_after_current_session(&self) {
+    fn shutdown_after_current_session(&self) {
         let current_session = self.session_count();
         self.shutdown_sender
             .send_if_modified(|scheduled| schedule_shutdown_after(scheduled, current_session));
@@ -1161,7 +1161,7 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             SHUTDOWN_AFTER_CURRENT_SESSION_ENDPOINT,
             ApiVersion::new(0, 10),
             async |fedimint: &ConsensusApi, context, _v: ()| -> () {
-                fedimint.shutdown_after_current_session().await;
+                fedimint.shutdown_after_current_session();
                 Ok(())
             }
         },

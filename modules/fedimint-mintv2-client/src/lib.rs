@@ -424,6 +424,7 @@ pub struct MintClientContext {
     tbs_agg_pks: BTreeMap<Denomination, AggregatePublicKey>,
     tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, tbs::PublicKeyShare>>,
     pub balance_update_sender: tokio::sync::watch::Sender<()>,
+    pub amount_unit: AmountUnit,
 }
 
 impl Context for MintClientContext {
@@ -444,6 +445,7 @@ impl ClientModule for MintClientModule {
             tbs_agg_pks: self.cfg.tbs_agg_pks.clone(),
             tbs_pks: self.cfg.tbs_pks.clone(),
             balance_update_sender: self.balance_update_sender.clone(),
+            amount_unit: self.cfg.amount_unit,
         }
     }
 
@@ -639,6 +641,10 @@ impl MintClientModule {
         denominations.sort();
 
         Ok((spendable_notes, denominations))
+    }
+
+    pub fn amount_unit(&self) -> AmountUnit {
+        self.cfg.amount_unit
     }
 
     async fn select_funding_input(
@@ -1086,6 +1092,13 @@ impl MintClientModule {
         } else {
             ECash::new(self.federation_id, notes)
         };
+        // Stamp the denomination unit on the notes themselves, HERE, so there
+        // is exactly one encoding of a given send: the string recorded in the
+        // operation meta, the one handed to the sender, and the one a
+        // recipient (or a cancel) decodes are byte-identical. Anything that
+        // derives identity from the encoded e-cash -- receive-side duplicate
+        // detection, reclaim matching -- depends on that.
+        let ecash = ecash.with_unit(self.cfg.amount_unit);
         let amount = ecash.amount();
         let operation_id = OperationId::new_random();
 

@@ -10,7 +10,7 @@ use fedimint_core::base32::{self, FEDIMINT_PREFIX};
 use fedimint_core::config::FederationId;
 use fedimint_core::core::OperationId;
 use fedimint_core::db::mem_impl::MemDatabase;
-use fedimint_core::module::Amounts;
+use fedimint_core::module::{AmountUnit, Amounts};
 use fedimint_core::secp256k1::{Keypair, SECP256K1};
 use fedimint_dummy_client::{DummyClientInit, DummyClientModule};
 use fedimint_dummy_server::DummyInit;
@@ -20,12 +20,19 @@ use fedimint_mintv2_client::{
     ReceiveECashError, ReceivePaymentEvent, ReceivePaymentStatus, ReceivePaymentUpdateEvent,
     SendECashError, SendPaymentEvent, SpendableNote,
 };
+use fedimint_mintv2_common::config::MintGenParams;
 use fedimint_mintv2_common::{Denomination, KIND};
 use fedimint_mintv2_server::MintInit;
 use fedimint_testing::federation::FederationTest;
 use fedimint_testing::fixtures::Fixtures;
 use futures::StreamExt;
 use serde_json::Value;
+
+/// The custom unit id the usdt module issues under
+/// (`fedimint_usdt_common::USDT_UNIT` in experimint). Duplicated here as a
+/// plain constant so this platform test of custom-unit mints does not pull
+/// the module crate in for one value.
+const USDT_UNIT: AmountUnit = AmountUnit::new_custom(1);
 
 #[derive(Debug, PartialEq, Eq)]
 enum MintEvent {
@@ -1047,4 +1054,65 @@ mod db {
         )
         .await
     }
+}
+/// Boots a federation with TWO mintv2 instances: the default
+/// Bitcoin-denominated one plus a second instance denominated in
+/// [`USDT_UNIT`] (`fedimint_usdt_common::USDT_UNIT`, the same constant a
+/// future usdt module must credit into). This is the concrete capability the
+/// USDT-on-EVM wallet module depends on: a configurable-unit mintv2 instance
+/// coexisting with the Bitcoin one in a single federation, with the client
+/// routing balance queries to the correct instance based on `AmountUnit`.
+#[tokio::test(flavor = "multi_thread")]
+async fn dual_mint_federation_routes_balance_by_amount_unit() -> anyhow::Result<()> {
+    let fixtures = fixtures().with_extra_module_instance(
+        KIND,
+        MintGenParams {
+            amount_unit: USDT_UNIT,
+        },
+    );
+    let fed = fixtures.new_fed_not_degraded().await;
+
+    let client = fed.new_client().await;
+
+    // (a) Two mintv2 instances exist, at distinct instance ids.
+    let mint_instance_ids: Vec<_> = client
+        .config()
+        .await
+        .modules
+        .iter()
+        .filter(|(_, module_cfg)| module_cfg.kind == KIND)
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(
+        mint_instance_ids.len(),
+        2,
+        "expected two mintv2 instances, got {mint_instance_ids:?}"
+    );
+
+    // (b) The client's per-unit routing resolves BITCOIN and USDT_UNIT to two
+    // distinct mintv2 instances (both among the two instances found above).
+    let (btc_module_id, _) = client
+        .primary_module_for_unit(AmountUnit::BITCOIN)
+        .expect("a primary mintv2 instance must be registered for BITCOIN");
+    let (usdt_module_id, _) = client
+        .primary_module_for_unit(USDT_UNIT)
+        .expect("a primary mintv2 instance must be registered for USDT_UNIT");
+
+    assert_ne!(
+        btc_module_id, usdt_module_id,
+        "BITCOIN and USDT_UNIT must route to distinct mint instances"
+    );
+    assert!(mint_instance_ids.contains(&btc_module_id));
+    assert!(mint_instance_ids.contains(&usdt_module_id));
+
+    // (c) A USDT_UNIT balance query resolves without error (proving a primary
+    // module is registered for that unit) and returns zero (no deposits yet).
+    // The Bitcoin balance path still works too.
+    let usdt_balance = client.get_balance_for_unit(USDT_UNIT).await?;
+    assert_eq!(usdt_balance, Amount::ZERO);
+
+    let btc_balance = client.get_balance_for_btc().await?;
+    assert_eq!(btc_balance, Amount::ZERO);
+
+    Ok(())
 }
