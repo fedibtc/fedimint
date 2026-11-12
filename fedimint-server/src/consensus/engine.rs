@@ -256,6 +256,16 @@ impl ConsensusEngine {
         // We need four peers to run the atomic broadcast
         assert!(self.num_peers().total() >= 4);
 
+        // Start every completion path at zero, so a scrape tells a path that
+        // never happened apart from no data.
+        for path in [
+            SessionCompletion::OwnSignatures,
+            SessionCompletion::PeerOutcomeAfterSigning,
+            SessionCompletion::PeerOutcomeWhileOrdering,
+        ] {
+            CONSENSUS_SESSIONS_COMPLETED.with_label_values(&[path.as_str()]);
+        }
+
         self.initialize_checkpoint_directory(self.get_finished_session_count().await)?;
 
         while !task_handle.is_shutting_down() {

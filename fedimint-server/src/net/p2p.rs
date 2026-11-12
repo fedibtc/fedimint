@@ -203,6 +203,16 @@ impl<M: Send + 'static> P2PConnection<M> {
         let (outgoing_sender, outgoing_receiver) = bounded(5);
         let (incoming_sender, incoming_receiver) = bounded(5);
 
+        // Start both drop counters at zero, so a scrape tells "no drops" apart
+        // from "no data".
+        for direction in ["outgoing", "incoming"] {
+            PEER_MESSAGES_DROPPED.with_label_values(&[
+                our_id.to_string().as_str(),
+                &peer_id.to_string(),
+                direction,
+            ]);
+        }
+
         task_group.spawn_cancellable(
             format!("io-state-machine-{peer_id}"),
             async move {
