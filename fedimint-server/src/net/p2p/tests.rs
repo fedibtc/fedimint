@@ -13,10 +13,12 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::{
-    P2PConnectionSMCommon, P2PConnectionSMState, P2PConnectionState, P2PConnectionStateMachine,
+    P2PConnection, P2PConnectionSMCommon, P2PConnectionSMState, P2PConnectionState,
+    P2PConnectionStateMachine,
 };
 use crate::metrics::{
-    PEER_TRANSPORT_BYTES, PEER_TRANSPORT_CONGESTION_EVENTS, PEER_TRANSPORT_CONGESTION_WINDOW_BYTES,
+    PEER_MESSAGES_DROPPED, PEER_SEND_DURATION_SECONDS, PEER_TRANSPORT_BYTES,
+    PEER_TRANSPORT_CONGESTION_EVENTS, PEER_TRANSPORT_CONGESTION_WINDOW_BYTES,
     PEER_TRANSPORT_LOST_PACKETS, PEER_TRANSPORT_RTT_SECONDS,
 };
 use crate::net::p2p_connection::{
@@ -1139,6 +1141,144 @@ async fn redials_when_a_send_stalls() {
         .expect("the link recovers after a send stalls");
 
     assert_eq!(connects.load(Ordering::Relaxed), 1);
+
+    task.abort();
+}
+
+fn dropped_messages(peer: &str, direction: &str) -> u64 {
+    PEER_MESSAGES_DROPPED
+        .with_label_values(&["1", peer, direction])
+        .get()
+}
+
+/// Messages that consensus hands to a peer whose queue is full are dropped,
+/// and each drop is counted for that peer and direction only.
+#[test]
+fn full_outgoing_queue_counts_dropped_messages() {
+    const PEER: &str = "13";
+
+    let (outgoing_sender, _outgoing_receiver) = async_channel::bounded(2);
+    let (_incoming_sender, incoming_receiver) = async_channel::bounded(2);
+    let connection = P2PConnection {
+        outgoing_sender,
+        incoming_receiver,
+        our_id_str: "1".to_owned(),
+        peer_id_str: PEER.to_owned(),
+    };
+
+    for message in 0..5u64 {
+        connection.try_send(message);
+    }
+
+    assert_eq!(dropped_messages(PEER, "outgoing"), 3);
+    assert_eq!(dropped_messages(PEER, "incoming"), 0);
+}
+
+/// A connection that delivers queued frames and whose sends take as many
+/// milliseconds as the message says.
+struct TimedConnection {
+    frames: async_channel::Receiver<u64>,
+    sends_completed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl IP2PConnection<u64> for TimedConnection {
+    async fn send(&self, message: u64) -> anyhow::Result<()> {
+        runtime::sleep(Duration::from_millis(message)).await;
+        self.sends_completed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<u64>> {
+        let message = self
+            .frames
+            .recv()
+            .await
+            .map_err(|_| anyhow!("frame channel closed"))?;
+
+        Ok(FakeFrame(message).into_dyn())
+    }
+
+    fn rtt(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Frames that arrive while consensus does not drain the incoming queue are
+/// dropped and counted, and every send is timed including the time the
+/// transport holds it.
+#[tokio::test]
+async fn counts_incoming_drops_and_times_sends() {
+    const PEER: u16 = 12;
+    let peer = PEER.to_string();
+
+    let (frame_sender, frames) = async_channel::bounded(8);
+    let (_connection_sender, incoming_connections) = async_channel::bounded(1);
+    let (outgoing_sender, outgoing_receiver) = async_channel::bounded(5);
+    let (incoming_sender, incoming_receiver) = async_channel::bounded(1);
+    let (status_sender, _status_receiver) = watch::channel(P2PConnectionState {
+        connected: None,
+        last_error: None,
+    });
+    let sends_completed = Arc::new(AtomicUsize::new(0));
+
+    let mut state_machine = P2PConnectionStateMachine {
+        state: P2PConnectionSMState::Connected(Arc::new(TimedConnection {
+            frames,
+            sends_completed: sends_completed.clone(),
+        })),
+        common: P2PConnectionSMCommon {
+            incoming_sender,
+            outgoing_receiver,
+            our_id: PeerId::from(1),
+            our_id_str: "1".to_owned(),
+            peer_id: PeerId::from(PEER),
+            peer_id_str: peer.clone(),
+            connector: Arc::new(PendingConnector { fallback: None }),
+            incoming_connections,
+            status_sender,
+            max_connection_age: None,
+            connection_deadline: None,
+        },
+    };
+    let task = runtime::spawn("p2p-drop-metrics-test", async move {
+        while let Some(next) = state_machine.state_transition().await {
+            state_machine = next;
+        }
+    });
+
+    // Nothing reads the incoming queue of one slot: the first frame fills
+    // it and the other three are dropped.
+    for frame in 0..4 {
+        frame_sender.send(frame).await.expect("frame queued");
+    }
+    timeout(Duration::from_secs(5), async {
+        while dropped_messages(&peer, "incoming") < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("three incoming frames are dropped");
+    assert_eq!(incoming_receiver.len(), 1);
+
+    // Two quick sends and one the transport holds for 150 ms.
+    for millis in [0, 0, 150] {
+        outgoing_sender.send(millis).await.expect("outgoing queued");
+    }
+    timeout(Duration::from_secs(5), async {
+        while sends_completed.load(Ordering::Relaxed) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all sends complete");
+
+    let sends = PEER_SEND_DURATION_SECONDS.with_label_values(&["1", peer.as_str()]);
+    assert_eq!(sends.get_sample_count(), 3);
+    assert!(sends.get_sample_sum() >= 0.15, "{}", sends.get_sample_sum());
+    assert!(sends.get_sample_sum() < 1.0, "{}", sends.get_sample_sum());
+    assert_eq!(dropped_messages(&peer, "incoming"), 3);
+    assert_eq!(dropped_messages(&peer, "outgoing"), 0);
 
     task.abort();
 }

@@ -89,6 +89,34 @@ pub(crate) static CONSENSUS_ITEM_PROCESSING_MODULE_AUDIT_DURATION_SECONDS: LazyL
         .unwrap()
     });
 
+/// Duration of committing the database transaction of one consensus item.
+pub(crate) static CONSENSUS_ITEM_COMMIT_DURATION_SECONDS: LazyLock<Histogram> =
+    LazyLock::new(|| {
+        register_histogram_with_registry!(
+            histogram_opts!(
+                "consensus_item_commit_duration_seconds",
+                "Duration of committing the database transaction of a consensus item",
+                vec![
+                    0.000_01, 0.000_03, 0.000_1, 0.000_3, 0.001, 0.003, 0.01, 0.1, 1.0
+                ]
+            ),
+            REGISTRY
+        )
+        .unwrap()
+    });
+/// Sessions this guardian completed, by how it obtained the signed outcome.
+pub(crate) static CONSENSUS_SESSIONS_COMPLETED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        opts!(
+            "consensus_sessions_completed_total",
+            "Completed sessions by how the signed session outcome was obtained",
+        ),
+        &["path"],
+        REGISTRY
+    )
+    .unwrap()
+});
+
 pub(crate) static CONSENSUS_ORDERING_LATENCY_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram_with_registry!(
         histogram_opts!(
@@ -272,6 +300,36 @@ pub(crate) static PEER_MESSAGES_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|
     register_int_counter_vec_with_registry!(
         opts!("peer_messages_total", "Messages with the peer",),
         &["self_id", "peer_id", "direction"],
+        REGISTRY
+    )
+    .unwrap()
+});
+
+/// Messages to or from the peer that a full queue dropped, by direction.
+/// Outgoing drops happen while the connection cannot keep up with what
+/// consensus sends, incoming drops while consensus cannot keep up with what
+/// the peer sends; the networking layer is unreliable by design.
+pub(crate) static PEER_MESSAGES_DROPPED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec_with_registry!(
+        opts!(
+            "peer_messages_dropped_total",
+            "Messages with the peer dropped because their queue was full",
+        ),
+        &["self_id", "peer_id", "direction"],
+        REGISTRY
+    )
+    .unwrap()
+});
+/// Time a single message to the peer took to send, including transport
+/// backpressure, up to the send timeout.
+pub(crate) static PEER_SEND_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec_with_registry!(
+        histogram_opts!(
+            "peer_send_duration_seconds",
+            "Duration of sending one message to the peer",
+            vec![0.001, 0.01, 0.1, 1.0, 10.0, 60.0]
+        ),
+        &["self_id", "peer_id"],
         REGISTRY
     )
     .unwrap()

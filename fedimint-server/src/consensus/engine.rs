@@ -54,10 +54,10 @@ use crate::consensus::outcome_download::ObservedFederationApi;
 use crate::consensus::peer_availability::PeerActivity;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
 use crate::metrics::{
-    CONSENSUS_ITEM_PROCESSING_DURATION_SECONDS,
+    CONSENSUS_ITEM_COMMIT_DURATION_SECONDS, CONSENSUS_ITEM_PROCESSING_DURATION_SECONDS,
     CONSENSUS_ITEM_PROCESSING_MODULE_AUDIT_DURATION_SECONDS, CONSENSUS_ITEMS_PROCESSED_TOTAL,
     CONSENSUS_ORDERING_LATENCY_SECONDS, CONSENSUS_PEER_CONTRIBUTION_SESSION_IDX,
-    CONSENSUS_SESSION_COUNT,
+    CONSENSUS_SESSION_COUNT, CONSENSUS_SESSIONS_COMPLETED,
 };
 
 // The name of the directory where the database checkpoints are stored.
@@ -68,6 +68,32 @@ const DB_CHECKPOINTS_DIR: &str = "db_checkpoints";
 /// costs an attempt, and reprocessing takes a fresh snapshot, so needing more
 /// than a couple of these means something is wrong beyond a stale snapshot.
 const MAX_ITEM_PROCESSING_ATTEMPTS: usize = 10;
+
+/// How this guardian obtained the signed outcome of a session it completed.
+///
+/// A guardian that keeps completing sessions with a peer's outcome while it is
+/// still ordering items is behind the federation: its own units arrive too
+/// late to be ordered, even though its session count stays level.
+#[derive(Debug, Clone, Copy)]
+pub enum SessionCompletion {
+    /// We ordered every round and collected a threshold of signatures.
+    OwnSignatures,
+    /// We ordered every round and signed, but a peer's signed outcome arrived
+    /// first.
+    PeerOutcomeAfterSigning,
+    /// A peer's signed outcome arrived while we were still ordering items.
+    PeerOutcomeWhileOrdering,
+}
+
+impl SessionCompletion {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnSignatures => "own_signatures",
+            Self::PeerOutcomeAfterSigning => "peer_outcome_after_signing",
+            Self::PeerOutcomeWhileOrdering => "peer_outcome_while_ordering",
+        }
+    }
+}
 
 /// How an admin scheduled a shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +234,10 @@ impl ConsensusEngine {
             .await;
 
             self.checkpoint_database(session_index);
+
+            CONSENSUS_SESSIONS_COMPLETED
+                .with_label_values(&[SessionCompletion::OwnSignatures.as_str()])
+                .inc();
 
             info!(target: LOG_CONSENSUS, "Session {session_index} completed");
 
@@ -390,7 +420,7 @@ impl ConsensusEngine {
 
         self.ord_latency_sender.send_replace(None);
 
-        let signed_session_outcome = self
+        let (signed_session_outcome, completion) = self
             .complete_signed_session_outcome(
                 session_index,
                 unit_data_receiver,
@@ -406,6 +436,10 @@ impl ConsensusEngine {
             self.validate_signed_session_outcome(&signed_session_outcome, session_index),
             "Our created signed session outcome fails validation"
         );
+
+        CONSENSUS_SESSIONS_COMPLETED
+            .with_label_values(&[completion.as_str()])
+            .inc();
 
         info!(target: LOG_CONSENSUS, ?session_index, "Terminating Aleph BFT session");
 
@@ -446,7 +480,7 @@ impl ConsensusEngine {
         signed_outcomes_receiver: Receiver<(PeerId, SignedSessionOutcome)>,
         signatures_receiver: Receiver<(PeerId, schnorr::Signature)>,
         _connections: DynP2PConnections<P2PMessage>,
-    ) -> Option<SignedSessionOutcome> {
+    ) -> Option<(SignedSessionOutcome, SessionCompletion)> {
         // It is guaranteed that aleph bft will always replay all previously processed
         // items from the current session from index zero
         let mut item_index = 0;
@@ -564,7 +598,7 @@ impl ConsensusEngine {
                         }
                     }
 
-                    return Some(signed_session_outcome);
+                    return Some((signed_session_outcome, SessionCompletion::PeerOutcomeWhileOrdering));
                 },
                 result = signed_outcomes_receiver.recv() => {
                     let (peer_id, p2p_outcome) = result.ok()?;
@@ -621,7 +655,7 @@ impl ConsensusEngine {
                             "Successfully recovered session via P2P"
                         );
 
-                        return Some(p2p_outcome);
+                        return Some((p2p_outcome, SessionCompletion::PeerOutcomeWhileOrdering));
                     }
 
                     debug!(
@@ -740,7 +774,7 @@ impl ConsensusEngine {
                         "Consensus Failure: header disagrees with federation consensus"
                     );
 
-                    return Some(signed_session_outcome);
+                    return Some((signed_session_outcome, SessionCompletion::PeerOutcomeAfterSigning));
                 },
                 result = signed_outcomes_receiver.recv() => {
                     let (peer_id, p2p_outcome) = result.ok()?;
@@ -759,7 +793,7 @@ impl ConsensusEngine {
                             "Recovered session via P2P while collecting signatures"
                         );
 
-                        return Some(p2p_outcome);
+                        return Some((p2p_outcome, SessionCompletion::PeerOutcomeAfterSigning));
                     }
 
                     debug!(
@@ -791,10 +825,13 @@ impl ConsensusEngine {
             "Successfully collected threshold of signatures"
         );
 
-        Some(SignedSessionOutcome {
-            session_outcome,
-            signatures,
-        })
+        Some((
+            SignedSessionOutcome {
+                session_outcome,
+                signatures,
+            },
+            SessionCompletion::OwnSignatures,
+        ))
     }
 
     /// Returns a random peer ID excluding ourselves
@@ -1141,7 +1178,10 @@ impl ConsensusEngine {
             "Balance sheet of the fed has gone negative, this should never happen! {audit}"
         );
 
-        dbtx.commit_tx_result().await?;
+        let commit_timer = CONSENSUS_ITEM_COMMIT_DURATION_SECONDS.start_timer();
+        let committed = dbtx.commit_tx_result().await;
+        commit_timer.observe_duration();
+        committed?;
 
         self.accepted_item_sender.send_replace(());
 

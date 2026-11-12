@@ -28,9 +28,10 @@ use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::metrics::{
-    PEER_CONNECT_COUNT, PEER_DISCONNECT_COUNT, PEER_MESSAGES_COUNT, PEER_TRANSPORT_BYTES,
-    PEER_TRANSPORT_CONGESTION_EVENTS, PEER_TRANSPORT_CONGESTION_WINDOW_BYTES,
-    PEER_TRANSPORT_LOST_PACKETS, PEER_TRANSPORT_RTT_SECONDS,
+    PEER_CONNECT_COUNT, PEER_DISCONNECT_COUNT, PEER_MESSAGES_COUNT, PEER_MESSAGES_DROPPED,
+    PEER_SEND_DURATION_SECONDS, PEER_TRANSPORT_BYTES, PEER_TRANSPORT_CONGESTION_EVENTS,
+    PEER_TRANSPORT_CONGESTION_WINDOW_BYTES, PEER_TRANSPORT_LOST_PACKETS,
+    PEER_TRANSPORT_RTT_SECONDS,
 };
 use crate::net::p2p_connection::{DynConnectionStatusUpdates, DynP2PConnection, P2PTransportStats};
 use crate::net::p2p_connector::DynP2PConnector;
@@ -179,6 +180,8 @@ impl<M: Clone + Send + 'static> IP2PConnections<M> for ReconnectP2PConnections<M
 struct P2PConnection<M> {
     outgoing_sender: Sender<M>,
     incoming_receiver: Receiver<M>,
+    our_id_str: String,
+    peer_id_str: String,
 }
 
 impl<M: Send + 'static> P2PConnection<M> {
@@ -237,11 +240,20 @@ impl<M: Send + 'static> P2PConnection<M> {
         P2PConnection {
             outgoing_sender,
             incoming_receiver,
+            our_id_str: our_id.to_string(),
+            peer_id_str: peer_id.to_string(),
         }
     }
 
     fn try_send(&self, message: M) {
         if self.outgoing_sender.try_send(message).is_err() {
+            PEER_MESSAGES_DROPPED
+                .with_label_values(&[
+                    self.our_id_str.as_str(),
+                    self.peer_id_str.as_str(),
+                    "outgoing",
+                ])
+                .inc();
             debug!(target: LOG_NET_PEER, "Outgoing message channel is full");
         }
     }
@@ -478,7 +490,13 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
             // while keepalives hold the connection open. Bound it, so the link
             // is re-established instead of looking connected while every
             // further message is dropped.
-            match timeout(SEND_TIMEOUT, connection.send(message)).await {
+            let send_timer = PEER_SEND_DURATION_SECONDS
+                .with_label_values(&[our_id_str, peer_id_str])
+                .start_timer();
+            let sent = timeout(SEND_TIMEOUT, connection.send(message)).await;
+            send_timer.observe_duration();
+
+            match sent {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return SendHalt::Failed(e),
                 Err(_) => {
@@ -513,6 +531,9 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                         .inc();
 
                     if incoming_sender.try_send(message).is_err() {
+                        PEER_MESSAGES_DROPPED
+                            .with_label_values(&[our_id_str, peer_id_str, "incoming"])
+                            .inc();
                         debug!(target: LOG_NET_PEER, "Incoming message channel is full");
                     }
                 }
