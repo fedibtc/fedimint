@@ -136,7 +136,7 @@ pub struct ConnectorRegistryBuilder {
     /// Enable compatible iroh-next endpoint preference from guardian metadata
     iroh_next: bool,
     /// Allow direct IP connections, not only relayed ones, on iroh 1.x
-    iroh_direct: bool,
+    iroh_p2p: bool,
 
     /// Enable Websocket API handling at all?
     ws_enable: bool,
@@ -226,7 +226,7 @@ impl ConnectorRegistryBuilder {
             iroh::IrohConnector::new(
                 self.iroh_dns.clone(),
                 self.iroh_pkarr_dht,
-                self.iroh_direct,
+                self.iroh_p2p,
                 path_change,
             )
             .await?,
@@ -287,9 +287,9 @@ impl ConnectorRegistryBuilder {
     /// then stop working. The iroh 0.35 endpoint has no runtime switch;
     /// build iroh with its `no_holepunch` feature for the same effect
     /// there.
-    pub fn iroh_direct(self, enable: bool) -> Self {
+    pub fn iroh_p2p(self, enable: bool) -> Self {
         Self {
-            iroh_direct: enable,
+            iroh_p2p: enable,
             ..self
         }
     }
@@ -432,7 +432,7 @@ impl ConnectorRegistry {
             iroh_dns: None,
             iroh_pkarr_dht: false,
             iroh_next: false,
-            iroh_direct: true,
+            iroh_p2p: true,
             ws_enable: true,
             ws_force_tor: false,
             http_enable: true,
@@ -449,7 +449,7 @@ impl ConnectorRegistry {
             iroh_dns: None,
             iroh_pkarr_dht: false,
             iroh_next: false,
-            iroh_direct: true,
+            iroh_p2p: true,
             ws_enable: true,
             ws_force_tor: false,
             http_enable: false,
@@ -466,7 +466,7 @@ impl ConnectorRegistry {
             iroh_dns: None,
             iroh_pkarr_dht: false,
             iroh_next: false,
-            iroh_direct: true,
+            iroh_p2p: true,
             ws_enable: true,
             ws_force_tor: false,
             http_enable: true,

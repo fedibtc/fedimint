@@ -133,11 +133,11 @@ impl IrohConnector {
     pub async fn new(
         iroh_dns: Option<SafeUrl>,
         iroh_enable_dht: bool,
-        iroh_direct: bool,
+        iroh_p2p: bool,
         path_change: Arc<watch::Sender<u64>>,
     ) -> anyhow::Result<Self> {
         let mut s =
-            Self::new_no_overrides(iroh_dns, iroh_enable_dht, iroh_direct, path_change).await?;
+            Self::new_no_overrides(iroh_dns, iroh_enable_dht, iroh_p2p, path_change).await?;
 
         // Overrides are `<node-id>=<socket-addr>` pairs: the node id is the key
         // and the value is a single direct address. iroh 1.0 no longer ships
@@ -161,7 +161,7 @@ impl IrohConnector {
     pub async fn new_no_overrides(
         iroh_dns: Option<SafeUrl>,
         iroh_enable_dht: bool,
-        iroh_direct: bool,
+        iroh_p2p: bool,
         path_change: Arc<watch::Sender<u64>>,
     ) -> anyhow::Result<Self> {
         let endpoint_stable = Box::pin({
@@ -237,11 +237,11 @@ impl IrohConnector {
 
             // Browsers have no IP transports to clear: wasm is always relay-only.
             #[cfg(not(target_family = "wasm"))]
-            if !iroh_direct {
+            if !iroh_p2p {
                 builder = builder.clear_ip_transports();
             }
             #[cfg(target_family = "wasm")]
-            let _ = iroh_direct;
+            let _ = iroh_p2p;
 
             // iOS prompts for Local Network access when the port mapper probes
             // the router, and another crate can turn iroh's `portmapper` on.
@@ -988,7 +988,7 @@ mod tests {
     /// Turning direct connections off leaves the iroh 1.x endpoint without IP
     /// sockets, so it can only send through relays. Leaving them on keeps them.
     #[tokio::test]
-    async fn disabling_direct_connections_binds_no_ip_sockets_on_the_next_endpoint() {
+    async fn disabling_p2p_binds_no_ip_sockets_on_the_next_endpoint() {
         for direct in [true, false] {
             let connector = super::IrohConnector::new_no_overrides(
                 None,
