@@ -235,9 +235,13 @@ impl IrohConnector {
             // would disable dialing them, not just registration.
             let mut builder = builder.relay_mode(iroh_next::RelayMode::Default);
 
+            // Browsers have no IP transports to clear: wasm is always relay-only.
+            #[cfg(not(target_family = "wasm"))]
             if !iroh_direct {
                 builder = builder.clear_ip_transports();
             }
+            #[cfg(target_family = "wasm")]
+            let _ = iroh_direct;
 
             // iOS prompts for Local Network access when the port mapper probes
             // the router, and another crate can turn iroh's `portmapper` on.
