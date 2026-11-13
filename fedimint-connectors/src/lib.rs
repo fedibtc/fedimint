@@ -135,6 +135,8 @@ pub struct ConnectorRegistryBuilder {
     iroh_pkarr_dht: bool,
     /// Enable compatible iroh-next endpoint preference from guardian metadata
     iroh_next: bool,
+    /// Allow direct IP connections, not only relayed ones, on iroh 1.x
+    iroh_direct: bool,
 
     /// Enable Websocket API handling at all?
     ws_enable: bool,
@@ -221,8 +223,13 @@ impl ConnectorRegistryBuilder {
             bail!("Iroh connector not enabled");
         }
         Ok(Arc::new(
-            iroh::IrohConnector::new(self.iroh_dns.clone(), self.iroh_pkarr_dht, path_change)
-                .await?,
+            iroh::IrohConnector::new(
+                self.iroh_dns.clone(),
+                self.iroh_pkarr_dht,
+                self.iroh_direct,
+                path_change,
+            )
+            .await?,
         ) as DynConnector)
     }
 
@@ -265,6 +272,24 @@ impl ConnectorRegistryBuilder {
     pub fn iroh_next(self, enable: bool) -> Self {
         Self {
             iroh_next: enable,
+            ..self
+        }
+    }
+
+    /// Allow Iroh to reach guardians directly over IP, not only through
+    /// relays.
+    ///
+    /// When disabled, the iroh 1.x endpoint sends only through relays:
+    /// guardians never learn the client's IP address, and the client never
+    /// probes the direct candidates guardians advertise, which on iOS can
+    /// include addresses on the user's own network and raise the Local
+    /// Network prompt. Connection overrides that carry a direct address
+    /// then stop working. The iroh 0.35 endpoint has no runtime switch;
+    /// build iroh with its `no_holepunch` feature for the same effect
+    /// there.
+    pub fn iroh_direct(self, enable: bool) -> Self {
+        Self {
+            iroh_direct: enable,
             ..self
         }
     }
@@ -407,6 +432,7 @@ impl ConnectorRegistry {
             iroh_dns: None,
             iroh_pkarr_dht: false,
             iroh_next: false,
+            iroh_direct: true,
             ws_enable: true,
             ws_force_tor: false,
             http_enable: true,
@@ -423,6 +449,7 @@ impl ConnectorRegistry {
             iroh_dns: None,
             iroh_pkarr_dht: false,
             iroh_next: false,
+            iroh_direct: true,
             ws_enable: true,
             ws_force_tor: false,
             http_enable: false,
@@ -439,6 +466,7 @@ impl ConnectorRegistry {
             iroh_dns: None,
             iroh_pkarr_dht: false,
             iroh_next: false,
+            iroh_direct: true,
             ws_enable: true,
             ws_force_tor: false,
             http_enable: true,
