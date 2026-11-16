@@ -48,18 +48,6 @@ pub mod io;
 pub mod peer_handle;
 pub mod setup;
 
-fn dkg_consensus_code_version(code_version: String) -> String {
-    // Use the same major/minor and vendor identity for newly generated
-    // consensus configs, independently of the guardian's patch release.
-    //
-    // Runtime callers validate semantic versions before config generation.
-    // Preserve opaque values used by historical test helpers. Restored configs
-    // bypass this path and retain their historical full version string.
-    fedimint_core::version::DkgVersion::parse(&code_version).map_or(code_version, |version| {
-        version.compatibility_version().to_string()
-    })
-}
-
 /// The default maximum open connections the API can handle
 pub const DEFAULT_MAX_CLIENT_CONNECTIONS: u32 = 1000;
 
@@ -346,7 +334,6 @@ impl ServerConfig {
         modules: BTreeMap<ModuleInstanceId, ServerModuleConfig>,
         code_version: String,
     ) -> Self {
-        let code_version = dkg_consensus_code_version(code_version);
         let consensus = ServerConfigConsensus {
             // Setup validates untrusted code versions before config generation.
             // Keep this lower-level API usable by test helpers that use opaque
