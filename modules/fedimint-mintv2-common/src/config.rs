@@ -139,10 +139,13 @@ impl FeeConsensus {
         // Preserve the legacy static-config invariant. The dynamic-fee design in
         // #8758 moves broader policy to separate FeeConsensus/FeeRate types.
         if !((base == Amount::ZERO && parts_per_million == 0)
-            || (base == Amount::from_msats(100) && parts_per_million <= 1_000))
+            || ((base == Amount::from_msats(10) || base == Amount::from_msats(100))
+                && parts_per_million <= 1_000))
         {
+            // Fedi: new federations use a 10 msat base fee, and federations
+            // formed before that keep their 100 msat one.
             return Err(
-                "Mint fees must be zero or use the 100 msat base fee and at most one thousand parts per million",
+                "Mint fees must be zero or use a 10 or 100 msat base fee and at most one thousand parts per million",
             );
         }
 
