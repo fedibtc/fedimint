@@ -182,7 +182,7 @@ impl_db_record!(
 
 impl_db_lookup!(key = FeeRateVoteKey, query_prefix = FeeRateVotePrefix);
 
-/// One volume day of consensus blocks (`block_count / BLOCKS_PER_DAY`).
+/// One 144-block bucket of the module consensus block count.
 #[derive(Clone, Debug, Eq, PartialEq, Encodable, Decodable, Serialize)]
 pub struct VolumeDayKey(pub u64);
 
@@ -190,10 +190,24 @@ pub struct VolumeDayKey(pub u64);
 pub struct VolumeDayPrefix;
 
 /// The on-chain flows this guardian processed in one volume day.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Encodable, Decodable, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Encodable, Decodable, Serialize)]
 pub struct VolumeDay {
     pub deposited: bitcoin::Amount,
     pub withdrawn: bitcoin::Amount,
+}
+
+impl VolumeDay {
+    /// Saturate each direction independently so local totals cannot overflow.
+    pub(crate) fn accumulate(&mut self, other: Self) {
+        self.deposited = self
+            .deposited
+            .checked_add(other.deposited)
+            .unwrap_or(bitcoin::Amount::MAX);
+        self.withdrawn = self
+            .withdrawn
+            .checked_add(other.withdrawn)
+            .unwrap_or(bitcoin::Amount::MAX);
+    }
 }
 
 impl_db_record!(
@@ -220,3 +234,6 @@ impl_db_record!(
 );
 
 impl_db_lookup!(key = VolumeStartKey, query_prefix = VolumeStartPrefix);
+
+#[cfg(test)]
+mod tests;

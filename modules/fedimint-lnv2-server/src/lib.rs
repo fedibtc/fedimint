@@ -55,7 +55,7 @@ use fedimint_logging::LOG_MODULE_LNV2;
 use fedimint_server_core::bitcoin_rpc::ServerBitcoinRpcMonitor;
 use fedimint_server_core::config::{PeerHandleOps, eval_poly_g1};
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
-use fedimint_server_core::volume::VolumeWindow;
+use fedimint_server_core::volume::{counted_whole_window, volume_buckets, volume_day};
 use fedimint_server_core::{
     ConfigGenModuleArgs, EnvVarDoc, ServerModule, ServerModuleInit, ServerModuleInitArgs,
 };
@@ -87,9 +87,6 @@ use crate::metrics::{LN_FUNDED_CONTRACT_SATS, LN_OUTGOING_CONTRACT_SETTLED};
 /// allocation and abort the guardian process. The legitimate client requests
 /// 128 at a time, so this leaves ample headroom.
 const MAX_INCOMING_CONTRACTS_BATCH: usize = 1024;
-
-/// Volume is bucketed by days of consensus unix time.
-const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct LightningInit;
@@ -475,7 +472,7 @@ impl ServerModule for Lightning {
         // still settle earlier in that session, at the same clock value, which
         // is why the day counting started on is never complete.
         if dbtx.get_value(&VolumeStartKey).await.is_none() {
-            let now = self.consensus_unix_time(dbtx).await;
+            let now = self.consensus_block_count(dbtx).await;
             dbtx.insert_new_entry(&VolumeStartKey, &now).await;
         }
 
@@ -521,7 +518,8 @@ impl ServerModule for Lightning {
 
                 let pub_key = match outgoing_witness {
                     OutgoingWitness::Claim(preimage) => {
-                        if contract.expiration <= self.consensus_block_count(dbtx).await {
+                        let block_count = self.consensus_block_count(dbtx).await;
+                        if contract.expiration <= block_count {
                             return Err(LightningInputError::Expired);
                         }
 
@@ -531,8 +529,15 @@ impl ServerModule for Lightning {
 
                         dbtx.insert_entry(&PreimageKey(*outpoint), preimage).await;
 
-                        self.count_volume(dbtx, |day| day.sent += contract.amount)
-                            .await;
+                        Self::count_volume(
+                            dbtx,
+                            block_count,
+                            VolumeDay {
+                                sent: contract.amount,
+                                received: Amount::ZERO,
+                            },
+                        )
+                        .await;
 
                         contract.claim_pk
                     }
@@ -587,8 +592,16 @@ impl ServerModule for Lightning {
 
                 let pub_key = match contract.decrypt_preimage(agg_decryption_key) {
                     Some(..) => {
-                        self.count_volume(dbtx, |day| day.received += contract.commitment.amount)
-                            .await;
+                        let block_count = self.consensus_block_count(dbtx).await;
+                        Self::count_volume(
+                            dbtx,
+                            block_count,
+                            VolumeDay {
+                                sent: Amount::ZERO,
+                                received: contract.commitment.amount,
+                            },
+                        )
+                        .await;
 
                         contract.commitment.claim_pk
                     }
@@ -719,7 +732,7 @@ impl ServerModule for Lightning {
                     Ok(module.consensus_block_count(&mut dbtx).await)
                 }
             },
-            public_api_endpoint! {
+            admin_api_endpoint! {
                 VOLUME_STATS_ENDPOINT,
                 ApiVersion::new(0, 1),
                 async |module: &Lightning, context, _params: ()| -> LightningVolumeStats {
@@ -874,51 +887,39 @@ impl Lightning {
     }
 
     /// Add a settled payment to the current consensus day.
-    async fn count_volume(
-        &self,
-        dbtx: &mut DatabaseTransaction<'_>,
-        add: impl FnOnce(&mut VolumeDay),
-    ) {
-        let key = VolumeDayKey(self.consensus_unix_time(dbtx).await / SECONDS_PER_DAY);
+    async fn count_volume(dbtx: &mut DatabaseTransaction<'_>, block_count: u64, delta: VolumeDay) {
+        let key = VolumeDayKey(volume_day(block_count));
         let mut day = dbtx.get_value(&key).await.unwrap_or_default();
-        add(&mut day);
+        day.accumulate(delta);
         dbtx.insert_entry(&key, &day).await;
     }
 
     async fn volume_stats(&self, dbtx: &mut DatabaseTransaction<'_>) -> LightningVolumeStats {
-        let now = self.consensus_unix_time(dbtx).await;
+        let block_count = self.consensus_block_count(dbtx).await;
         let start = dbtx.get_value(&VolumeStartKey).await;
-
-        LightningVolumeStats {
-            last_7_days: Self::volume(dbtx, now, start, 7).await,
-            last_30_days: Self::volume(dbtx, now, start, 30).await,
-        }
-    }
-
-    async fn volume(
-        dbtx: &mut DatabaseTransaction<'_>,
-        now: u64,
-        start: Option<u64>,
-        days: u64,
-    ) -> LightningVolume {
-        let window = VolumeWindow::new(now / SECONDS_PER_DAY, days);
-
-        let mut volume = LightningVolume {
-            received: Amount::ZERO,
-            sent: Amount::ZERO,
-            complete: window.is_complete(start, SECONDS_PER_DAY),
-        };
-
+        let week = volume_buckets(block_count, 7);
+        let month = volume_buckets(block_count, 30);
+        let mut last_7_days = VolumeDay::default();
+        let mut last_30_days = VolumeDay::default();
         let mut stream = dbtx
-            .find_by_range(VolumeDayKey(window.first_day)..VolumeDayKey(window.end_day))
+            .find_by_range(VolumeDayKey(month.start)..VolumeDayKey(month.end))
             .await;
-
-        while let Some((_, day)) = stream.next().await {
-            volume.received += day.received;
-            volume.sent += day.sent;
+        while let Some((key, day)) = stream.next().await {
+            last_30_days.accumulate(day);
+            if key.0 >= week.start {
+                last_7_days.accumulate(day);
+            }
         }
-
-        volume
+        let report = |total: VolumeDay, first_bucket: u64| LightningVolume {
+            received: total.received,
+            sent: total.sent,
+            complete: counted_whole_window(start, first_bucket),
+        };
+        LightningVolumeStats {
+            block_count,
+            last_7_days: report(last_7_days, week.start),
+            last_30_days: report(last_30_days, month.start),
+        }
     }
 
     async fn await_incoming_contract(

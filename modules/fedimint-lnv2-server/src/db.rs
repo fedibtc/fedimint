@@ -30,8 +30,9 @@ pub enum DbKeyPrefix {
     IncomingContractStreamIndex = 0x09,
     IncomingContractStream = 0x10,
     IncomingContractIndex = 0x11,
-    VolumeDay = 0x12,
-    VolumeStart = 0x13,
+    // Leave the draft Unix-time counters (0x12, 0x13) untouched.
+    VolumeDay = 0x14,
+    VolumeStart = 0x15,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -229,7 +230,7 @@ impl_db_lookup!(
     query_prefix = IncomingContractIndexPrefix
 );
 
-/// One day of consensus unix time (`unix_time / SECONDS_PER_DAY`).
+/// One 144-block bucket of the module consensus block count.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
 pub struct VolumeDayKey(pub u64);
 
@@ -237,10 +238,18 @@ pub struct VolumeDayKey(pub u64);
 pub struct VolumeDayPrefix;
 
 /// The payments this guardian settled on one consensus day.
-#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Encodable, Decodable)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Encodable, Decodable)]
 pub struct VolumeDay {
     pub received: Amount,
     pub sent: Amount,
+}
+
+impl VolumeDay {
+    /// Saturate each direction independently so local totals cannot overflow.
+    pub(crate) fn accumulate(&mut self, other: Self) {
+        self.received.msats = self.received.msats.saturating_add(other.received.msats);
+        self.sent.msats = self.sent.msats.saturating_add(other.sent.msats);
+    }
 }
 
 impl_db_record!(
@@ -251,7 +260,7 @@ impl_db_record!(
 
 impl_db_lookup!(key = VolumeDayKey, query_prefix = VolumeDayPrefix);
 
-/// The consensus unix time when this guardian started counting volume. The
+/// The consensus block count when this guardian started counting volume. The
 /// value is 0 if the consensus clock had not started yet, which means the
 /// guardian has counted since the federation formed.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
@@ -311,3 +320,6 @@ pub(crate) async fn migrate_to_v1(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

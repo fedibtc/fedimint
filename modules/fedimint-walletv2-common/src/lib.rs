@@ -107,11 +107,13 @@ pub struct OutputInfo {
 /// The on-chain flows one guardian counted, as returned by
 /// [`endpoint_constants::VOLUME_STATS_ENDPOINT`].
 ///
-/// A guardian counts flows as it processes them, bucketed by days of
-/// [`BLOCKS_PER_DAY`] consensus blocks. Windows end at the current consensus
-/// day, so "7 days" covers the current day and the six before it.
+/// The guardian admin endpoint reports 144-block buckets of this module's
+/// consensus block count. Each window includes the current unfinished bucket.
+/// An amount of `u64::MAX` satoshis means at least that much.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WalletVolumeStats {
+    /// The block count at this snapshot. Divide by 144 for the current bucket.
+    pub block_count: u64,
     pub last_7_days: WalletVolume,
     pub last_30_days: WalletVolume,
 }
@@ -128,8 +130,6 @@ pub struct WalletVolume {
     pub complete: bool,
 }
 
-/// The number of consensus blocks that make one volume day.
-pub const BLOCKS_PER_DAY: u64 = 144;
 
 #[derive(Debug)]
 pub struct WalletCommonInit;

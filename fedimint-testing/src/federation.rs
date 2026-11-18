@@ -388,8 +388,8 @@ impl FederationTestBuilder {
                 Box::pin(consensus::run(
                     connectors,
                     service_connectors,
-                    Some(ApiAuth::new("pass".to_string())),
-                    Some(ApiAuth::new("pass".to_string())),
+                    Some(crate::API_AUTH.clone()),
+                    Some(crate::API_AUTH.clone()),
                     connections,
                     p2p_status_receivers,
                     api_bind,

@@ -13,7 +13,7 @@ use fedimint_client::transaction::{
 use fedimint_client_module::module::ClientModule;
 use fedimint_core::core::{IntoDynInstance, OperationId};
 use fedimint_core::module::{AmountUnit, Amounts, ApiRequestErased};
-use fedimint_core::util::NextOrPending as _;
+use fedimint_core::util::{NextOrPending as _, backoff_util, retry};
 use fedimint_core::{Amount, OutPoint, sats};
 use fedimint_dummy_client::{DummyClientInit, DummyClientModule};
 use fedimint_dummy_server::DummyInit;
@@ -25,13 +25,16 @@ use fedimint_lnv2_client::{
     InvoiceSendStatus, LightningClientInit, LightningClientModule, LightningOperationMeta,
     ReceiveOperationState, SendOperationState, SendPaymentError,
 };
-use fedimint_lnv2_common::endpoint_constants::VOLUME_STATS_ENDPOINT;
+use fedimint_lnv2_common::endpoint_constants::{
+    CONSENSUS_BLOCK_COUNT_ENDPOINT, VOLUME_STATS_ENDPOINT,
+};
 use fedimint_lnv2_common::{
     Bolt11InvoiceDescription, KIND, LightningInput, LightningInputV0, LightningOutput,
     LightningOutputV0, LightningVolume, LightningVolumeStats, OutgoingWitness,
 };
 use fedimint_lnv2_server::LightningInit;
 use fedimint_logging::LOG_TEST;
+use fedimint_testing::API_AUTH;
 use fedimint_testing::fixtures::Fixtures;
 use futures::StreamExt;
 use serde_json::Value;
@@ -403,22 +406,6 @@ async fn claiming_outgoing_contract_triggers_success() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read the lnv2 volume every peer agrees on.
-async fn volume_stats(client: &ClientHandleArc) -> anyhow::Result<LightningVolumeStats> {
-    let lnv2_module_id = client
-        .get_first_instance(&LightningClientModule::kind())
-        .expect("the fixture federation runs lnv2");
-
-    Ok(client
-        .api()
-        .with_module(lnv2_module_id)
-        .request_current_consensus(
-            VOLUME_STATS_ENDPOINT.to_string(),
-            ApiRequestErased::default(),
-        )
-        .await?)
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn volume_stats_count_only_settled_payments() -> anyhow::Result<()> {
     let fixtures = fixtures();
@@ -426,15 +413,7 @@ async fn volume_stats_count_only_settled_payments() -> anyhow::Result<()> {
     let sender = fed.new_client().await;
     let recipient = fed.new_client().await;
 
-    // Until the first session completes, the consensus unix time is zero and
-    // settled payments would land on day zero, outside every window.
-    while sender.api().session_count().await? < 1 {
-        fedimint_core::task::sleep_in_test(
-            "waiting for the consensus clock",
-            Duration::from_millis(100),
-        )
-        .await;
-    }
+    await_block_count_consensus(&fixtures, &sender).await?;
 
     sender
         .get_first_module::<DummyClientModule>()?
@@ -578,9 +557,61 @@ async fn volume_stats_count_only_settled_payments() -> anyhow::Result<()> {
         complete: true,
     };
 
-    let stats = volume_stats(&sender).await?;
+    let peer = fed
+        .online_peer_ids()
+        .next()
+        .expect("fixture has an online peer");
+    let api = fed.new_admin_api(peer).await?.with_module(lnv2_module_id);
+    let denied = api
+        .request_single_peer::<LightningVolumeStats>(
+            VOLUME_STATS_ENDPOINT.to_owned(),
+            ApiRequestErased::default(),
+            peer,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        denied.to_string().contains("Invalid authorization"),
+        "{denied}"
+    );
+    let stats: LightningVolumeStats = api
+        .request_admin(
+            VOLUME_STATS_ENDPOINT,
+            ApiRequestErased::default(),
+            API_AUTH.clone(),
+        )
+        .await?;
     assert_eq!(stats.last_7_days, expected);
     assert_eq!(stats.last_30_days, expected);
+
+    // No wall time elapses on the consensus clock comparable to a week.
+    // Advancing seven block buckets must move both flows out of only the week.
+    fixtures.bitcoin().mine_blocks(7 * 144).await;
+    let later = retry(
+        "waiting for the guardian's block count",
+        backoff_util::aggressive_backoff(),
+        || async {
+            let later: LightningVolumeStats = api
+                .request_admin(
+                    VOLUME_STATS_ENDPOINT,
+                    ApiRequestErased::default(),
+                    API_AUTH.clone(),
+                )
+                .await?;
+            anyhow::ensure!(later.block_count >= stats.block_count + 7 * 144);
+            Ok::<_, anyhow::Error>(later)
+        },
+    )
+    .await?;
+    assert_eq!(
+        later.last_7_days,
+        LightningVolume {
+            sent: Amount::ZERO,
+            received: Amount::ZERO,
+            complete: true,
+        }
+    );
+    assert_eq!(later.last_30_days, expected);
 
     Ok(())
 }
@@ -1081,5 +1112,34 @@ mod db {
             },
         )
         .await
+    }
+}
+
+/// Wait until the federation has committed its first block count votes, so
+/// settled payments land in the bucket of the real chain height.
+async fn await_block_count_consensus(
+    _fixtures: &Fixtures,
+    client: &ClientHandleArc,
+) -> anyhow::Result<()> {
+    let lnv2_module_id = client
+        .get_first_instance(&LightningClientModule::kind())
+        .expect("the fixture federation runs lnv2");
+    loop {
+        let block_count: u64 = client
+            .api()
+            .with_module(lnv2_module_id)
+            .request_current_consensus(
+                CONSENSUS_BLOCK_COUNT_ENDPOINT.to_string(),
+                ApiRequestErased::default(),
+            )
+            .await?;
+        if block_count > 0 {
+            return Ok(());
+        }
+        fedimint_core::task::sleep_in_test(
+            "waiting for block count consensus",
+            Duration::from_millis(100),
+        )
+        .await;
     }
 }

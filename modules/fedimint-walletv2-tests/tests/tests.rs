@@ -11,6 +11,7 @@ use fedimint_core::task::sleep_in_test;
 use fedimint_dummy_client::DummyClientInit;
 use fedimint_dummy_server::DummyInit;
 use fedimint_eventlog::{Event, EventLogEntry, EventLogId};
+use fedimint_testing::API_AUTH;
 use fedimint_testing::btc::BitcoinTest;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_walletv2_client::events::{
@@ -280,15 +281,30 @@ async fn volume_stats_count_deposits_and_withdrawals() -> anyhow::Result<()> {
         .get_first_instance(&KIND)
         .expect("the fixture federation runs walletv2");
 
-    let stats: WalletVolumeStats = client
-        .api()
-        .with_module(wallet_module_id)
-        .request_current_consensus(
-            VOLUME_STATS_ENDPOINT.to_string(),
+    let peer = fed
+        .online_peer_ids()
+        .next()
+        .expect("fixture has an online peer");
+    let api = fed.new_admin_api(peer).await?.with_module(wallet_module_id);
+    let denied = api
+        .request_single_peer::<WalletVolumeStats>(
+            VOLUME_STATS_ENDPOINT.to_owned(),
             ApiRequestErased::default(),
+            peer,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        denied.to_string().contains("Invalid authorization"),
+        "{denied}"
+    );
+    let stats: WalletVolumeStats = api
+        .request_admin(
+            VOLUME_STATS_ENDPOINT,
+            ApiRequestErased::default(),
+            API_AUTH.clone(),
         )
         .await?;
-
     let expected = WalletVolume {
         deposited: Amount::from_int_btc(1),
         withdrawn: Amount::from_sat(10_000),

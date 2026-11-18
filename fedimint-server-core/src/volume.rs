@@ -1,33 +1,24 @@
 //! Windows over the per-day volume counters that modules keep.
 
-/// The days a volume window covers, `first_day..end_day`, ending with the
-/// current day.
-pub struct VolumeWindow {
-    pub first_day: u64,
-    pub end_day: u64,
+/// Map a module's consensus block count to its 144-block volume bucket.
+pub fn volume_day(block_count: u64) -> u64 {
+    block_count / 144
 }
 
-impl VolumeWindow {
-    pub fn new(today: u64, days: u64) -> Self {
-        Self {
-            first_day: (today + 1).saturating_sub(days),
-            end_day: today + 1,
-        }
-    }
+/// Bucket numbers included in a report, ending with the current bucket.
+pub fn volume_buckets(block_count: u64, days: u64) -> std::ops::Range<u64> {
+    let end = volume_day(block_count) + 1;
+    end.saturating_sub(days)..end
+}
 
-    /// Whether counting covered the whole window. `start` is the clock value,
-    /// in `units_per_day` units, when counting started; 0 means the clock had
-    /// not started, so counting started when the federation formed.
-    ///
-    /// Software from before the counters may have processed flows at the
-    /// very clock value counting started at, so the day counting started on
-    /// is never complete, even when it started at the day's first unit.
-    pub fn is_complete(&self, start: Option<u64>, units_per_day: u64) -> bool {
-        match start {
-            None => false,
-            Some(0) => true,
-            Some(start) => start < self.first_day * units_per_day,
-        }
+/// A guardian that upgraded during the first bucket may have missed flows,
+/// even if it started counting at that bucket's first block. Zero is the
+/// start marker for a guardian that counted from formation.
+pub fn counted_whole_window(start_block: Option<u64>, first_bucket: u64) -> bool {
+    match start_block {
+        None => false,
+        Some(0) => true,
+        Some(start) => volume_day(start) < first_bucket,
     }
 }
 
