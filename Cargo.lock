@@ -78,7 +78,7 @@ dependencies = [
 [[package]]
 name = "aleph-bft-crypto"
 version = "0.9.1"
-source = "git+https://github.com/fedibtc/AlephBFT?branch=roboman%2Fv0.36.0-fedi#a485405938a4509118178f1a02b715f97e9b241e"
+source = "git+https://github.com/fedibtc/AlephBFT?rev=a485405938a4509118178f1a02b715f97e9b241e#a485405938a4509118178f1a02b715f97e9b241e"
 dependencies = [
  "async-trait",
  "bit-vec",
@@ -90,7 +90,7 @@ dependencies = [
 [[package]]
 name = "aleph-bft-rmc"
 version = "0.12.0"
-source = "git+https://github.com/fedibtc/AlephBFT?branch=roboman%2Fv0.36.0-fedi#a485405938a4509118178f1a02b715f97e9b241e"
+source = "git+https://github.com/fedibtc/AlephBFT?rev=a485405938a4509118178f1a02b715f97e9b241e#a485405938a4509118178f1a02b715f97e9b241e"
 dependencies = [
  "aleph-bft-crypto",
  "aleph-bft-types",
@@ -104,7 +104,7 @@ dependencies = [
 [[package]]
 name = "aleph-bft-types"
 version = "0.13.0"
-source = "git+https://github.com/fedibtc/AlephBFT?branch=roboman%2Fv0.36.0-fedi#a485405938a4509118178f1a02b715f97e9b241e"
+source = "git+https://github.com/fedibtc/AlephBFT?rev=a485405938a4509118178f1a02b715f97e9b241e#a485405938a4509118178f1a02b715f97e9b241e"
 dependencies = [
  "aleph-bft-crypto",
  "async-trait",
@@ -3083,7 +3083,7 @@ dependencies = [
 [[package]]
 name = "fedimint-aleph-bft"
 version = "0.36.0"
-source = "git+https://github.com/fedibtc/AlephBFT?branch=roboman%2Fv0.36.0-fedi#a485405938a4509118178f1a02b715f97e9b241e"
+source = "git+https://github.com/fedibtc/AlephBFT?rev=a485405938a4509118178f1a02b715f97e9b241e#a485405938a4509118178f1a02b715f97e9b241e"
 dependencies = [
  "aleph-bft-rmc",
  "aleph-bft-types",
