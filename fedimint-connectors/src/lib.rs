@@ -1043,3 +1043,6 @@ impl<T: ?Sized> ConnectionState<T> {
 
 #[cfg(test)]
 mod reconnect_tests;
+
+#[cfg(test)]
+mod pool_tests;
