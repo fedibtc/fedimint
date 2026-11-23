@@ -785,7 +785,7 @@ pub struct ConnectionPool<T: IConnection + ?Sized> {
     /// single outgoing connection to a certain URL that is in the process
     /// of being established, or we already established.
     #[allow(clippy::type_complexity)]
-    connections: Arc<tokio::sync::Mutex<HashMap<SafeUrl, Arc<ConnectionState<T>>>>>,
+    connections: Arc<std::sync::Mutex<HashMap<SafeUrl, Arc<ConnectionState<T>>>>>,
 }
 
 impl<T: IConnection + ?Sized> Clone for ConnectionPool<T> {
@@ -802,13 +802,13 @@ impl<T: IConnection + ?Sized> ConnectionPool<T> {
     pub fn new(connectors: ConnectorRegistry) -> Self {
         Self {
             connectors,
-            connections: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
             active_connections: watch::channel(BTreeSet::new()).0,
         }
     }
 
-    async fn get_or_init_pool_entry(&self, url: &SafeUrl) -> Arc<ConnectionState<T>> {
-        let mut pool_locked = self.connections.lock().await;
+    fn get_or_init_pool_entry(&self, url: &SafeUrl) -> Arc<ConnectionState<T>> {
+        let mut pool_locked = self.connections.lock().expect("locking error");
         pool_locked
             .entry(url.to_owned())
             .and_modify(|entry_arc| {
@@ -845,7 +845,7 @@ impl<T: IConnection + ?Sized> ConnectionPool<T> {
         F: Fn(SafeUrl, Option<String>, ConnectorRegistry) -> Fut + Clone + Send + Sync + 'static,
         Fut: Future<Output = ServerResult<Arc<T>>> + Send + 'static,
     {
-        let pool_entry_arc = self.get_or_init_pool_entry(url).await;
+        let pool_entry_arc = self.get_or_init_pool_entry(url);
 
         let leader_tx = loop {
             let mut leader_rx = {
@@ -923,7 +923,7 @@ impl<T: IConnection + ?Sized> ConnectionPool<T> {
                         // This will update the `active_connections` just like calling
                         // `get_or_create_connection` normally do, but we will
                         // not attempt to do anything with the result (i.e. try to connect).
-                        s.get_or_init_pool_entry(&url).await;
+                        s.get_or_init_pool_entry(&url);
                     }
                 });
 
