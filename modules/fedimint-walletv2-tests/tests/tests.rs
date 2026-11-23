@@ -244,7 +244,7 @@ async fn receive_reports_confirmation_progress() -> anyhow::Result<()> {
     let progress = module.address_receive_progress(&address).await?.deposits;
 
     // The query across all addresses must agree, and keep the address.
-    let all = module.all_receive_progress().await;
+    let all = module.all_receive_progress().await.deposits;
     assert!(all.iter().all(|(paid, _, _)| *paid == address));
     assert_eq!(
         all.into_iter()
