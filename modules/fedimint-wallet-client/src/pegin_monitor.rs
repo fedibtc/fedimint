@@ -1,4 +1,5 @@
 use std::cmp;
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 use anyhow::anyhow;
@@ -388,6 +389,25 @@ fn deposit_confirmations(
     ))
 }
 
+/// Each output in `history` that pays `script`, once, even when the backend
+/// lists its transaction more than once.
+fn unique_deposit_outputs(
+    history: Vec<bitcoin::Transaction>,
+    script: &ScriptBuf,
+) -> Vec<(bitcoin::Transaction, bitcoin::OutPoint)> {
+    let mut seen = BTreeSet::new();
+    filter_onchain_deposit_outputs(history.into_iter(), script)
+        .map(|(transaction, out_idx)| {
+            let outpoint = bitcoin::OutPoint {
+                txid: transaction.compute_txid(),
+                vout: out_idx,
+            };
+            (transaction, outpoint)
+        })
+        .filter(|(_, outpoint)| seen.insert(*outpoint))
+        .collect()
+}
+
 /// The progress of every output the bitcoin backend reports paying the address
 /// of `tweak_idx` that this client has no claim record for, from the same
 /// sources [`check_idx_pegins`] claims with.
@@ -403,13 +423,7 @@ pub(crate) async fn deposit_progress(
     let history = btc_rpc.get_script_history(&script).await?;
 
     let mut deposits = vec![];
-    for (transaction, out_idx) in filter_onchain_deposit_outputs(history.into_iter(), &script) {
-        let txid = transaction.compute_txid();
-        let outpoint = bitcoin::OutPoint {
-            txid,
-            vout: out_idx,
-        };
-
+    for (transaction, outpoint) in unique_deposit_outputs(history, &script) {
         let claimed_peg_in_key = ClaimedPegInKey {
             peg_in_index: tweak_idx,
             btc_out_point: outpoint,
@@ -424,7 +438,7 @@ pub(crate) async fn deposit_progress(
             continue;
         }
 
-        let confirmations = match btc_rpc.get_tx_block_height(&txid).await? {
+        let confirmations = match btc_rpc.get_tx_block_height(&outpoint.txid).await? {
             Some(tx_block_height) => deposit_confirmations(
                 tx_block_height.saturating_add(1),
                 consensus_block_count,
@@ -435,7 +449,7 @@ pub(crate) async fn deposit_progress(
 
         deposits.push(DepositProgress {
             outpoint,
-            value: transaction.output[out_idx as usize].value,
+            value: transaction.output[outpoint.vout as usize].value,
             confirmations,
             required: required_confirmations(data.cfg.finality_delay),
         });
@@ -729,5 +743,38 @@ mod deposit_progress_tests {
         assert_eq!(deposit_confirmations(200, 95, 10), 0);
         // Stops at the target however deep the deposit gets.
         assert_eq!(deposit_confirmations(50, 95, 10), 11);
+    }
+
+    #[test]
+    fn a_repeated_transaction_lists_each_deposit_output_once() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::hashes::Hash;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, OutPoint, Transaction, TxOut, WScriptHash};
+
+        let ours = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([1; 32]));
+        let foreign = ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([2; 32]));
+        let pay = |script: &ScriptBuf| TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: script.clone(),
+        };
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![pay(&ours), pay(&foreign), pay(&ours)],
+        };
+        let txid = transaction.compute_txid();
+
+        // A wallet history can list a transaction once per output it pays.
+        let outputs = unique_deposit_outputs(vec![transaction.clone(), transaction], &ours);
+
+        assert_eq!(
+            outputs
+                .into_iter()
+                .map(|(_, outpoint)| outpoint)
+                .collect::<Vec<_>>(),
+            vec![OutPoint { txid, vout: 0 }, OutPoint { txid, vout: 2 }]
+        );
     }
 }
