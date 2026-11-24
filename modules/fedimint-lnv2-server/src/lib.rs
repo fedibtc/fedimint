@@ -280,6 +280,7 @@ impl ServerModuleInit for LightningInit {
 
         Ok(Lightning {
             cfg: args.cfg().to_typed()?,
+            our_peer_id: args.our_peer_id(),
             db: args.db().clone(),
             server_bitcoin_rpc_monitor: args.server_bitcoin_rpc_monitor(),
         })
@@ -432,6 +433,7 @@ fn dealer_sk(polynomial: &[Scalar], peer: PeerId) -> SecretKeyShare {
 #[derive(Debug)]
 pub struct Lightning {
     cfg: LightningConfig,
+    our_peer_id: PeerId,
     db: Database,
     server_bitcoin_rpc_monitor: ServerBitcoinRpcMonitor,
 }
@@ -443,15 +445,26 @@ impl ServerModule for Lightning {
 
     async fn consensus_proposal(
         &self,
-        _dbtx: &mut DatabaseTransaction<'_>,
+        dbtx: &mut DatabaseTransaction<'_>,
     ) -> Vec<LightningConsensusItem> {
+        // With quiescence on we only propose a vote that our peers accept,
+        // mirroring the checks in process_consensus_item. Proposing a redundant
+        // vote every second would keep the atomic broadcast creating units on an
+        // idle federation.
+        let quiescent = fedimint_server_core::quiescence::is_enabled();
+        let mut items = Vec::new();
+
         // We reduce the time granularity to deduplicate votes more often and not save
         // one consensus item every second.
-        let mut items = vec![LightningConsensusItem::UnixTimeVote(
-            60 * (duration_since_epoch().as_secs() / 60),
-        )];
+        let unix_time = 60 * (duration_since_epoch().as_secs() / 60);
 
-        if let Ok(block_count) = self.get_block_count() {
+        if !quiescent || unix_time > self.our_unix_time_vote(dbtx).await {
+            items.push(LightningConsensusItem::UnixTimeVote(unix_time));
+        }
+
+        if let Ok(block_count) = self.get_block_count()
+            && (!quiescent || block_count > self.our_block_count_vote(dbtx).await)
+        {
             trace!(target: LOG_MODULE_LNV2, ?block_count, "Proposing block count");
             items.push(LightningConsensusItem::BlockCountVote(block_count));
         }
@@ -838,6 +851,18 @@ impl Lightning {
             .status()
             .map(|status| status.block_count)
             .context("Block count not available yet")
+    }
+
+    async fn our_block_count_vote(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
+        dbtx.get_value(&BlockCountVoteKey(self.our_peer_id))
+            .await
+            .unwrap_or(0)
+    }
+
+    async fn our_unix_time_vote(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
+        dbtx.get_value(&UnixTimeVoteKey(self.our_peer_id))
+            .await
+            .unwrap_or(0)
     }
 
     async fn consensus_block_count(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
