@@ -41,7 +41,9 @@ use crate::config::ServerConfig;
 use crate::consensus::aleph_bft::backup::{BackupReader, BackupWriter};
 use crate::consensus::aleph_bft::data_provider::{DataProvider, UnitData};
 use crate::consensus::aleph_bft::finalization_handler::{FinalizationHandler, OrderedUnit};
-use crate::consensus::aleph_bft::host_sync::{align_to_wall_clock, coordinator_socket};
+use crate::consensus::aleph_bft::host_sync::{
+    align_to_wall_clock, coordinator_socket, round_phase,
+};
 use crate::consensus::aleph_bft::keychain::Keychain;
 use crate::consensus::aleph_bft::network::Network;
 use crate::consensus::aleph_bft::spawner::Spawner;
@@ -355,9 +357,9 @@ impl ConsensusEngine {
 
         let mut delay_config = aleph_bft::default_delay_config();
 
-        // With a host sync coordinator, end rounds on the host's shared
-        // wall-clock grid so that the host's guardians sync together.
-        let align_rounds = coordinator_socket().is_some();
+        // With a host sync coordinator, end rounds on the host's grid so that
+        // the host's guardians sync together.
+        let round_phase = coordinator_socket().and_then(|_| round_phase());
         let round_period = Duration::from_millis(self.cfg.local.broadcast_round_delay_ms.into());
 
         delay_config.unit_creation_delay = Arc::new(move |round_index| {
@@ -380,10 +382,9 @@ impl ConsensusEngine {
 
             let delay = Duration::from_millis(delay.round() as u64);
 
-            if align_rounds {
-                align_to_wall_clock(delay, round_period)
-            } else {
-                delay
+            match round_phase {
+                Some(phase) => align_to_wall_clock(delay, round_period, phase),
+                None => delay,
             }
         });
 

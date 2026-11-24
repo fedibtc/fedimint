@@ -39,6 +39,12 @@ pub const FM_DEBUG_SHOW_SECRETS_ENV: &str = "FM_DEBUG_SHOW_SECRETS";
 /// `fedimint_server::consensus::aleph_bft::host_sync`.
 pub const FM_BACKUP_SYNC_COORDINATOR_ENV: &str = "FM_BACKUP_SYNC_COORDINATOR";
 
+/// This host's phase on the round grid, in microseconds: with
+/// [`FM_BACKUP_SYNC_COORDINATOR_ENV`], rounds end at wall-clock multiples of
+/// the round delay plus this. Each host picks its own; without it rounds stay
+/// unaligned.
+pub const FM_BACKUP_SYNC_PHASE_US_ENV: &str = "FM_BACKUP_SYNC_PHASE_US";
+
 /// Check if env variable is set and not equal `0` or `false` which are common
 /// ways to disable something.
 pub fn is_env_var_set(var: &str) -> bool {
