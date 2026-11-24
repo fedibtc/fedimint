@@ -875,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn parent_client_validates_happy_path_and_retirement() {
         let (parent, mut child) = tokio::io::duplex(4096);
-        let child_task = tokio::spawn(async move {
+        let child_task = fedimint_core::runtime::spawn("driven test child", async move {
             write_hello(&mut child, ChildState::NeedsParams).await;
             let _: ParentMessage = read_frame(&mut child).await.unwrap();
             write_frame(&mut child, &ChildMessage::DkgStarted {})
@@ -925,7 +925,7 @@ mod tests {
     #[tokio::test]
     async fn parent_client_accepts_already_configured_path() {
         let (parent, mut child) = tokio::io::duplex(1024);
-        tokio::spawn(async move {
+        fedimint_core::runtime::spawn("driven test child", async move {
             write_hello(
                 &mut child,
                 ChildState::AlreadyConfigured {
@@ -959,7 +959,7 @@ mod tests {
     #[tokio::test]
     async fn parent_client_reports_params_rejected_as_terminal() {
         let (parent, mut child) = tokio::io::duplex(1024);
-        tokio::spawn(async move {
+        fedimint_core::runtime::spawn("driven test child", async move {
             write_hello(&mut child, ChildState::NeedsParams).await;
             let _: ParentMessage = read_frame(&mut child).await.unwrap();
             write_frame(
@@ -1012,7 +1012,7 @@ mod tests {
     #[tokio::test]
     async fn parent_client_rejects_version_mismatch() {
         let (parent, mut child) = tokio::io::duplex(1024);
-        tokio::spawn(async move {
+        fedimint_core::runtime::spawn("driven test child", async move {
             write_frame(
                 &mut child,
                 &ChildMessage::Hello {
@@ -1229,10 +1229,10 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let final_path = parent.path().join("fedimintd");
         fs::create_dir(&final_path).unwrap();
-        fs::write(final_path.join("partial"), b"partial").unwrap();
+        fedimint_core::util::write_new(final_path.join("partial"), b"partial").unwrap();
         let stale_staging = staging_path(&final_path).unwrap();
         fs::create_dir(&stale_staging).unwrap();
-        fs::write(stale_staging.join("stale"), b"stale").unwrap();
+        fedimint_core::util::write_new(stale_staging.join("stale"), b"stale").unwrap();
 
         let staging = prepare_staging(&final_path).unwrap();
         assert!(!final_path.exists());
@@ -1245,7 +1245,7 @@ mod tests {
                 0o700
             );
         }
-        fs::write(staging.join("complete"), b"complete").unwrap();
+        fedimint_core::util::write_new(staging.join("complete"), b"complete").unwrap();
 
         install_staging(&staging, &final_path).unwrap();
 
@@ -1258,7 +1258,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let final_path = parent.path().join("fedimintd");
         fs::create_dir(&final_path).unwrap();
-        fs::write(final_path.join(SALT_FILE), b"existing salt").unwrap();
+        fedimint_core::util::write_new(final_path.join(SALT_FILE), b"existing salt").unwrap();
 
         let error = ensure_no_config_artifacts(&final_path).unwrap_err();
 

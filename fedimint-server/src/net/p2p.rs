@@ -417,7 +417,7 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                         // frame must finish before we retire a healthy connection.
                         let _ = stop_receive.send(());
                         if let Err(error) = (&mut receive_loop).await {
-                            debug!(target: LOG_NET_PEER, %error, "Retired connection failed while draining an accepted frame");
+                            debug!(target: LOG_NET_PEER, err = %error.fmt_compact_anyhow(), "Retired connection failed while draining an accepted frame");
                         }
                     }
                     return match halt {
