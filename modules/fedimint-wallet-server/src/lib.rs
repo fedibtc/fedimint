@@ -524,6 +524,8 @@ impl ServerModule for Wallet {
             .collect::<Vec<WalletConsensusItem>>()
             .await;
 
+        let quiescent = fedimint_server_core::quiescence::is_enabled();
+
         // If we are unable to get a block count from the node we skip adding a block
         // count vote to consensus items.
         //
@@ -569,7 +571,14 @@ impl ServerModule for Wallet {
                 );
 
                 WALLET_BLOCK_COUNT.set(i64::from(block_count_vote));
-                items.push(WalletConsensusItem::BlockCount(block_count_vote));
+
+                // With quiescence on we only propose a vote that our peers accept,
+                // mirroring the checks in process_consensus_item. Proposing a
+                // redundant vote every second would keep the atomic broadcast
+                // creating units on an idle federation.
+                if !quiescent || block_count_vote > current_vote {
+                    items.push(WalletConsensusItem::BlockCount(block_count_vote));
+                }
             }
             Err(err) => {
                 warn!(target: LOG_MODULE_WALLET, err = %err.fmt_compact_anyhow(), "Can't update block count");
@@ -578,7 +587,11 @@ impl ServerModule for Wallet {
 
         let fee_rate_proposal = self.get_fee_rate_opt();
 
-        items.push(WalletConsensusItem::Feerate(fee_rate_proposal));
+        if !quiescent
+            || Some(fee_rate_proposal) != dbtx.get_value(&FeeRateVoteKey(self.our_peer_id)).await
+        {
+            items.push(WalletConsensusItem::Feerate(fee_rate_proposal));
+        }
 
         // Consensus upgrade activation voting
         let manual_vote = dbtx
@@ -604,9 +617,17 @@ impl ServerModule for Wallet {
                 })
         };
 
+        let our_consensus_version_vote = dbtx
+            .get_value(&ConsensusVersionVoteKey(self.our_peer_id))
+            .await
+            .unwrap_or(ModuleConsensusVersion::new(2, 0));
+
         // Prioritizing automatic vote for now since the manual vote never resets. Once
         // that is fixed this should be switched around.
-        if let Some(vote_version) = automatic_vote.or(manual_vote) {
+        if let Some(vote_version) = automatic_vote
+            .or(manual_vote)
+            .filter(|vote_version| !quiescent || our_consensus_version_vote < *vote_version)
+        {
             items.push(WalletConsensusItem::ModuleConsensusVersion(vote_version));
         }
 
