@@ -18,7 +18,7 @@ use tracing::{error, trace};
 
 use super::super::db::SignedSessionOutcomeKey;
 use super::super::peer_availability::PeerActivity;
-use super::data_provider::UnitData;
+use super::data_provider::{PendingBatches, UnitData};
 use super::keychain::Keychain;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -44,6 +44,7 @@ pub struct Network {
     peer_activity: Arc<Mutex<PeerActivity>>,
     signed_outcomes_sender: Sender<(PeerId, SignedSessionOutcome)>,
     signatures_sender: Sender<(PeerId, schnorr::Signature)>,
+    pending_batches: PendingBatches,
     db: Database,
 }
 
@@ -53,6 +54,7 @@ impl Network {
         peer_activity: Arc<Mutex<PeerActivity>>,
         signed_outcomes_sender: Sender<(PeerId, SignedSessionOutcome)>,
         signatures_sender: Sender<(PeerId, schnorr::Signature)>,
+        pending_batches: PendingBatches,
         db: Database,
     ) -> Self {
         Self {
@@ -60,6 +62,7 @@ impl Network {
             peer_activity,
             signed_outcomes_sender,
             signatures_sender,
+            pending_batches,
             db,
         }
     }
@@ -105,9 +108,16 @@ impl aleph_bft::Network<NetworkData> for Network {
 
                     match NetworkData::decode(&mut IoReader(bytes.as_slice())) {
                         Ok(network_data) => {
+                            let included = network_data.included();
+
                             // in order to bound the RAM consumption of a session we have to bound
                             // the size of an individual unit in memory
-                            if network_data.included_data().iter().all(UnitData::is_valid) {
+                            if included.iter().all(|included| included.data.is_valid()) {
+                                // a quiescent data provider wakes up to order our peers' batches
+                                for included in &included {
+                                    self.pending_batches.heard(included);
+                                }
+
                                 return Some(network_data);
                             }
 

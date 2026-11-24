@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Instant;
 
-use fedimint_core::TransactionId;
+use aleph_bft::{IncludedData, Round};
 use fedimint_core::config::ALEPH_BFT_UNIT_BYTE_LIMIT;
 use fedimint_core::encoding::Encodable;
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::secp256k1::schnorr;
+use fedimint_core::{PeerId, TransactionId};
 use tokio::sync::watch;
 
 use crate::LOG_CONSENSUS;
@@ -29,6 +31,96 @@ impl UnitData {
     }
 }
 
+/// The batches of this session that, as far as we know, await ordering: the
+/// ones we attached to our own units and the ones we received in our peers'
+/// units. A quiescent [`DataProvider`] keeps creating units while there are
+/// any, such that a batch which only one guardian has gets ordered right
+/// away rather than once every guardian has work of its own.
+///
+/// The [`DataProvider`] counts our batches as it creates them, the
+/// [`super::network::Network`] records our peers' batches as their units
+/// arrive, and the [`super::finalization_handler::FinalizationHandler`]
+/// clears both as they are ordered.
+#[derive(Clone)]
+pub struct PendingBatches(Arc<watch::Sender<PendingBatchesState>>);
+
+#[derive(Debug, Default)]
+pub struct PendingBatchesState {
+    ours: usize,
+    /// Our peers' unordered batches by the creator and round of their unit,
+    /// since two guardians may attach equal batches to their units.
+    peers: BTreeSet<(PeerId, Round)>,
+    /// Aleph BFT rebroadcasts a guardian's latest unit until it creates the
+    /// next one and sends units again in responses, so we remember which units
+    /// were ordered in order to not take such a copy for new work.
+    ordered: BTreeSet<(PeerId, Round)>,
+}
+
+impl PendingBatchesState {
+    fn is_empty(&self) -> bool {
+        self.ours == 0 && self.peers.is_empty()
+    }
+}
+
+impl Default for PendingBatches {
+    fn default() -> Self {
+        Self(Arc::new(watch::channel(PendingBatchesState::default()).0))
+    }
+}
+
+impl PendingBatches {
+    fn created(&self) {
+        self.0.send_if_modified(|state| {
+            state.ours += 1;
+            // only a peer's batch needs to wake a parked data provider
+            false
+        });
+    }
+
+    /// Record a batch received in a peer's unit. The unit is not verified yet,
+    /// so a peer can keep us from going quiescent, but nothing else.
+    pub fn heard(&self, included: &IncludedData<UnitData>) {
+        if !matches!(included.data, UnitData::Batch(..)) {
+            return;
+        }
+
+        // a peer can name any node index in a message it sends us
+        let Some(creator) = super::to_peer_id(included.creator) else {
+            return;
+        };
+
+        let unit = (creator, included.round);
+
+        self.0
+            .send_if_modified(|state| !state.ordered.contains(&unit) && state.peers.insert(unit));
+    }
+
+    pub fn ordered(&self, creator: PeerId, round: Round, ours: bool, data: &UnitData) {
+        if !matches!(data, UnitData::Batch(..)) {
+            return;
+        }
+
+        self.0.send_if_modified(|state| {
+            // Aleph BFT replays every unit of the current session from our backup on
+            // a restart, thereby ordering batches we have not created in this
+            // process. Hence we saturate at zero instead of underflowing.
+            if ours {
+                state.ours = state.ours.saturating_sub(1);
+            }
+
+            state.peers.remove(&(creator, round));
+            state.ordered.insert((creator, round));
+
+            // ordering never gives a parked data provider work
+            false
+        });
+    }
+
+    fn subscribe(&self) -> watch::Receiver<PendingBatchesState> {
+        self.0.subscribe()
+    }
+}
+
 pub struct DataProvider {
     mempool_item_receiver: async_channel::Receiver<ConsensusItem>,
     signature_receiver: watch::Receiver<Option<schnorr::Signature>>,
@@ -36,6 +128,10 @@ pub struct DataProvider {
     leftover_item: Option<ConsensusItem>,
     timestamp_sender: async_channel::Sender<Instant>,
     is_recovery: bool,
+    pending_batches: PendingBatches,
+    pending_changes: watch::Receiver<PendingBatchesState>,
+    park_deadline: Option<Instant>,
+    quiescence: watch::Receiver<bool>,
 }
 
 impl DataProvider {
@@ -44,6 +140,8 @@ impl DataProvider {
         signature_receiver: watch::Receiver<Option<schnorr::Signature>>,
         timestamp_sender: async_channel::Sender<Instant>,
         is_recovery: bool,
+        pending_batches: PendingBatches,
+        park_deadline: Option<Instant>,
     ) -> Self {
         Self {
             mempool_item_receiver,
@@ -52,6 +150,20 @@ impl DataProvider {
             leftover_item: None,
             timestamp_sender,
             is_recovery,
+            pending_changes: pending_batches.subscribe(),
+            pending_batches,
+            park_deadline,
+            quiescence: fedimint_server_core::quiescence::subscribe(),
+        }
+    }
+
+    /// Whether the item is not a transaction we already attached to a unit.
+    fn is_new(&mut self, item: &ConsensusItem) -> bool {
+        match item {
+            ConsensusItem::Transaction(transaction) => {
+                self.submitted_transactions.insert(transaction.tx_hash())
+            }
+            _ => true,
         }
     }
 }
@@ -59,58 +171,353 @@ impl DataProvider {
 #[async_trait::async_trait]
 impl aleph_bft::DataProvider<UnitData> for DataProvider {
     async fn get_data(&mut self) -> Option<UnitData> {
-        // we only attach our signature as no more items can be ordered in this session
-        if let Some(signature) = *self.signature_receiver.borrow() {
-            return Some(UnitData::Signature(signature.serialize()));
-        }
-
-        // the length of a vector is encoded in at most 9 bytes
-        let mut n_bytes = 9;
-        let mut items = Vec::new();
-
-        if let Some(item) = self.leftover_item.take() {
-            let n_bytes_item = item.consensus_encode_to_vec().len();
-
-            if n_bytes_item + n_bytes <= ALEPH_BFT_UNIT_BYTE_LIMIT {
-                n_bytes += n_bytes_item;
-                items.push(item);
-            } else {
-                tracing::warn!(target: LOG_CONSENSUS, ?item, "Consensus item length is over BYTE_LIMIT");
+        loop {
+            // we only attach our signature as no more items can be ordered in this session
+            if let Some(signature) = *self.signature_receiver.borrow() {
+                return Some(UnitData::Signature(signature.serialize()));
             }
-        }
 
-        // if the channel is empty we want to return the batch immediately in order to
-        // not delay the creation of our next unit, even if the batch is empty
-        while let Ok(item) = self.mempool_item_receiver.try_recv() {
-            if let ConsensusItem::Transaction(transaction) = &item
-                && !self.submitted_transactions.insert(transaction.tx_hash())
+            // the length of a vector is encoded in at most 9 bytes
+            let mut n_bytes = 9;
+            let mut items = Vec::new();
+
+            if let Some(item) = self.leftover_item.take() {
+                let n_bytes_item = item.consensus_encode_to_vec().len();
+
+                if n_bytes_item + n_bytes <= ALEPH_BFT_UNIT_BYTE_LIMIT {
+                    n_bytes += n_bytes_item;
+                    items.push(item);
+                } else {
+                    tracing::warn!(target: LOG_CONSENSUS, ?item, "Consensus item length is over BYTE_LIMIT");
+                }
+            }
+
+            // we only drain the items which are available right away in order to not
+            // delay the creation of our next unit
+            while let Ok(item) = self.mempool_item_receiver.try_recv() {
+                if !self.is_new(&item) {
+                    continue;
+                }
+
+                let n_bytes_item = item.consensus_encode_to_vec().len();
+
+                if n_bytes + n_bytes_item <= ALEPH_BFT_UNIT_BYTE_LIMIT {
+                    n_bytes += n_bytes_item;
+                    items.push(item);
+                } else {
+                    self.leftover_item = Some(item);
+                    break;
+                }
+            }
+
+            if !items.is_empty() {
+                if !self.is_recovery {
+                    self.timestamp_sender.send(Instant::now()).await.ok();
+                }
+
+                let bytes = items.consensus_encode_to_vec();
+
+                assert!(bytes.len() <= ALEPH_BFT_UNIT_BYTE_LIMIT);
+
+                self.pending_batches.created();
+
+                return Some(UnitData::Batch(bytes));
+            }
+
+            // Without quiescence we create a unit every round, with or without data.
+            // With it, as long as a batch of ours or of a peer still awaits ordering
+            // we keep creating units without data such that the broadcast grows the
+            // dag and orders it, otherwise there is no work to be done and we go
+            // quiescent until an item is submitted to us, a peer's batch arrives, the
+            // session ends, the park deadline passes, or quiescence is turned off.
+            let park_deadline = self.park_deadline?;
+
+            if !*self.quiescence.borrow_and_update()
+                || Instant::now() >= park_deadline
+                || !self.pending_changes.borrow_and_update().is_empty()
             {
-                continue;
+                return None;
             }
 
-            let n_bytes_item = item.consensus_encode_to_vec().len();
-
-            if n_bytes + n_bytes_item <= ALEPH_BFT_UNIT_BYTE_LIMIT {
-                n_bytes += n_bytes_item;
-                items.push(item);
-            } else {
-                self.leftover_item = Some(item);
-                break;
+            tokio::select! {
+                item = self.mempool_item_receiver.recv() => {
+                    match item {
+                        Ok(item) => {
+                            if self.is_new(&item) {
+                                self.leftover_item = Some(item);
+                            }
+                        }
+                        // the sender is dropped as the server shuts down, in which case
+                        // we park instead of spinning on the closed channel
+                        Err(..) => std::future::pending::<()>().await,
+                    }
+                }
+                changed = self.signature_receiver.changed() => {
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                // The switch lives as long as the process.
+                _ = self.quiescence.changed() => {}
+                // We hold the sender ourselves.
+                _ = self.pending_changes.changed() => {}
+                () = tokio::time::sleep_until(park_deadline.into()) => {}
             }
         }
+    }
+}
 
-        if items.is_empty() {
-            return None;
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use aleph_bft::DataProvider as _;
+    use fedimint_core::encoding::Decodable as _;
+    use fedimint_core::module::registry::ModuleDecoderRegistry;
+    use fedimint_core::transaction::{Transaction, TransactionSignature};
+
+    use super::*;
+
+    const PARKED: Duration = Duration::from_millis(300);
+
+    fn transaction(nonce: u8) -> ConsensusItem {
+        ConsensusItem::Transaction(Transaction {
+            inputs: vec![],
+            outputs: vec![],
+            nonce: [nonce; 8],
+            signatures: TransactionSignature::NaiveMultisig(vec![]),
+        })
+    }
+
+    fn batch_items(data: Option<UnitData>) -> Vec<ConsensusItem> {
+        let Some(UnitData::Batch(bytes)) = data else {
+            panic!("expected a batch, got {data:?}");
+        };
+        Vec::<ConsensusItem>::consensus_decode_whole(&bytes, &ModuleDecoderRegistry::default())
+            .expect("a batch decodes")
+    }
+
+    fn batch(nonce: u8) -> UnitData {
+        UnitData::Batch(vec![transaction(nonce)].consensus_encode_to_vec())
+    }
+
+    struct Harness {
+        provider: DataProvider,
+        mempool: async_channel::Sender<ConsensusItem>,
+        signature: watch::Sender<Option<schnorr::Signature>>,
+        batches: PendingBatches,
+        _timestamps: async_channel::Receiver<Instant>,
+    }
+
+    fn harness(park_deadline: Option<Instant>) -> Harness {
+        let (mempool, mempool_receiver) = async_channel::unbounded();
+        let (signature, signature_receiver) = watch::channel(None);
+        let (timestamp_sender, timestamps) = async_channel::unbounded();
+        let batches = PendingBatches::default();
+        Harness {
+            provider: DataProvider::new(
+                mempool_receiver,
+                signature_receiver,
+                timestamp_sender,
+                false,
+                batches.clone(),
+                park_deadline,
+            ),
+            mempool,
+            signature,
+            batches,
+            _timestamps: timestamps,
         }
+    }
 
-        if !self.is_recovery {
-            self.timestamp_sender.send(Instant::now()).await.ok();
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
+
+    async fn parks(provider: &mut DataProvider) -> bool {
+        tokio::time::timeout(PARKED, provider.get_data())
+            .await
+            .is_err()
+    }
+
+    async fn returns(provider: &mut DataProvider) -> Option<UnitData> {
+        tokio::time::timeout(PARKED, provider.get_data())
+            .await
+            .expect("get_data returns without parking")
+    }
+
+    /// Run `wake` shortly after `get_data` has parked, and return its result.
+    async fn woken_by(
+        provider: &mut DataProvider,
+        wake: impl FnOnce() + Send + 'static,
+    ) -> Option<UnitData> {
+        let waker = fedimint_core::runtime::spawn("data provider test waker", async move {
+            fedimint_core::runtime::sleep(Duration::from_millis(100)).await;
+            wake();
+        });
+        let data = tokio::time::timeout(PARKED * 3, provider.get_data())
+            .await
+            .expect("the wake-up ends the park");
+        waker.await.expect("the waker does not panic");
+        data
+    }
+
+    fn unit(creator: u16, round: Round, data: UnitData) -> IncludedData<UnitData> {
+        IncludedData {
+            creator: super::super::to_node_index(PeerId::from(creator)),
+            round,
+            data,
         }
+    }
 
-        let bytes = items.consensus_encode_to_vec();
+    #[test]
+    fn pending_batches_track_ours_and_unordered_peer_batches() {
+        let us = PeerId::from(0);
+        let peer = PeerId::from(1);
+        let other_peer = PeerId::from(2);
 
-        assert!(bytes.len() <= ALEPH_BFT_UNIT_BYTE_LIMIT);
+        let batches = PendingBatches::default();
+        let mut changes = batches.subscribe();
+        assert!(changes.borrow_and_update().is_empty());
 
-        Some(UnitData::Batch(bytes))
+        // Ordering a batch of ours replayed from the backup must not underflow.
+        batches.ordered(us, 1, true, &batch(1));
+        assert!(batches.subscribe().borrow().is_empty());
+
+        // Our own batches count until ordered, without waking anyone.
+        batches.created();
+        batches.created();
+        assert!(!changes.has_changed().expect("sender alive"));
+        batches.ordered(us, 2, true, &batch(2));
+        assert!(!changes.borrow().is_empty());
+        batches.ordered(us, 3, true, &batch(3));
+        assert!(changes.borrow().is_empty());
+
+        // A peer's batch is pending from its arrival until it is ordered, and
+        // its arrival wakes a parked provider.
+        batches.heard(&unit(1, 4, batch(4)));
+        assert!(changes.has_changed().expect("sender alive"));
+        assert!(!changes.borrow_and_update().is_empty());
+
+        // Another copy of the same unit is the same batch.
+        batches.heard(&unit(1, 4, batch(4)));
+        assert!(!changes.has_changed().expect("sender alive"));
+        batches.ordered(peer, 4, false, &batch(4));
+        assert!(changes.borrow().is_empty());
+
+        // A rebroadcast of an ordered unit is no new work.
+        batches.heard(&unit(1, 4, batch(4)));
+        assert!(!changes.has_changed().expect("sender alive"));
+        assert!(changes.borrow().is_empty());
+
+        // Two peers' equal batches stay pending until both are ordered.
+        batches.heard(&unit(1, 5, batch(5)));
+        batches.heard(&unit(2, 5, batch(5)));
+        assert!(!changes.borrow_and_update().is_empty());
+        batches.ordered(peer, 5, false, &batch(5));
+        assert!(!changes.borrow().is_empty());
+        batches.ordered(other_peer, 5, false, &batch(5));
+        assert!(changes.borrow().is_empty());
+
+        // Units without a batch, and units naming no possible peer, are no work.
+        batches.heard(&unit(1, 6, UnitData::Signature([7; 64])));
+        batches.heard(&IncludedData {
+            creator: aleph_bft::NodeIndex(usize::MAX),
+            round: 6,
+            data: batch(6),
+        });
+        assert!(!changes.has_changed().expect("sender alive"));
+        assert!(changes.borrow().is_empty());
+    }
+
+    // A single test, since the switch is a process global.
+    #[tokio::test]
+    async fn quiescence_parks_only_without_work_and_only_while_switched_on() {
+        use fedimint_server_core::quiescence::set_enabled;
+
+        set_enabled(false);
+
+        // Off: a unit every round, with or without data.
+        let mut h = harness(Some(far_deadline()));
+        assert_eq!(returns(&mut h.provider).await, None);
+        assert_eq!(returns(&mut h.provider).await, None);
+
+        set_enabled(true);
+
+        // On and idle: no unit until there is work.
+        assert!(parks(&mut h.provider).await);
+
+        // An item submitted while parked is attached at once.
+        let mempool = h.mempool.clone();
+        let ours = woken_by(&mut h.provider, move || {
+            mempool.try_send(transaction(1)).expect("unbounded");
+        })
+        .await;
+        assert_eq!(batch_items(ours.clone()), vec![transaction(1)]);
+
+        // Units without data continue while our batch awaits ordering.
+        assert_eq!(returns(&mut h.provider).await, None);
+        assert_eq!(returns(&mut h.provider).await, None);
+
+        // Once it is ordered, we park again.
+        h.batches
+            .ordered(PeerId::from(0), 1, true, ours.as_ref().expect("a batch"));
+        assert!(parks(&mut h.provider).await);
+
+        // A transaction we already attached does not wake us.
+        h.mempool.try_send(transaction(1)).expect("unbounded");
+        assert!(parks(&mut h.provider).await);
+
+        // A peer's batch wakes us, and we create units until it is ordered.
+        let batches = h.batches.clone();
+        let data = woken_by(&mut h.provider, move || {
+            batches.heard(&unit(1, 2, batch(2)));
+        })
+        .await;
+        assert_eq!(data, None);
+        assert_eq!(returns(&mut h.provider).await, None);
+        h.batches.ordered(PeerId::from(1), 2, false, &batch(2));
+        assert!(parks(&mut h.provider).await);
+
+        // Its rebroadcast does not wake us again.
+        h.batches.heard(&unit(1, 2, batch(2)));
+        assert!(parks(&mut h.provider).await);
+
+        // Turning the switch off wakes a parked provider.
+        let data = woken_by(&mut h.provider, || {
+            set_enabled(false);
+        })
+        .await;
+        assert_eq!(data, None);
+        assert_eq!(returns(&mut h.provider).await, None);
+
+        // The session's signature wakes a parked provider.
+        set_enabled(true);
+        assert!(parks(&mut h.provider).await);
+        let signature = schnorr::Signature::from_slice(&[7; 64]).expect("64 bytes");
+        let signature_sender = h.signature.clone();
+        let data = woken_by(&mut h.provider, move || {
+            signature_sender.send_replace(Some(signature));
+        })
+        .await;
+        assert_eq!(data, Some(UnitData::Signature(signature.serialize())));
+
+        // A parked provider resumes creating units at its park deadline.
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let mut h = harness(Some(deadline));
+        let data = tokio::time::timeout(PARKED * 3, h.provider.get_data())
+            .await
+            .expect("the deadline ends the park");
+        assert_eq!(data, None);
+        assert!(deadline <= Instant::now());
+        assert_eq!(returns(&mut h.provider).await, None);
+
+        // Without a park deadline, as in a session resumed from the backup, the
+        // provider never parks.
+        let mut h = harness(None);
+        assert_eq!(returns(&mut h.provider).await, None);
+        assert_eq!(returns(&mut h.provider).await, None);
+
+        set_enabled(false);
     }
 }
