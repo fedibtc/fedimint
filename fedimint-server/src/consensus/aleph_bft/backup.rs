@@ -7,6 +7,7 @@ use futures::StreamExt as _;
 use tracing::info;
 
 use crate::LOG_CONSENSUS;
+use crate::consensus::aleph_bft::host_sync::{SyncGate, coordinator_socket};
 use crate::consensus::db::{AlephUnitsKey, AlephUnitsPrefix};
 
 /// Identifies a unit in the backup by its encoding.
@@ -71,6 +72,7 @@ pub struct BackupWriter {
     db: Database,
     units_index: u64,
     stored: BTreeSet<sha256::Hash>,
+    gate: Option<SyncGate>,
 }
 
 impl BackupWriter {
@@ -91,6 +93,7 @@ impl BackupWriter {
             db,
             units_index,
             stored,
+            gate: coordinator_socket().map(SyncGate::new),
         }
     }
 }
@@ -119,6 +122,10 @@ impl aleph_bft::BackupWriter for BackupWriter {
             dbtx.insert_new_entry(&AlephUnitsKey(self.units_index), unit)
                 .await;
             self.units_index += 1;
+        }
+
+        if let Some(gate) = &mut self.gate {
+            gate.wait().await;
         }
 
         dbtx.commit_tx_result()

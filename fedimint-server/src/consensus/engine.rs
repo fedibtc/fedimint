@@ -41,6 +41,7 @@ use crate::config::ServerConfig;
 use crate::consensus::aleph_bft::backup::{BackupReader, BackupWriter};
 use crate::consensus::aleph_bft::data_provider::{DataProvider, UnitData};
 use crate::consensus::aleph_bft::finalization_handler::{FinalizationHandler, OrderedUnit};
+use crate::consensus::aleph_bft::host_sync::{align_to_wall_clock, coordinator_socket};
 use crate::consensus::aleph_bft::keychain::Keychain;
 use crate::consensus::aleph_bft::network::Network;
 use crate::consensus::aleph_bft::spawner::Spawner;
@@ -354,6 +355,11 @@ impl ConsensusEngine {
 
         let mut delay_config = aleph_bft::default_delay_config();
 
+        // With a host sync coordinator, end rounds on the host's shared
+        // wall-clock grid so that the host's guardians sync together.
+        let align_rounds = coordinator_socket().is_some();
+        let round_period = Duration::from_millis(self.cfg.local.broadcast_round_delay_ms.into());
+
         delay_config.unit_creation_delay = Arc::new(move |round_index| {
             // In a test environment all peers are started in lockstep, so we
             // add jitter to the unit creation delay to break it; in production
@@ -372,7 +378,13 @@ impl ConsensusEngine {
                     * jitter
             };
 
-            Duration::from_millis(delay.round() as u64)
+            let delay = Duration::from_millis(delay.round() as u64);
+
+            if align_rounds {
+                align_to_wall_clock(delay, round_period)
+            } else {
+                delay
+            }
         });
 
         let config = aleph_bft::create_config(

@@ -34,6 +34,11 @@ pub const FM_DISABLE_BASE_FEES_ENV: &str = "FM_DISABLE_BASE_FEES";
 /// Print sensitive secrets without redacting them. Use only for debugging.
 pub const FM_DEBUG_SHOW_SECRETS_ENV: &str = "FM_DEBUG_SHOW_SECRETS";
 
+/// Path of a unix socket through which the guardians on one host sync their
+/// AlephBFT backups together. Set by hosts that run many guardians; see
+/// `fedimint_server::consensus::aleph_bft::host_sync`.
+pub const FM_BACKUP_SYNC_COORDINATOR_ENV: &str = "FM_BACKUP_SYNC_COORDINATOR";
+
 /// Check if env variable is set and not equal `0` or `false` which are common
 /// ways to disable something.
 pub fn is_env_var_set(var: &str) -> bool {
