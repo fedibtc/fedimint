@@ -108,14 +108,19 @@ impl aleph_bft::Network<NetworkData> for Network {
 
                     match NetworkData::decode(&mut IoReader(bytes.as_slice())) {
                         Ok(network_data) => {
-                            let included = network_data.included();
+                            let units = network_data.carried_units();
 
                             // in order to bound the RAM consumption of a session we have to bound
                             // the size of an individual unit in memory
-                            if included.iter().all(|included| included.data.is_valid()) {
-                                // a quiescent data provider wakes up to order our peers' batches
-                                for included in &included {
-                                    self.pending_batches.heard(included);
+                            if units
+                                .iter()
+                                .filter_map(|unit| unit.data.as_ref())
+                                .all(UnitData::is_valid)
+                            {
+                                // a quiescent data provider wakes up for our peers' batches and
+                                // for peers that are ahead of it
+                                for unit in &units {
+                                    self.pending_batches.heard(unit);
                                 }
 
                                 return Some(network_data);
