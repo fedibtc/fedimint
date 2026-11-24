@@ -39,7 +39,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 use crate::LOG_CONSENSUS;
 use crate::config::ServerConfig;
 use crate::consensus::aleph_bft::backup::{BackupReader, BackupWriter};
-use crate::consensus::aleph_bft::data_provider::{DataProvider, UnitData};
+use crate::consensus::aleph_bft::data_provider::{DataProvider, UnitData, UnorderedBatches};
 use crate::consensus::aleph_bft::finalization_handler::{FinalizationHandler, OrderedUnit};
 use crate::consensus::aleph_bft::keychain::Keychain;
 use crate::consensus::aleph_bft::network::Network;
@@ -165,6 +165,18 @@ pub struct ConsensusEngine {
     pub peer_activity: Arc<std::sync::Mutex<PeerActivity>>,
 }
 
+/// Whether the session watchdog gives up on a session; see
+/// [`ConsensusEngine::run_session_with_watchdog`].
+fn session_is_stuck(
+    timeout: Duration,
+    session_elapsed: Duration,
+    quiescent: bool,
+    our_batches_stalled_for: Option<Duration>,
+) -> bool {
+    session_elapsed > timeout
+        && (!quiescent || our_batches_stalled_for.is_some_and(|stalled| stalled > timeout))
+}
+
 impl ConsensusEngine {
     fn num_peers(&self) -> NumPeers {
         self.cfg.consensus.broadcast_public_keys.to_num_peers()
@@ -287,11 +299,10 @@ impl ConsensusEngine {
             // has been observed to resolve stuck sessions. Since AlephBFT
             // persists its units to the database this is equivalent to a crash
             // and therefore safe.
-            let Ok(session) = tokio::time::timeout(
-                self.session_timeout,
-                self.run_session(self.connections.clone(), session_index),
-            )
-            .await
+            let unordered_batches = UnorderedBatches::default();
+            let Some(session) = self
+                .run_session_with_watchdog(session_index, unordered_batches)
+                .await
             else {
                 warn!(
                     target: LOG_CONSENSUS,
@@ -324,11 +335,55 @@ impl ConsensusEngine {
         Ok(ConsensusStop::TaskShutdown)
     }
 
+    /// Run a session, or return `None` once it is stuck for `session_timeout`.
+    ///
+    /// Without quiescence a session is stuck once it runs that long. A
+    /// quiescent federation completes a session only as fast as work arrives,
+    /// so with quiescence on a session is stuck only once it also had a batch
+    /// of ours waiting that long without any of our batches being ordered.
+    async fn run_session_with_watchdog(
+        &self,
+        session_index: u64,
+        unordered_batches: UnorderedBatches,
+    ) -> Option<Option<()>> {
+        const WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
+
+        let session_start = std::time::Instant::now();
+        let session = self.run_session(
+            self.connections.clone(),
+            session_index,
+            unordered_batches.clone(),
+        );
+        tokio::pin!(session);
+
+        loop {
+            tokio::select! {
+                outcome = &mut session => return Some(outcome),
+                () = sleep(WATCHDOG_INTERVAL) => {
+                    if session_is_stuck(
+                        self.session_timeout,
+                        session_start.elapsed(),
+                        fedimint_server_core::quiescence::is_enabled(),
+                        unordered_batches.stalled_for(),
+                    ) {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn run_session(
         &self,
         connections: DynP2PConnections<P2PMessage>,
         session_index: u64,
+        unordered_batches: UnorderedBatches,
     ) -> Option<()> {
+        // With quiescence on, a peer only creates units while it either has items
+        // to order itself or a batch of its own still awaits ordering, hence the
+        // broadcast is quiescent on an idle federation and a session can take
+        // arbitrarily long in wall clock time to reach its round limit.
+        //
         // In order to bound a sessions RAM consumption we need to bound its number of
         // units and therefore its number of rounds. Since we use a session to
         // create a naive secp256k1 threshold signature for the header of session
@@ -410,8 +465,9 @@ impl ConsensusEngine {
                         signature_receiver,
                         timestamp_sender,
                         self.is_recovery().await,
+                        unordered_batches.clone(),
                     ),
-                    FinalizationHandler::new(unit_data_sender),
+                    FinalizationHandler::new(unit_data_sender, self.identity(), unordered_batches),
                     BackupWriter::new(self.db.clone()).await,
                     BackupReader::new(self.db.clone()),
                 ),
@@ -1344,7 +1400,33 @@ pub async fn get_finished_session_count_static(dbtx: &mut DatabaseTransaction<'_
 
 #[cfg(test)]
 mod tests {
-    use super::{ScheduledShutdown, SessionTimedOut, ShutdownRequest, due_shutdown};
+    use std::time::Duration;
+
+    use super::{
+        ScheduledShutdown, SessionTimedOut, ShutdownRequest, due_shutdown, session_is_stuck,
+    };
+
+    #[test]
+    fn a_quiescent_session_is_stuck_only_once_our_batch_waited_the_timeout() {
+        let timeout = Duration::from_secs(3600);
+        let long = Duration::from_secs(3601);
+        let short = Duration::from_secs(60);
+
+        // Without quiescence the wall-clock rule is unchanged.
+        assert!(!session_is_stuck(timeout, timeout, false, None));
+        assert!(session_is_stuck(timeout, long, false, None));
+        assert!(session_is_stuck(timeout, long, false, Some(short)));
+
+        // A quiet federation may take as long as it likes.
+        assert!(!session_is_stuck(timeout, long * 10, true, None));
+        assert!(!session_is_stuck(timeout, long * 10, true, Some(short)));
+        assert!(!session_is_stuck(timeout, long * 10, true, Some(timeout)));
+        assert!(session_is_stuck(timeout, long * 10, true, Some(long)));
+
+        // A young session is never stuck.
+        assert!(!session_is_stuck(timeout, short, true, Some(long)));
+        assert!(!session_is_stuck(timeout, short, false, Some(long)));
+    }
 
     #[test]
     fn shutdown_takes_effect_at_the_first_boundary_at_or_after_its_session() {
