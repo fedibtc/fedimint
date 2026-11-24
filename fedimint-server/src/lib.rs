@@ -44,8 +44,8 @@ use fedimint_core::invite_code::InviteCode;
 use fedimint_core::module::ApiAuth;
 use fedimint_core::net::peers::DynP2PConnections;
 use fedimint_core::task::{TaskGroup, sleep};
-use fedimint_core::util::SafeUrl;
-use fedimint_logging::LOG_CONSENSUS;
+use fedimint_core::util::{FmtCompact as _, FmtCompactAnyhow as _, SafeUrl};
+use fedimint_logging::{LOG_CONSENSUS, LOG_SERVER};
 pub use fedimint_server_core as core;
 use fedimint_server_core::ServerModuleInitRegistry;
 use fedimint_server_core::bitcoin_rpc::DynServerBitcoinRpc;
@@ -127,10 +127,12 @@ fn config_gen_failure(
 ) -> anyhow::Error {
     let error = error.into();
     tracing::error!(
-        error = format_args!("{error:#}"),
+        target: LOG_SERVER,
+        err = %error.fmt_compact_anyhow(),
         "configuration generation stage failed"
     );
     tracing::warn!(
+        target: LOG_SERVER,
         safe_to_share = true,
         stage,
         failure_kind,
@@ -996,8 +998,9 @@ pub async fn run_config_gen_with_iroh_p2p_relays(
             .with_graceful_shutdown(handle.make_shutdown_rx())
             .await
         {
-            error!(error = %err, "setup UI server failed");
+            error!(target: LOG_SERVER, err = %err.fmt_compact(), "setup UI server failed");
             warn!(
+                target: LOG_SERVER,
                 safe_to_share = true,
                 stage = "setup_ui",
                 failure_kind = "server_failed",

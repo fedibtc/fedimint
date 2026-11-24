@@ -1,8 +1,11 @@
-use fedimint_client_module::module::FinalClientIface;
+use fedimint_client_module::module::{ClientModule as _, FinalClientIface};
 use fedimint_core::db::Database;
 use fedimint_core::db::mem_impl::MemDatabase;
 
-use super::*;
+use super::{
+    Amount, AmountUnit, BTreeMap, ClientContext, DerivableSecret, Duration, FederationId,
+    FeeConsensus, MintClientConfig, MintClientModule, ModuleNotifier, OperationId,
+};
 
 #[tokio::test]
 async fn fee_quote_does_not_wait_for_change_tweaks() {

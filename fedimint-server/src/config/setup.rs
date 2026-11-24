@@ -26,7 +26,9 @@ use fedimint_core::module::{
     admin_api_endpoint, public_api_endpoint,
 };
 use fedimint_core::setup_code::PeerEndpoints;
+use fedimint_core::util::FmtCompact as _;
 use fedimint_core::{PeerId, base32, runtime};
+use fedimint_logging::LOG_SERVER;
 use fedimint_server_core::setup_ui::ISetupApi;
 use iroh::SecretKey;
 use rand::rngs::OsRng;
@@ -762,14 +764,16 @@ fn trace_setup_result<T>(
 ) -> Result<T, ApiError> {
     match &result {
         Ok(_) => info!(
+            target: LOG_SERVER,
             safe_to_share = true,
             stage = "setup_api",
             operation,
             "Setup API operation completed"
         ),
         Err(error) => {
-            warn!(operation, ?error, "Setup API operation failed");
+            warn!(target: LOG_SERVER, operation, error = %error.fmt_compact(), "Setup API operation failed");
             warn!(
+                target: LOG_SERVER,
                 safe_to_share = true,
                 stage = "setup_api",
                 operation,
