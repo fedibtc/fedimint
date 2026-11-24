@@ -26,9 +26,6 @@ pub const CONSENSUS_ORD_LATENCY_ENDPOINT: &str = "consensus_ord_latency";
 pub const P2P_CONNECTION_STATUS_ENDPOINT: &str = "p2p_connection_status";
 pub const PEER_AVAILABILITY_ENDPOINT: &str = "peer_availability";
 pub const RESET_PEER_AVAILABILITY_ENDPOINT: &str = "reset_peer_availability";
-/// Admin: turn Aleph quiescence on or off until the process exits (fedibtc
-/// fork).
-pub const SET_ALEPH_QUIESCENCE_ENDPOINT: &str = "set_aleph_quiescence";
 pub const START_DKG_ENDPOINT: &str = "start_dkg";
 pub const SET_LOCAL_PARAMS_ENDPOINT: &str = "set_local_params";
 pub const STATUS_ENDPOINT: &str = "status";

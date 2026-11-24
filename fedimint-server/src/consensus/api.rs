@@ -33,10 +33,10 @@ use fedimint_core::endpoint_constants::{
     GUARDIAN_METADATA_ENDPOINT, INVITE_CODE_ENDPOINT, P2P_CONNECTION_STATUS_ENDPOINT,
     PEER_AVAILABILITY_ENDPOINT, RECOVER_ENDPOINT, RESET_PEER_AVAILABILITY_ENDPOINT,
     SERVER_CONFIG_CONSENSUS_HASH_ENDPOINT, SESSION_COUNT_ENDPOINT, SESSION_STATUS_ENDPOINT,
-    SESSION_STATUS_V2_ENDPOINT, SET_ALEPH_QUIESCENCE_ENDPOINT, SETUP_STATUS_ENDPOINT,
-    SHUTDOWN_AFTER_CURRENT_SESSION_ENDPOINT, SHUTDOWN_ENDPOINT, SIGN_API_ANNOUNCEMENT_ENDPOINT,
-    SIGN_GUARDIAN_METADATA_ENDPOINT, STATUS_ENDPOINT, SUBMIT_API_ANNOUNCEMENT_ENDPOINT,
-    SUBMIT_GUARDIAN_METADATA_ENDPOINT, SUBMIT_TRANSACTION_ENDPOINT, VERSION_ENDPOINT,
+    SESSION_STATUS_V2_ENDPOINT, SETUP_STATUS_ENDPOINT, SHUTDOWN_AFTER_CURRENT_SESSION_ENDPOINT,
+    SHUTDOWN_ENDPOINT, SIGN_API_ANNOUNCEMENT_ENDPOINT, SIGN_GUARDIAN_METADATA_ENDPOINT,
+    STATUS_ENDPOINT, SUBMIT_API_ANNOUNCEMENT_ENDPOINT, SUBMIT_GUARDIAN_METADATA_ENDPOINT,
+    SUBMIT_TRANSACTION_ENDPOINT, VERSION_ENDPOINT,
 };
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::invite_code::InviteCode;
@@ -1162,22 +1162,6 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             ApiVersion::new(0, 10),
             async |fedimint: &ConsensusApi, context, _v: ()| -> () {
                 fedimint.shutdown_after_current_session().await;
-                Ok(())
-            }
-        },
-        admin_api_endpoint! {
-            SET_ALEPH_QUIESCENCE_ENDPOINT,
-            ApiVersion::new(0, 11),
-            async |_fedimint: &ConsensusApi, context, enabled: bool| -> () {
-                let previous = fedimint_server_core::quiescence::set_enabled(enabled);
-                if previous != enabled {
-                    info!(
-                        target: crate::LOG_CONSENSUS,
-                        safe_to_share = true,
-                        enabled,
-                        "Aleph quiescence switched"
-                    );
-                }
                 Ok(())
             }
         },

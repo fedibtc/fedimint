@@ -3,10 +3,11 @@
 //! Upstream fedimint/fedimint#9043 stops a guardian from creating AlephBFT
 //! units while it has nothing to order, and stops modules from re-proposing
 //! votes that their peers already recorded. This fork ships both behind one
-//! switch that the operator flips at runtime through the
-//! `set_aleph_quiescence` admin endpoint. It starts off on every process
-//! start and is not persisted, so a restarted guardian behaves exactly like
-//! one without the change until it is enabled again.
+//! switch that the process driving `fedimintd` flips at runtime through the
+//! driven control channel's features (`fedimint_server::config::driven`). It
+//! starts off on every process start and is not persisted, so a restarted
+//! guardian behaves exactly like one without the change until it is enabled
+//! again.
 //!
 //! One `fedimintd` process runs one guardian, so the switch is a process
 //! global: module consensus proposals have no other path to it. In-process

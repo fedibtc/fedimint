@@ -56,7 +56,6 @@ use net::api::ApiSecrets;
 use net::p2p::P2PStatusReceivers;
 use net::p2p_connector::IrohConnector;
 #[cfg(unix)]
-use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 use tokio_rustls::rustls;
 use tracing::{error, info, warn};
@@ -694,6 +693,7 @@ pub async fn run_driven(
     };
 
     let db = open_database(data_dir.clone()).await?;
+    let features_task_group = task_group.clone();
     run_consensus(
         data_dir,
         force_api_secrets,
@@ -716,7 +716,10 @@ pub async fn run_driven(
         iroh_next_api_settings,
         async move {
             write_frame(&mut control, &ChildMessage::ConsensusStarted {}).await?;
-            control.shutdown().await?;
+            features_task_group.spawn_cancellable(
+                "driven features",
+                crate::config::driven::follow_features(control),
+            );
             Ok(())
         },
     )
