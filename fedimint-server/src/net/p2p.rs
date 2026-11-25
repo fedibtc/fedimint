@@ -120,6 +120,14 @@ impl<M: Send + 'static> ReconnectP2PConnections<M> {
                     },
                     Err(err) => {
                         warn!(target: LOG_NET_PEER, our_id = %identity, err = %err.fmt_compact(), "Error while opening incoming connection");
+                        warn!(
+                            target: LOG_NET_PEER,
+                            safe_to_share = true,
+                            stage = "p2p_accept",
+                            failure_kind = "accept_failed",
+                            own_peer_id = %identity,
+                            "Peer connection failed"
+                        );
                     }
                 }
             }
@@ -430,6 +438,15 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                         SendHalt::Replaced(connection) => {
                             info!(target: LOG_NET_PEER, "Connected to peer");
 
+                            info!(
+                                target: LOG_NET_PEER,
+                                safe_to_share = true,
+                                stage = "p2p_connection",
+                                direction = "incoming_replacement",
+                                peer_id = %self.peer_id,
+                                "Connected to DKG peer"
+                            );
+
                             self.connection_deadline =
                                 self.max_connection_age.map(|age| Instant::now() + age);
 
@@ -640,6 +657,14 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
             error = %last_error,
             "Disconnected from peer"
         );
+        warn!(
+            target: LOG_NET_PEER,
+            safe_to_share = true,
+            stage = "p2p_connection",
+            failure_kind = "disconnected",
+            peer_id = %self.peer_id,
+            "Disconnected from DKG peer"
+        );
 
         PEER_DISCONNECT_COUNT
             .with_label_values(&[&self.our_id_str, &self.peer_id_str])
@@ -666,6 +691,14 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                     .inc();
 
                 info!(target: LOG_NET_PEER, "Connected to peer");
+                info!(
+                    target: LOG_NET_PEER,
+                    safe_to_share = true,
+                    stage = "p2p_connection",
+                    direction = "incoming",
+                    peer_id = %self.peer_id,
+                    "Connected to DKG peer"
+                );
 
                 self.connection_deadline = self.max_connection_age.map(|age| Instant::now() + age);
 
@@ -682,6 +715,14 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                             .inc();
 
                         info!(target: LOG_NET_PEER, "Connected to peer");
+                        info!(
+                            target: LOG_NET_PEER,
+                            safe_to_share = true,
+                            stage = "p2p_connection",
+                            direction = "outgoing",
+                            peer_id = %self.peer_id,
+                            "Connected to DKG peer"
+                        );
 
                         self.connection_deadline = self.max_connection_age.map(|age| Instant::now() + age);
 
@@ -694,6 +735,15 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                             target: LOG_CONSENSUS,
                             error = %last_error,
                             "Failed to connect to peer"
+                        );
+
+                        warn!(
+                            target: LOG_CONSENSUS,
+                            safe_to_share = true,
+                            stage = "p2p_connection",
+                            failure_kind = "connect_failed",
+                            peer_id = %self.peer_id,
+                            "Peer connection failed"
                         );
 
                         Some(P2PConnectionSMState::Disconnected {
