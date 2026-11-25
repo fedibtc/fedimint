@@ -1,7 +1,7 @@
 use aleph_bft::{NodeIndex, Round};
 use fedimint_core::PeerId;
 
-use super::data_provider::{UnitData, UnorderedBatches};
+use super::data_provider::{PendingBatches, UnitData};
 
 pub struct OrderedUnit {
     pub creator: PeerId,
@@ -12,19 +12,19 @@ pub struct OrderedUnit {
 pub struct FinalizationHandler {
     sender: async_channel::Sender<OrderedUnit>,
     identity: PeerId,
-    unordered_batches: UnorderedBatches,
+    pending_batches: PendingBatches,
 }
 
 impl FinalizationHandler {
     pub fn new(
         sender: async_channel::Sender<OrderedUnit>,
         identity: PeerId,
-        unordered_batches: UnorderedBatches,
+        pending_batches: PendingBatches,
     ) -> Self {
         Self {
             sender,
             identity,
-            unordered_batches,
+            pending_batches,
         }
     }
 }
@@ -43,10 +43,11 @@ impl aleph_bft::FinalizationHandler<UnitData> for FinalizationHandler {
         let creator = super::to_peer_id(creator)
             .expect("Finalized units were verified against the broadcast public key set");
 
-        // the data provider stops creating units as soon as all of our batches have
-        // been ordered
-        if creator == self.identity && matches!(data, Some(UnitData::Batch(..))) {
-            self.unordered_batches.ordered();
+        // the data provider stops creating units as soon as all batches with work
+        // have been ordered
+        if let Some(data) = &data {
+            self.pending_batches
+                .ordered(creator, round, creator == self.identity, data);
         }
 
         // the channel is unbounded
@@ -63,26 +64,27 @@ impl aleph_bft::FinalizationHandler<UnitData> for FinalizationHandler {
 #[cfg(test)]
 mod tests {
     use aleph_bft::FinalizationHandler as _;
+    use fedimint_core::module::registry::ModuleDecoderRegistry;
 
     use super::*;
 
     #[test]
-    fn only_our_own_ordered_batch_counts_as_ordered() {
+    fn only_our_own_ordered_batch_counts_as_ours() {
         let (sender, receiver) = async_channel::unbounded();
-        let batches = UnorderedBatches::default();
+        let batches = PendingBatches::new(0, ModuleDecoderRegistry::default());
         let mut handler = FinalizationHandler::new(sender, PeerId::from(1), batches.clone());
 
         batches.created();
 
         // a peer's batch, our signature and our unit without data leave our batch
         // unordered
-        handler.unit_finalized(NodeIndex(0), 0, Some(UnitData::Batch(vec![])));
+        handler.unit_finalized(NodeIndex(0), 0, Some(UnitData::Batch(vec![0])));
         handler.unit_finalized(NodeIndex(1), 1, Some(UnitData::Signature([0; 64])));
         handler.unit_finalized(NodeIndex(1), 2, None);
-        assert!(!batches.is_empty());
+        assert!(!batches.idle());
 
-        handler.unit_finalized(NodeIndex(1), 3, Some(UnitData::Batch(vec![])));
-        assert!(batches.is_empty());
+        handler.unit_finalized(NodeIndex(1), 3, Some(UnitData::Batch(vec![0])));
+        assert!(batches.idle());
 
         // every unit is forwarded to the engine
         assert_eq!(receiver.len(), 4);

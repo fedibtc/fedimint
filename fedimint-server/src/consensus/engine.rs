@@ -39,7 +39,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 use crate::LOG_CONSENSUS;
 use crate::config::ServerConfig;
 use crate::consensus::aleph_bft::backup::{BackupReader, BackupWriter};
-use crate::consensus::aleph_bft::data_provider::{DataProvider, UnitData, UnorderedBatches};
+use crate::consensus::aleph_bft::data_provider::{DataProvider, PendingBatches, UnitData};
 use crate::consensus::aleph_bft::finalization_handler::{FinalizationHandler, OrderedUnit};
 use crate::consensus::aleph_bft::keychain::Keychain;
 use crate::consensus::aleph_bft::network::{Network, drain_session_message};
@@ -419,7 +419,7 @@ impl ConsensusEngine {
             Instant::now().checked_add(self.session_timeout / 2)
         };
 
-        let unordered_batches = UnorderedBatches::default();
+        let pending_batches = PendingBatches::new(session_index, self.decoders());
         let (drain_sender, drain_receiver) = watch::channel(false);
 
         let aleph_handle = spawn(
@@ -432,13 +432,16 @@ impl ConsensusEngine {
                         signature_receiver,
                         timestamp_sender,
                         is_recovery,
-                        unordered_batches.clone(),
-                        session_index,
+                        pending_batches.clone(),
                         park_deadline,
                         self.shutdown_receiver.clone(),
                         drain_receiver,
                     ),
-                    FinalizationHandler::new(unit_data_sender, self.identity(), unordered_batches),
+                    FinalizationHandler::new(
+                        unit_data_sender,
+                        self.identity(),
+                        pending_batches.clone(),
+                    ),
                     BackupWriter::new(self.db.clone()).await,
                     BackupReader::new(self.db.clone()),
                 ),
@@ -447,6 +450,7 @@ impl ConsensusEngine {
                     self.peer_activity.clone(),
                     signed_outcomes_sender,
                     signatures_sender,
+                    pending_batches,
                     self.db.clone(),
                     session_index,
                     drain_sender,
