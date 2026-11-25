@@ -100,8 +100,11 @@ impl RocksDb {
         // tail holds records from its previous use, which PointInTime treats
         // as the end of the log. After an unclean shutdown it recovers the
         // same synced prefix as TolerateCorruptedTailRecords.
+        // Keep 2 recycled WAL files (matching `max_write_buffer_number = 2`:
+        // 1 active + 1 flushing buffer), halving idle WAL disk reservation
+        // from 64 MiB to 32 MiB per database.
         opts.set_wal_recovery_mode(DBRecoveryMode::PointInTime);
-        opts.set_recycle_log_file_num(4);
+        opts.set_recycle_log_file_num(DEFAULT_RECYCLE_LOG_FILE_NUM);
         let db: rocksdb::OptimisticTransactionDB =
             rocksdb::OptimisticTransactionDB::<rocksdb::SingleThreaded>::open(&opts, db_path)?;
         Ok(RocksDb(db))
@@ -158,6 +161,18 @@ const DEFAULT_BLOCK_CACHE_SIZE: usize = 2 * 1024 * 1024;
 /// consumes memory for each open file handle and associated metadata)
 const DEFAULT_MAX_OPEN_FILES: i32 = 256;
 
+/// Default recycled WAL file count: 2 (matches `max_write_buffer_number = 2`:
+/// 1 active + 1 flushing buffer, reserving 32 MiB instead of 64 MiB per DB).
+const DEFAULT_RECYCLE_LOG_FILE_NUM: usize = 2;
+
+/// Default max info `LOG` file size before rotation: 1 MiB (`RocksDB` default
+/// is 0 / unlimited).
+const DEFAULT_MAX_LOG_FILE_SIZE: usize = 1024 * 1024;
+
+/// Default number of `RocksDB` info `LOG` files to retain (`RocksDB` default
+/// is 1000).
+const DEFAULT_KEEP_LOG_FILE_NUM: usize = 2;
+
 fn parse_env_size(env_name: &str) -> anyhow::Result<Option<usize>> {
     let Ok(var) = std::env::var(env_name) else {
         return Ok(None);
@@ -191,6 +206,26 @@ fn get_default_options() -> anyhow::Result<rocksdb::Options> {
     opts.set_block_based_table_factory(&block_opts);
 
     opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
+
+    // Bound RocksDB's own info `LOG` files and disable periodic stats dumps
+    // (defaults: Info level, stats dumped/persisted every 600 s, unlimited
+    // log file size, keeping up to 1000 rotated `LOG.old.*` files).
+    opts.set_log_level(rocksdb::LogLevel::Warn);
+    opts.set_stats_dump_period_sec(0);
+    opts.set_stats_persist_period_sec(0);
+    opts.set_max_log_file_size(DEFAULT_MAX_LOG_FILE_SIZE);
+    opts.set_keep_log_file_num(DEFAULT_KEEP_LOG_FILE_NUM);
+
+    // Use LZ4 for hot upper levels and Zstd for the bottommost level where
+    // immutable history (such as signed session outcomes) settles. Both codecs
+    // are already compiled into `librocksdb-sys`, and RocksDB SST block
+    // trailers record the codec per block so existing Snappy SSTs and older
+    // readers remain compatible.
+    opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+    opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+    // Keep dynamic level sizing enabled explicitly (also the default since
+    // RocksDB 8.2, which migrates DBs created with `false` automatically).
+    opts.set_level_compaction_dynamic_level_bytes(true);
 
     debug!(
         write_buffer_size,
@@ -977,6 +1012,183 @@ mod fedimint_rocksdb_tests {
         assert!(
             matches!(result, Err(DatabaseError::WriteConflict)),
             "expected a write conflict, got {result:?}"
+        );
+    }
+
+    fn legacy_rocksdb_options() -> rocksdb::Options {
+        let mut opts = rocksdb::Options::default();
+        opts.set_write_buffer_size(DEFAULT_WRITE_BUFFER_SIZE);
+        opts.set_max_write_buffer_number(2);
+        opts.set_max_open_files(DEFAULT_MAX_OPEN_FILES);
+        opts.set_compression_type(rocksdb::DBCompressionType::Snappy);
+        opts.set_level_compaction_dynamic_level_bytes(false);
+        opts.set_wal_recovery_mode(DBRecoveryMode::PointInTime);
+        opts.set_recycle_log_file_num(4);
+        opts.create_if_missing(true);
+        opts
+    }
+
+    /// An existing database created with the previous options (Snappy
+    /// compression, `level_compaction_dynamic_level_bytes = false`,
+    /// `recycle_log_file_num = 4`) must open cleanly under the tuned options,
+    /// preserve all keys, and continue accepting writes and compactions.
+    #[test]
+    fn test_legacy_options_db_reopens_with_tuned_options() {
+        let path = tempfile::Builder::new()
+            .prefix("fcb-rocksdb-test-legacy-upgrade")
+            .tempdir()
+            .unwrap();
+
+        let legacy_entries: Vec<(Vec<u8>, Vec<u8>)> = (0u32..64)
+            .map(|i| {
+                (
+                    format!("legacy-key-{i:04}").into_bytes(),
+                    format!("legacy-compressible-payload-{i:04}-{}", "x".repeat(512)).into_bytes(),
+                )
+            })
+            .collect();
+
+        // Populate SST files across multiple flushes and a compaction using the
+        // pre-tuning options.
+        {
+            let opts = legacy_rocksdb_options();
+            let db =
+                rocksdb::OptimisticTransactionDB::<rocksdb::SingleThreaded>::open(&opts, &path)
+                    .unwrap();
+            for chunk in legacy_entries.chunks(16) {
+                for (k, v) in chunk {
+                    db.put(k, v).unwrap();
+                }
+                db.flush().unwrap();
+            }
+            db.compact_range(None::<&[u8]>, None::<&[u8]>);
+        }
+
+        // Reopen with the tuned options via `RocksDb`.
+        let extra_key = b"post-upgrade-key".to_vec();
+        let extra_val = format!("post-upgrade-payload-{}", "y".repeat(1024)).into_bytes();
+        {
+            let db = RocksDb::open_blocking_unlocked(path.as_ref()).unwrap();
+            let raw = db.inner();
+            for (k, v) in &legacy_entries {
+                assert_eq!(raw.get(k).unwrap().as_deref(), Some(v.as_slice()));
+            }
+            raw.put(&extra_key, &extra_val).unwrap();
+            raw.flush().unwrap();
+            raw.compact_range(None::<&[u8]>, None::<&[u8]>);
+            assert_eq!(
+                raw.get(&extra_key).unwrap().as_deref(),
+                Some(extra_val.as_slice())
+            );
+        }
+
+        // Verify the RocksDB info log contains no errors/warnings about
+        // dynamic level bytes migration.
+        let log_path = path.path().join("LOG");
+        if log_path.exists() {
+            let log_text = std::fs::read_to_string(&log_path).unwrap();
+            assert!(
+                !log_text.contains("[ERROR]") && !log_text.contains("[FATAL]"),
+                "unexpected RocksDB error in LOG after reopening legacy DB:\n{log_text}"
+            );
+        }
+    }
+
+    /// A database written with the tuned options (LZ4 upper levels, Zstd
+    /// bottommost level, dynamic level bytes, `recycle_log_file_num = 2`) must
+    /// remain readable by both `RocksDbReadOnly` and a reader using the old
+    /// options (since `RocksDB` SST block trailers identify each block's codec).
+    #[test]
+    fn test_tuned_db_readable_by_readonly_and_legacy_options() {
+        let path = tempfile::Builder::new()
+            .prefix("fcb-rocksdb-test-tuned-compat")
+            .tempdir()
+            .unwrap();
+
+        let bottommost_entries: Vec<(Vec<u8>, Vec<u8>)> = (0u32..48)
+            .map(|i| {
+                (
+                    format!("cold-key-{i:04}").into_bytes(),
+                    format!("cold-session-outcome-{i:04}-{}", "a".repeat(1024)).into_bytes(),
+                )
+            })
+            .collect();
+        let hot_entries: Vec<(Vec<u8>, Vec<u8>)> = (0u32..16)
+            .map(|i| {
+                (
+                    format!("hot-key-{i:04}").into_bytes(),
+                    format!("hot-state-{i:04}-{}", "b".repeat(512)).into_bytes(),
+                )
+            })
+            .collect();
+
+        {
+            let db = RocksDb::open_blocking_unlocked(path.as_ref()).unwrap();
+            let raw = db.inner();
+            for (k, v) in &bottommost_entries {
+                raw.put(k, v).unwrap();
+            }
+            raw.flush().unwrap();
+            // Force a full compaction so `bottommost_entries` are rewritten
+            // with Zstd bottommost compression.
+            raw.compact_range(None::<&[u8]>, None::<&[u8]>);
+
+            // Flush a second batch so upper-level SSTs exist with LZ4.
+            for (k, v) in &hot_entries {
+                raw.put(k, v).unwrap();
+            }
+            raw.flush().unwrap();
+
+            // `RocksDbReadOnly` can open and read alongside the writer.
+            let ro = RocksDbReadOnly::open_read_only_blocking(path.as_ref()).unwrap();
+            for (k, v) in bottommost_entries.iter().chain(&hot_entries) {
+                assert_eq!(ro.0.get(k).unwrap().as_deref(), Some(v.as_slice()));
+            }
+        }
+
+        // Reopen with the legacy options to verify downgrade/rollback
+        // compatibility.
+        let legacy_opts = legacy_rocksdb_options();
+        let db =
+            rocksdb::OptimisticTransactionDB::<rocksdb::SingleThreaded>::open(&legacy_opts, &path)
+                .unwrap();
+        for (k, v) in bottommost_entries.iter().chain(&hot_entries) {
+            assert_eq!(db.get(k).unwrap().as_deref(), Some(v.as_slice()));
+        }
+    }
+
+    /// Repeated opens/restarts must not accumulate unbounded `LOG.old.*` files.
+    #[test]
+    fn test_info_log_files_stay_bounded_across_restarts() {
+        let path = tempfile::Builder::new()
+            .prefix("fcb-rocksdb-test-log-rotation")
+            .tempdir()
+            .unwrap();
+
+        for round in 0u32..8 {
+            let db = RocksDb::open_blocking_unlocked(path.as_ref()).unwrap();
+            let raw = db.inner();
+            raw.put(format!("k-{round}"), format!("v-{round}")).unwrap();
+            raw.flush().unwrap();
+            drop(db);
+            // Ensure distinct microsecond timestamps on `LOG.old.*` names.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let log_files: Vec<String> = std::fs::read_dir(path.path())
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                (name == "LOG" || name.starts_with("LOG.old.")).then_some(name)
+            })
+            .collect();
+
+        // RocksDB keeps the active `LOG` plus at most `keep_log_file_num`
+        // rotated `LOG.old.*` files (or fewer).
+        assert!(
+            log_files.len() <= DEFAULT_KEEP_LOG_FILE_NUM,
+            "expected at most {DEFAULT_KEEP_LOG_FILE_NUM} LOG files, found {}: {log_files:?}",
+            log_files.len()
         );
     }
 }
