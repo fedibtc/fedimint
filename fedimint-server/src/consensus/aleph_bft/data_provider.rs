@@ -1,13 +1,13 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use aleph_bft::{CarriedUnit, Round};
+use fedimint_core::TransactionId;
 use fedimint_core::config::ALEPH_BFT_UNIT_BYTE_LIMIT;
 use fedimint_core::encoding::Encodable;
 use fedimint_core::epoch::ConsensusItem;
 use fedimint_core::secp256k1::schnorr;
-use fedimint_core::{PeerId, TransactionId};
 use tokio::sync::watch;
 
 use crate::LOG_CONSENSUS;
@@ -32,109 +32,38 @@ impl UnitData {
     }
 }
 
-/// What keeps a quiescent [`DataProvider`] creating units in this session.
+/// The number of batches we have attached to our own units which have not been
+/// ordered yet, shared between the [`DataProvider`] which creates them and the
+/// [`super::finalization_handler::FinalizationHandler`] which observes them
+/// being ordered.
 ///
-/// - The batches that, as far as we know, await ordering: the ones we attached
-///   to our own units and the ones we received in our peers' units. A batch
-///   which only one guardian has then gets ordered right away rather than once
-///   every guardian has work of its own.
-///
-/// A peer unit without data does not wake us. A guardian without quiescence
-/// creates one every round, so such a wake would keep a federation awake while
-/// any of its guardians runs an older build. The cost: a guardian that created
-/// one unit more than its peers before they parked waits for their units as
-/// parents, so an item that only it has waits until another guardian has work.
-///
-/// The [`DataProvider`] counts our batches as it creates them, the
-/// [`super::network::Network`] records our peers' units of this session as
-/// they arrive, and the [`super::finalization_handler::FinalizationHandler`]
-/// clears batches as they are ordered.
-#[derive(Clone)]
-pub struct PendingBatches {
-    /// Peers keep rebroadcasting the last units of the session they just
-    /// finished while we run the next one. Those units are no work of ours, and
-    /// their high rounds would keep us awake for the whole session.
-    session: u64,
-    state: Arc<watch::Sender<PendingBatchesState>>,
-}
+/// Only our own batches keep a quiescent provider creating units. A peer's
+/// batch or unit does not wake us: a guardian without quiescence re-proposes
+/// its votes every second and creates a unit every round, so such a wake would
+/// keep a federation awake while any of its guardians runs an older build. The
+/// cost: an item that only one guardian has waits until another guardian has
+/// work of its own, such as its next unix time vote.
+#[derive(Clone, Default)]
+pub struct UnorderedBatches(Arc<AtomicUsize>);
 
-#[derive(Debug, Default)]
-pub struct PendingBatchesState {
-    ours: usize,
-    /// Our peers' unordered batches by the creator and round of their unit,
-    /// since two guardians may attach equal batches to their units.
-    peers: BTreeSet<(PeerId, Round)>,
-    /// Aleph BFT rebroadcasts a guardian's latest unit until it creates the
-    /// next one and sends units again in responses, so we remember which units
-    /// were ordered in order to not take such a copy for new work.
-    ordered: BTreeSet<(PeerId, Round)>,
-}
-
-impl PendingBatchesState {
-    /// Whether nothing keeps us from parking.
-    fn idle(&self) -> bool {
-        self.ours == 0 && self.peers.is_empty()
-    }
-}
-
-impl PendingBatches {
-    pub fn new(session: u64) -> Self {
-        Self {
-            session,
-            state: Arc::new(watch::channel(PendingBatchesState::default()).0),
-        }
+impl UnorderedBatches {
+    pub fn created(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn created(&self) {
-        self.state.send_if_modified(|state| {
-            state.ours += 1;
-            // only a peer's batch needs to wake a parked data provider
-            false
-        });
+    pub fn ordered(&self) {
+        // Aleph BFT replays every unit of the current session from our backup on
+        // a restart, thereby ordering batches we have not created in this
+        // process. Hence we saturate at zero instead of underflowing.
+        self.0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |batches| {
+                Some(batches.saturating_sub(1))
+            })
+            .expect("The closure always returns Some");
     }
 
-    /// Record the batch of a unit of this session received from a peer. The
-    /// unit is not verified yet, so a peer can keep us from going quiescent,
-    /// but nothing else.
-    pub fn heard(&self, unit: &CarriedUnit<UnitData>) {
-        if unit.session != self.session || !matches!(unit.data, Some(UnitData::Batch(..))) {
-            return;
-        }
-
-        // a peer can name any node index in a message it sends us
-        let Some(creator) = super::to_peer_id(unit.creator) else {
-            return;
-        };
-
-        let key = (creator, unit.round);
-
-        self.state
-            .send_if_modified(|state| !state.ordered.contains(&key) && state.peers.insert(key));
-    }
-
-    pub fn ordered(&self, creator: PeerId, round: Round, ours: bool, data: &UnitData) {
-        if !matches!(data, UnitData::Batch(..)) {
-            return;
-        }
-
-        self.state.send_if_modified(|state| {
-            // Aleph BFT replays every unit of the current session from our backup on
-            // a restart, thereby ordering batches we have not created in this
-            // process. Hence we saturate at zero instead of underflowing.
-            if ours {
-                state.ours = state.ours.saturating_sub(1);
-            }
-
-            state.peers.remove(&(creator, round));
-            state.ordered.insert((creator, round));
-
-            // ordering never gives a parked data provider work
-            false
-        });
-    }
-
-    fn subscribe(&self) -> watch::Receiver<PendingBatchesState> {
-        self.state.subscribe()
+    pub fn is_empty(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == 0
     }
 }
 
@@ -145,20 +74,22 @@ pub struct DataProvider {
     leftover_item: Option<ConsensusItem>,
     timestamp_sender: async_channel::Sender<Instant>,
     is_recovery: bool,
-    pending_batches: PendingBatches,
-    pending_changes: watch::Receiver<PendingBatchesState>,
+    unordered_batches: UnorderedBatches,
+    session_index: u64,
     park_deadline: Option<Instant>,
     quiescence: watch::Receiver<bool>,
     shutdown: watch::Receiver<Option<ScheduledShutdown>>,
 }
 
 impl DataProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mempool_item_receiver: async_channel::Receiver<ConsensusItem>,
         signature_receiver: watch::Receiver<Option<schnorr::Signature>>,
         timestamp_sender: async_channel::Sender<Instant>,
         is_recovery: bool,
-        pending_batches: PendingBatches,
+        unordered_batches: UnorderedBatches,
+        session_index: u64,
         park_deadline: Option<Instant>,
         shutdown: watch::Receiver<Option<ScheduledShutdown>>,
     ) -> Self {
@@ -169,8 +100,8 @@ impl DataProvider {
             leftover_item: None,
             timestamp_sender,
             is_recovery,
-            pending_changes: pending_batches.subscribe(),
-            pending_batches,
+            unordered_batches,
+            session_index,
             park_deadline,
             quiescence: fedimint_server_core::quiescence::subscribe(),
             shutdown,
@@ -183,7 +114,7 @@ impl DataProvider {
     fn shutdown_due(&mut self) -> bool {
         self.shutdown
             .borrow_and_update()
-            .is_some_and(|scheduled| scheduled.session <= self.pending_batches.session)
+            .is_some_and(|scheduled| scheduled.session <= self.session_index)
     }
 
     /// Whether the item is not a transaction we already attached to a unit.
@@ -248,23 +179,23 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
 
                 assert!(bytes.len() <= ALEPH_BFT_UNIT_BYTE_LIMIT);
 
-                self.pending_batches.created();
+                self.unordered_batches.created();
 
                 return Some(UnitData::Batch(bytes));
             }
 
             // Without quiescence we create a unit every round, with or without data.
-            // With it, as long as a batch of ours or of a peer still awaits ordering,
-            // we keep creating units without data such that the broadcast grows the
-            // dag and orders it. Otherwise there is no work to be done and we go
-            // quiescent until an item is submitted to us, a peer's batch arrives, the
-            // session ends, the park deadline passes, quiescence is turned off, or a
-            // shutdown is scheduled at the end of this session.
+            // With it, as long as a batch of ours still awaits ordering, we keep
+            // creating units without data such that the broadcast grows the dag and
+            // orders it. Otherwise there is no work to be done and we go quiescent
+            // until an item is submitted to us, the session ends, the park deadline
+            // passes, quiescence is turned off, or a shutdown is scheduled at the end
+            // of this session.
             let park_deadline = self.park_deadline?;
 
             if !*self.quiescence.borrow_and_update()
                 || Instant::now() >= park_deadline
-                || !self.pending_changes.borrow_and_update().idle()
+                || !self.unordered_batches.is_empty()
                 || self.shutdown_due()
             {
                 return None;
@@ -290,8 +221,6 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
                 }
                 // The switch lives as long as the process.
                 _ = self.quiescence.changed() => {}
-                // We hold the sender ourselves.
-                _ = self.pending_changes.changed() => {}
                 changed = self.shutdown.changed() => {
                     if changed.is_err() {
                         std::future::pending::<()>().await;
@@ -334,16 +263,12 @@ mod tests {
             .expect("a batch decodes")
     }
 
-    fn batch(nonce: u8) -> UnitData {
-        UnitData::Batch(vec![transaction(nonce)].consensus_encode_to_vec())
-    }
-
     struct Harness {
         provider: DataProvider,
         mempool: async_channel::Sender<ConsensusItem>,
         signature: watch::Sender<Option<schnorr::Signature>>,
         shutdown: watch::Sender<Option<ScheduledShutdown>>,
-        batches: PendingBatches,
+        batches: UnorderedBatches,
         _timestamps: async_channel::Receiver<Instant>,
     }
 
@@ -352,7 +277,7 @@ mod tests {
         let (signature, signature_receiver) = watch::channel(None);
         let (timestamp_sender, timestamps) = async_channel::unbounded();
         let (shutdown, shutdown_receiver) = watch::channel(None);
-        let batches = PendingBatches::new(SESSION);
+        let batches = UnorderedBatches::default();
         Harness {
             provider: DataProvider::new(
                 mempool_receiver,
@@ -360,6 +285,7 @@ mod tests {
                 timestamp_sender,
                 false,
                 batches.clone(),
+                SESSION,
                 park_deadline,
                 shutdown_receiver,
             ),
@@ -408,129 +334,24 @@ mod tests {
         }
     }
 
-    /// The session of the tests' pending batches.
+    /// The session the tests' providers run.
     const SESSION: u64 = 7;
 
-    fn unit(creator: u16, round: Round, data: UnitData) -> CarriedUnit<UnitData> {
-        CarriedUnit {
-            session: SESSION,
-            creator: super::super::to_node_index(PeerId::from(creator)),
-            round,
-            data: Some(data),
-        }
-    }
-
-    fn empty_unit(creator: u16, round: Round) -> CarriedUnit<UnitData> {
-        CarriedUnit {
-            session: SESSION,
-            creator: super::super::to_node_index(PeerId::from(creator)),
-            round,
-            data: None,
-        }
-    }
-
     #[test]
-    fn pending_batches_track_ours_and_unordered_peer_batches() {
-        let us = PeerId::from(0);
-        let peer = PeerId::from(1);
-        let other_peer = PeerId::from(2);
-
-        let batches = PendingBatches::new(SESSION);
-        let mut changes = batches.subscribe();
-        assert!(changes.borrow_and_update().idle());
+    fn unordered_batches_count_ours_until_ordered() {
+        let batches = UnorderedBatches::default();
+        assert!(batches.is_empty());
 
         // Ordering a batch of ours replayed from the backup must not underflow.
-        batches.ordered(us, 1, true, &batch(1));
-        assert!(batches.subscribe().borrow().idle());
+        batches.ordered();
+        assert!(batches.is_empty());
 
-        // Our own batches count until ordered, without waking anyone.
         batches.created();
         batches.created();
-        assert!(!changes.has_changed().expect("sender alive"));
-        batches.ordered(us, 2, true, &batch(2));
-        assert!(!changes.borrow().idle());
-        batches.ordered(us, 3, true, &batch(3));
-        assert!(changes.borrow().idle());
-
-        // A peer's batch is pending from its arrival until it is ordered, and
-        // its arrival wakes a parked provider.
-        batches.heard(&unit(1, 4, batch(4)));
-        assert!(changes.has_changed().expect("sender alive"));
-        assert!(!changes.borrow_and_update().idle());
-
-        // Another copy of the same unit is the same batch.
-        batches.heard(&unit(1, 4, batch(4)));
-        assert!(!changes.has_changed().expect("sender alive"));
-        batches.ordered(peer, 4, false, &batch(4));
-        assert!(changes.borrow().idle());
-
-        // A rebroadcast of an ordered unit is no new work.
-        batches.heard(&unit(1, 4, batch(4)));
-        assert!(!changes.has_changed().expect("sender alive"));
-        assert!(changes.borrow().idle());
-
-        // Two peers' equal batches stay pending until both are ordered.
-        batches.heard(&unit(1, 5, batch(5)));
-        batches.heard(&unit(2, 5, batch(5)));
-        assert!(!changes.borrow_and_update().idle());
-        batches.ordered(peer, 5, false, &batch(5));
-        assert!(!changes.borrow().idle());
-        batches.ordered(other_peer, 5, false, &batch(5));
-        assert!(changes.borrow().idle());
-
-        // Units without a batch are no work, and units naming no possible peer
-        // are ignored altogether.
-        batches.heard(&unit(1, 5, UnitData::Signature([7; 64])));
-        batches.heard(&CarriedUnit {
-            session: SESSION,
-            creator: aleph_bft::NodeIndex(usize::MAX),
-            round: 6,
-            data: Some(batch(6)),
-        });
-        assert!(!changes.has_changed().expect("sender alive"));
-        assert!(changes.borrow().idle());
-    }
-
-    #[test]
-    fn a_peer_unit_without_a_batch_is_no_work() {
-        let batches = PendingBatches::new(SESSION);
-        let mut changes = batches.subscribe();
-        assert!(changes.borrow_and_update().idle());
-
-        // A guardian without quiescence creates a unit every round. Those units,
-        // however far ahead of ours, must not wake a parked provider.
-        batches.heard(&empty_unit(1, 3));
-        batches.heard(&empty_unit(1, 500));
-        batches.heard(&unit(2, 501, UnitData::Signature([7; 64])));
-        assert!(!changes.has_changed().expect("sender alive"));
-        assert!(changes.borrow().idle());
-    }
-
-    #[test]
-    fn units_of_another_session_are_no_work() {
-        let batches = PendingBatches::new(SESSION);
-        let mut changes = batches.subscribe();
-        assert!(changes.borrow_and_update().idle());
-
-        // Peers rebroadcast the last units of the session they just finished,
-        // with rounds past the round limit, and may have attached a batch.
-        for session in [SESSION - 1, SESSION + 1] {
-            batches.heard(&CarriedUnit {
-                session,
-                ..empty_unit(1, 3610)
-            });
-            batches.heard(&CarriedUnit {
-                session,
-                ..unit(2, 3600, batch(1))
-            });
-        }
-        assert!(!changes.has_changed().expect("sender alive"));
-        assert!(changes.borrow().idle());
-
-        // The same batch in a unit of this session is work.
-        batches.heard(&unit(2, 3600, batch(1)));
-        assert!(changes.has_changed().expect("sender alive"));
-        assert!(!changes.borrow_and_update().idle());
+        batches.ordered();
+        assert!(!batches.is_empty());
+        batches.ordered();
+        assert!(batches.is_empty());
     }
 
     // A single test, since the switch is a process global.
@@ -557,41 +378,18 @@ mod tests {
                 mempool.try_send(transaction(1)).expect("unbounded");
             })
             .await;
-        assert_eq!(batch_items(ours.clone()), vec![transaction(1)]);
+        assert_eq!(batch_items(ours), vec![transaction(1)]);
 
         // Units without data continue while our batch awaits ordering.
         assert_eq!(h.returns().await, None);
         assert_eq!(h.returns().await, None);
 
         // Once it is ordered, we park again.
-        h.batches
-            .ordered(PeerId::from(0), 2, true, ours.as_ref().expect("a batch"));
+        h.batches.ordered();
         assert!(h.parks().await);
 
         // A transaction we already attached does not wake us.
         h.mempool.try_send(transaction(1)).expect("unbounded");
-        assert!(h.parks().await);
-
-        // A peer's batch wakes us, and we create units until it is ordered.
-        let batches = h.batches.clone();
-        let data = h
-            .woken_by(move || {
-                batches.heard(&unit(1, 3, batch(2)));
-            })
-            .await;
-        assert_eq!(data, None);
-        assert_eq!(h.returns().await, None);
-        h.batches.ordered(PeerId::from(1), 3, false, &batch(2));
-        assert!(h.parks().await);
-
-        // Its rebroadcast does not wake us again.
-        h.batches.heard(&unit(1, 3, batch(2)));
-        assert!(h.parks().await);
-
-        // Peer units without a batch do not wake us, whatever their round: a
-        // guardian without quiescence creates one every round.
-        h.batches.heard(&empty_unit(2, 4));
-        h.batches.heard(&empty_unit(3, 100));
         assert!(h.parks().await);
 
         // Turning the switch off wakes a parked provider.
