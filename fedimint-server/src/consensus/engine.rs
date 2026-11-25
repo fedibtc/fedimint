@@ -38,7 +38,9 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use crate::LOG_CONSENSUS;
 use crate::config::ServerConfig;
-use crate::consensus::aleph_bft::backup::{BackupReader, BackupWriter};
+use crate::consensus::aleph_bft::backup::{
+    ALEPH_BACKUP_FILE, BackupReader, BackupWriter, has_backup_units, reset_backup_file,
+};
 use crate::consensus::aleph_bft::data_provider::{DataProvider, UnitData};
 use crate::consensus::aleph_bft::finalization_handler::{FinalizationHandler, OrderedUnit};
 use crate::consensus::aleph_bft::keychain::Keychain;
@@ -273,7 +275,7 @@ impl ConsensusEngine {
 
             CONSENSUS_SESSION_COUNT.set(session_index as i64);
 
-            let is_recovery = self.is_recovery().await;
+            let is_recovery = self.is_recovery(session_index).await;
 
             info!(
                 target: LOG_CONSENSUS,
@@ -400,6 +402,14 @@ impl ConsensusEngine {
         let (signed_outcomes_sender, signed_outcomes_receiver) = async_channel::unbounded();
         let (signatures_sender, signatures_receiver) = async_channel::unbounded();
 
+        let is_recovery = self.is_recovery(session_index).await;
+        let backup_path = self.aleph_backup_path();
+        let backup_writer =
+            BackupWriter::with_file(self.db.clone(), backup_path.clone(), session_index)
+                .await
+                .expect("Failed to open AlephBFT backup file");
+        let backup_reader = BackupReader::with_file(self.db.clone(), backup_path, session_index);
+
         let aleph_handle = spawn(
             "aleph run session",
             aleph_bft::run_session(
@@ -409,11 +419,11 @@ impl ConsensusEngine {
                         self.submission_receiver.clone(),
                         signature_receiver,
                         timestamp_sender,
-                        self.is_recovery().await,
+                        is_recovery,
                     ),
                     FinalizationHandler::new(unit_data_sender),
-                    BackupWriter::new(self.db.clone()).await,
-                    BackupReader::new(self.db.clone()),
+                    backup_writer,
+                    backup_reader,
                 ),
                 Network::new(
                     connections.clone(),
@@ -469,15 +479,12 @@ impl ConsensusEngine {
         Some(())
     }
 
-    async fn is_recovery(&self) -> bool {
-        self.db
-            .begin_transaction_nc()
-            .await
-            .find_by_prefix(&AlephUnitsPrefix)
-            .await
-            .next()
-            .await
-            .is_some()
+    fn aleph_backup_path(&self) -> PathBuf {
+        self.data_dir.join(ALEPH_BACKUP_FILE)
+    }
+
+    async fn is_recovery(&self, session_index: u64) -> bool {
+        has_backup_units(&self.db, &self.aleph_backup_path(), session_index).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -895,7 +902,18 @@ impl ConsensusEngine {
     ) {
         let mut dbtx = self.db.begin_transaction().await;
 
-        dbtx.remove_by_prefix(&AlephUnitsPrefix).await;
+        // Clear legacy AlephUnits entries left in RocksDB from a pre-upgrade
+        // mid-session restart. Normal sessions write AlephBFT backups to a
+        // dedicated file, so this prefix is empty and writes zero tombstones.
+        let has_legacy_aleph_units = dbtx
+            .find_by_prefix(&AlephUnitsPrefix)
+            .await
+            .next()
+            .await
+            .is_some();
+        if has_legacy_aleph_units {
+            dbtx.remove_by_prefix(&AlephUnitsPrefix).await;
+        }
 
         dbtx.remove_by_prefix(&AcceptedItemPrefix).await;
 
@@ -919,6 +937,15 @@ impl ConsensusEngine {
         dbtx.commit_tx_result()
             .await
             .expect("This is the only place where we write to this key");
+
+        if let Err(err) = reset_backup_file(&self.aleph_backup_path(), session_index + 1).await {
+            warn!(
+                target: LOG_CONSENSUS,
+                session_index,
+                err = %err.fmt_compact(),
+                "Failed to reset AlephBFT backup file after completing session"
+            );
+        }
     }
 
     /// Returns the full path where the database checkpoints are stored.
