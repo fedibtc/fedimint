@@ -5,7 +5,7 @@ use bitcoin::hashes::{Hash, sha256};
 use fedimint_core::PeerId;
 use fedimint_core::config::P2PMessage;
 use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped};
-use fedimint_core::encoding::Encodable;
+use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::SerdeModuleEncoding;
 use fedimint_core::module::registry::ModuleRegistry;
 use fedimint_core::net::{DynP2PConnections, Recipient};
@@ -14,7 +14,8 @@ use fedimint_core::session_outcome::SignedSessionOutcome;
 use fedimint_core::util::FmtCompact as _;
 use fedimint_logging::LOG_CONSENSUS;
 use parity_scale_codec::{Decode, Encode, IoReader};
-use tracing::{error, trace};
+use tokio::sync::watch;
+use tracing::{error, info, trace};
 
 use super::super::db::SignedSessionOutcomeKey;
 use super::super::peer_availability::PeerActivity;
@@ -39,12 +40,36 @@ pub type NetworkData = aleph_bft::NetworkData<
     <Keychain as aleph_bft::MultiKeychain>::PartialMultisignature,
 >;
 
+/// The variant of [`P2PMessage::Default`] by which a guardian with a shutdown
+/// due at the end of a session asks its peers to stop parking under Aleph
+/// quiescence, so the session completes without waiting for their park
+/// deadline. P2P messages travel bincode-encoded, so a variant unknown to
+/// older peers would fail to decode; as `Default`, older peers decode and
+/// ignore it. The index is far above upstream's variants, so it does not
+/// collide with one they add.
+pub const DRAIN_SESSION_VARIANT: u64 = 0xfed1_0000;
+
+/// The request to drain `session_index`.
+pub fn drain_session_message(session_index: u64) -> P2PMessage {
+    P2PMessage::Default {
+        variant: DRAIN_SESSION_VARIANT,
+        bytes: session_index.consensus_encode_to_vec(),
+    }
+}
+
+/// The session a drain request's payload names, if it decodes.
+fn drain_session(bytes: &[u8]) -> Option<u64> {
+    u64::consensus_decode_whole(bytes, &ModuleRegistry::default()).ok()
+}
+
 pub struct Network {
     connections: DynP2PConnections<P2PMessage>,
     peer_activity: Arc<Mutex<PeerActivity>>,
     signed_outcomes_sender: Sender<(PeerId, SignedSessionOutcome)>,
     signatures_sender: Sender<(PeerId, schnorr::Signature)>,
     db: Database,
+    session_index: u64,
+    drain_sender: watch::Sender<bool>,
 }
 
 impl Network {
@@ -54,6 +79,8 @@ impl Network {
         signed_outcomes_sender: Sender<(PeerId, SignedSessionOutcome)>,
         signatures_sender: Sender<(PeerId, schnorr::Signature)>,
         db: Database,
+        session_index: u64,
+        drain_sender: watch::Sender<bool>,
     ) -> Self {
         Self {
             connections,
@@ -61,6 +88,8 @@ impl Network {
             signed_outcomes_sender,
             signatures_sender,
             db,
+            session_index,
+            drain_sender,
         }
     }
 }
@@ -144,6 +173,19 @@ impl aleph_bft::Network<NetworkData> for Network {
                         );
                     }
                 }
+                P2PMessage::Default { variant, bytes } if variant == DRAIN_SESSION_VARIANT => {
+                    // A request for another session, delayed or replayed, does nothing.
+                    if drain_session(&bytes) == Some(self.session_index)
+                        && !self.drain_sender.send_replace(true)
+                    {
+                        info!(
+                            target: LOG_CONSENSUS,
+                            %peer_id,
+                            session_index = self.session_index,
+                            "Peer asked to drain the session for its shutdown"
+                        );
+                    }
+                }
                 P2PMessage::SignedSessionOutcome(encoded_outcome) => {
                     match encoded_outcome.try_into_inner(&ModuleRegistry::default()) {
                         Ok(outcome) => {
@@ -173,3 +215,6 @@ impl aleph_bft::Network<NetworkData> for Network {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

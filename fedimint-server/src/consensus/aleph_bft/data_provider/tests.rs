@@ -35,6 +35,7 @@ struct Harness {
     mempool: async_channel::Sender<ConsensusItem>,
     signature: watch::Sender<Option<schnorr::Signature>>,
     shutdown: watch::Sender<Option<ScheduledShutdown>>,
+    drain: watch::Sender<bool>,
     batches: UnorderedBatches,
     _timestamps: async_channel::Receiver<Instant>,
 }
@@ -44,6 +45,7 @@ fn harness(park_deadline: Option<Instant>) -> Harness {
     let (signature, signature_receiver) = watch::channel(None);
     let (timestamp_sender, timestamps) = async_channel::unbounded();
     let (shutdown, shutdown_receiver) = watch::channel(None);
+    let (drain, drain_receiver) = watch::channel(false);
     let batches = UnorderedBatches::default();
     Harness {
         provider: DataProvider::new(
@@ -55,10 +57,12 @@ fn harness(park_deadline: Option<Instant>) -> Harness {
             SESSION,
             park_deadline,
             shutdown_receiver,
+            drain_receiver,
         ),
         mempool,
         signature,
         shutdown,
+        drain,
         batches,
         _timestamps: timestamps,
     }
@@ -197,6 +201,20 @@ async fn quiescence_parks_only_without_work_and_only_while_switched_on() {
                 session: SESSION,
                 request: ShutdownRequest::AfterCurrentSession,
             }));
+        })
+        .await;
+    assert_eq!(data, None);
+    assert_eq!(h.returns().await, None);
+    assert_eq!(h.returns().await, None);
+
+    // A peer's request to drain this session wakes a parked provider, which
+    // then creates units without parking.
+    let mut h = harness(Some(far_deadline()));
+    assert!(h.parks().await);
+    let drain = h.drain.clone();
+    let data = h
+        .woken_by(move || {
+            drain.send_replace(true);
         })
         .await;
     assert_eq!(data, None);

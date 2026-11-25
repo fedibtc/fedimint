@@ -20,7 +20,7 @@ use fedimint_core::envs::is_running_in_test_env;
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::module::{ApiRequestErased, SerdeModuleEncoding};
-use fedimint_core::net::DynP2PConnections;
+use fedimint_core::net::{DynP2PConnections, Recipient};
 use fedimint_core::runtime::spawn;
 use fedimint_core::secp256k1::schnorr;
 use fedimint_core::session_outcome::{
@@ -43,7 +43,7 @@ use crate::consensus::aleph_bft::backup::{BackupReader, BackupWriter};
 use crate::consensus::aleph_bft::data_provider::{DataProvider, UnitData, UnorderedBatches};
 use crate::consensus::aleph_bft::finalization_handler::{FinalizationHandler, OrderedUnit};
 use crate::consensus::aleph_bft::keychain::Keychain;
-use crate::consensus::aleph_bft::network::Network;
+use crate::consensus::aleph_bft::network::{Network, drain_session_message};
 use crate::consensus::aleph_bft::spawner::Spawner;
 use crate::consensus::aleph_bft::to_node_index;
 use crate::consensus::db::{
@@ -421,6 +421,7 @@ impl ConsensusEngine {
         };
 
         let unordered_batches = UnorderedBatches::default();
+        let (drain_sender, drain_receiver) = watch::channel(false);
 
         let aleph_handle = spawn(
             "aleph run session",
@@ -436,6 +437,7 @@ impl ConsensusEngine {
                         session_index,
                         park_deadline,
                         self.shutdown_receiver.clone(),
+                        drain_receiver,
                     ),
                     FinalizationHandler::new(unit_data_sender, self.identity(), unordered_batches),
                     BackupWriter::new(self.db.clone()).await,
@@ -447,6 +449,8 @@ impl ConsensusEngine {
                     signed_outcomes_sender,
                     signatures_sender,
                     self.db.clone(),
+                    session_index,
+                    drain_sender,
                 ),
                 Keychain::new(&self.cfg),
                 Spawner::new(self.task_group.make_subgroup()),
@@ -456,8 +460,14 @@ impl ConsensusEngine {
 
         self.ord_latency_sender.send_replace(None);
 
-        let (signed_session_outcome, completion) = self
-            .complete_signed_session_outcome(
+        let drain_requests = request_drain(
+            connections.clone(),
+            self.shutdown_receiver.clone(),
+            session_index,
+        );
+
+        let (signed_session_outcome, completion) = tokio::select! {
+            outcome = self.complete_signed_session_outcome(
                 session_index,
                 unit_data_receiver,
                 signature_sender,
@@ -465,8 +475,9 @@ impl ConsensusEngine {
                 signed_outcomes_receiver,
                 signatures_receiver,
                 connections,
-            )
-            .await?;
+            ) => outcome?,
+            never = drain_requests => match never {},
+        };
 
         assert!(
             self.validate_signed_session_outcome(&signed_session_outcome, session_index),
@@ -1368,6 +1379,44 @@ fn due_shutdown(
     scheduled
         .filter(|scheduled| scheduled.session <= completed_session)
         .map(|scheduled| scheduled.request)
+}
+
+/// How often a guardian with a shutdown due repeats its request that its peers
+/// drain the session. One delivery suffices; the repeats reach a peer that was
+/// disconnected or restarting when an earlier one was sent.
+const DRAIN_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Once a shutdown is due at the end of `session_index`, and while Aleph
+/// quiescence is switched on, ask our peers to stop parking, until the session
+/// ends and this future is dropped. A round needs units from 2f+1 guardians, so
+/// without this our shutdown, such as for a guardian transfer, would wait for
+/// our peers' park deadline.
+async fn request_drain(
+    connections: DynP2PConnections<P2PMessage>,
+    mut shutdown: watch::Receiver<Option<ScheduledShutdown>>,
+    session_index: u64,
+) -> std::convert::Infallible {
+    let due = shutdown
+        .wait_for(|scheduled| scheduled.is_some_and(|scheduled| scheduled.session <= session_index))
+        .await
+        .is_ok();
+
+    // The sender lives as long as the server.
+    if !due {
+        return std::future::pending().await;
+    }
+
+    let mut interval = tokio::time::interval(DRAIN_REQUEST_INTERVAL);
+
+    loop {
+        interval.tick().await;
+
+        // The switch follows the same feature policy on every guardian, so
+        // with it off our peers do not park and there is nothing to ask.
+        if fedimint_server_core::quiescence::is_enabled() {
+            connections.send(Recipient::Everyone, drain_session_message(session_index));
+        }
+    }
 }
 
 pub async fn get_finished_session_count_static(dbtx: &mut DatabaseTransaction<'_>) -> u64 {
