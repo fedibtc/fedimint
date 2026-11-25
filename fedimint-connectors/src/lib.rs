@@ -11,7 +11,7 @@ use std::fmt::{self, Debug};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -128,7 +128,7 @@ type ConnectorInitFn = Arc<
 ///
 /// See [`ConnectorRegistry::build_from_client_env`] and similar
 /// to create.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // Shut up, Clippy
 pub struct ConnectorRegistryBuilder {
     /// List of overrides to use when attempting to connect to given url
@@ -215,6 +215,7 @@ impl ConnectorRegistryBuilder {
         ConnectorRegistry {
             inner: ConnectorRegistryInner {
                 connectors_lazy,
+                guardian_pools: Mutex::new(HashMap::new()),
                 connection_overrides: self.connection_overrides,
                 initialized: SetOnce::new(),
                 path_change,
@@ -331,6 +332,10 @@ impl ConnectorRegistryBuilder {
 
 /// Actual data shared between copies of [`ConnectorRegistry`] handle
 struct ConnectorRegistryInner {
+    /// Pools are scoped to the exact transport authentication context. Weak
+    /// references avoid a cycle: each pool retains its connector registry.
+    #[allow(clippy::type_complexity)]
+    guardian_pools: Mutex<HashMap<Option<String>, Weak<ConnectionPool<dyn IGuardianConnection>>>>,
     /// Lazily initialized [`Connector`]s per protocol supported
     connectors_lazy: BTreeMap<String, (ConnectorInitFn, OnceCell<DynConnector>)>,
     /// Connection URL overrides for testing/custom routing
@@ -376,6 +381,28 @@ impl fmt::Debug for ConnectorRegistry {
 }
 
 impl ConnectorRegistry {
+    /// Share guardian connections between API views with the same authentication
+    /// context. The pool keys connections by full URL; callers must use it only
+    /// with this `api_secret`. Separate registries never share pools.
+    pub fn guardian_connection_pool(
+        &self,
+        api_secret: Option<&str>,
+    ) -> Arc<ConnectionPool<dyn IGuardianConnection>> {
+        let mut pools = self
+            .inner
+            .guardian_pools
+            .lock()
+            .expect("Guardian pool cache mutex is not poisoned");
+        pools.retain(|_, pool| pool.strong_count() > 0);
+        let key = api_secret.map(str::to_owned);
+        if let Some(pool) = pools.get(&key).and_then(Weak::upgrade) {
+            return pool;
+        }
+        let pool = Arc::new(ConnectionPool::new(self.clone()));
+        pools.insert(key, Arc::downgrade(&pool));
+        pool
+    }
+
     /// Whether compatible iroh-next endpoints advertised in guardian metadata
     /// are used.
     pub fn iroh_next_enabled(&self) -> bool {
@@ -1052,3 +1079,6 @@ impl<T: ?Sized> ConnectionState<T> {
 
 #[cfg(test)]
 mod reconnect_tests;
+
+#[cfg(test)]
+mod pool_tests;
