@@ -411,7 +411,7 @@ impl ConsensusEngine {
         // session's remaining rounds before the timeout above restarts us.
         let park_deadline = (!is_recovery).then(|| Instant::now() + self.session_timeout / 2);
 
-        let pending_batches = PendingBatches::default();
+        let pending_batches = PendingBatches::new(session_index);
 
         let aleph_handle = spawn(
             "aleph run session",

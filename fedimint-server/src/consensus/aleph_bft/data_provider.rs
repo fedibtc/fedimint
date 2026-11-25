@@ -43,11 +43,17 @@ impl UnitData {
 ///   work that reaches only that peer could not enter a unit.
 ///
 /// The [`DataProvider`] counts our batches as it creates them, the
-/// [`super::network::Network`] records our peers' units as they arrive, and
-/// the [`super::finalization_handler::FinalizationHandler`] clears batches as
-/// they are ordered.
+/// [`super::network::Network`] records our peers' units of this session as
+/// they arrive, and the [`super::finalization_handler::FinalizationHandler`]
+/// clears batches as they are ordered.
 #[derive(Clone)]
-pub struct PendingBatches(Arc<watch::Sender<PendingBatchesState>>);
+pub struct PendingBatches {
+    /// Peers keep rebroadcasting the last units of the session they just
+    /// finished while we run the next one. Those units are no work of ours, and
+    /// their high rounds would keep us awake for the whole session.
+    session: u64,
+    state: Arc<watch::Sender<PendingBatchesState>>,
+}
 
 #[derive(Debug, Default)]
 pub struct PendingBatchesState {
@@ -74,25 +80,30 @@ impl PendingBatchesState {
     }
 }
 
-impl Default for PendingBatches {
-    fn default() -> Self {
-        Self(Arc::new(watch::channel(PendingBatchesState::default()).0))
-    }
-}
-
 impl PendingBatches {
+    pub fn new(session: u64) -> Self {
+        Self {
+            session,
+            state: Arc::new(watch::channel(PendingBatchesState::default()).0),
+        }
+    }
+
     fn created(&self) {
-        self.0.send_if_modified(|state| {
+        self.state.send_if_modified(|state| {
             state.ours += 1;
             // only a peer's batch needs to wake a parked data provider
             false
         });
     }
 
-    /// Record a unit received from a peer: its round, and its batch if it
-    /// has one. The unit is not verified yet, so a peer can keep us from going
-    /// quiescent, but nothing else.
+    /// Record a unit of this session received from a peer: its round, and its
+    /// batch if it has one. The unit is not verified yet, so a peer can keep us
+    /// from going quiescent, but nothing else.
     pub fn heard(&self, unit: &CarriedUnit<UnitData>) {
+        if unit.session != self.session {
+            return;
+        }
+
         // a peer can name any node index in a message it sends us
         let Some(creator) = super::to_peer_id(unit.creator) else {
             return;
@@ -101,7 +112,7 @@ impl PendingBatches {
         let key = (creator, unit.round);
         let has_batch = matches!(unit.data, Some(UnitData::Batch(..)));
 
-        self.0.send_if_modified(|state| {
+        self.state.send_if_modified(|state| {
             let ahead = state
                 .highest_peer_round
                 .is_none_or(|highest| highest < unit.round);
@@ -121,7 +132,7 @@ impl PendingBatches {
             return;
         }
 
-        self.0.send_if_modified(|state| {
+        self.state.send_if_modified(|state| {
             // Aleph BFT replays every unit of the current session from our backup on
             // a restart, thereby ordering batches we have not created in this
             // process. Hence we saturate at zero instead of underflowing.
@@ -138,7 +149,7 @@ impl PendingBatches {
     }
 
     fn subscribe(&self) -> watch::Receiver<PendingBatchesState> {
-        self.0.subscribe()
+        self.state.subscribe()
     }
 }
 
@@ -338,7 +349,7 @@ mod tests {
         let (mempool, mempool_receiver) = async_channel::unbounded();
         let (signature, signature_receiver) = watch::channel(None);
         let (timestamp_sender, timestamps) = async_channel::unbounded();
-        let batches = PendingBatches::default();
+        let batches = PendingBatches::new(SESSION);
         Harness {
             provider: DataProvider::new(
                 mempool_receiver,
@@ -395,8 +406,12 @@ mod tests {
         }
     }
 
+    /// The session of the tests' pending batches.
+    const SESSION: u64 = 7;
+
     fn unit(creator: u16, round: Round, data: UnitData) -> CarriedUnit<UnitData> {
         CarriedUnit {
+            session: SESSION,
             creator: super::super::to_node_index(PeerId::from(creator)),
             round,
             data: Some(data),
@@ -405,6 +420,7 @@ mod tests {
 
     fn empty_unit(creator: u16, round: Round) -> CarriedUnit<UnitData> {
         CarriedUnit {
+            session: SESSION,
             creator: super::super::to_node_index(PeerId::from(creator)),
             round,
             data: None,
@@ -421,7 +437,7 @@ mod tests {
         let peer = PeerId::from(1);
         let other_peer = PeerId::from(2);
 
-        let batches = PendingBatches::default();
+        let batches = PendingBatches::new(SESSION);
         let mut changes = batches.subscribe();
         assert!(changes.borrow_and_update().idle_at(LATE));
 
@@ -468,6 +484,7 @@ mod tests {
         // are ignored altogether.
         batches.heard(&unit(1, 5, UnitData::Signature([7; 64])));
         batches.heard(&CarriedUnit {
+            session: SESSION,
             creator: aleph_bft::NodeIndex(usize::MAX),
             round: LATE,
             data: Some(batch(6)),
@@ -478,7 +495,7 @@ mod tests {
 
     #[test]
     fn a_peer_unit_keeps_us_awake_up_to_its_round() {
-        let batches = PendingBatches::default();
+        let batches = PendingBatches::new(SESSION);
         let mut changes = batches.subscribe();
         assert!(changes.borrow_and_update().idle_at(0));
 
@@ -502,6 +519,33 @@ mod tests {
         assert!(changes.has_changed().expect("sender alive"));
         assert!(!changes.borrow_and_update().idle_at(4));
         assert!(changes.borrow().idle_at(5));
+    }
+
+    #[test]
+    fn units_of_another_session_are_no_work() {
+        let batches = PendingBatches::new(SESSION);
+        let mut changes = batches.subscribe();
+        assert!(changes.borrow_and_update().idle_at(0));
+
+        // Peers rebroadcast the last units of the session they just finished,
+        // with rounds past the round limit, and may have attached a batch.
+        for session in [SESSION - 1, SESSION + 1] {
+            batches.heard(&CarriedUnit {
+                session,
+                ..empty_unit(1, 3610)
+            });
+            batches.heard(&CarriedUnit {
+                session,
+                ..unit(2, 3600, batch(1))
+            });
+        }
+        assert!(!changes.has_changed().expect("sender alive"));
+        assert!(changes.borrow().idle_at(1));
+
+        // The same units of this session are work.
+        batches.heard(&empty_unit(1, 3610));
+        assert!(changes.has_changed().expect("sender alive"));
+        assert!(!changes.borrow_and_update().idle_at(1));
     }
 
     // A single test, since the switch is a process global.
