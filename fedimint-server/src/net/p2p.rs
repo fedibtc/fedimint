@@ -27,8 +27,13 @@ use tokio::sync::{Notify, watch};
 use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{Instrument, debug, info, info_span, warn};
 
-use crate::metrics::{PEER_CONNECT_COUNT, PEER_DISCONNECT_COUNT, PEER_MESSAGES_COUNT};
-use crate::net::p2p_connection::{DynConnectionStatusUpdates, DynP2PConnection};
+use crate::metrics::{
+    PEER_CONNECT_COUNT, PEER_DISCONNECT_COUNT, PEER_MESSAGES_COUNT, PEER_MESSAGES_DROPPED,
+    PEER_SEND_DURATION_SECONDS, PEER_TRANSPORT_BYTES, PEER_TRANSPORT_CONGESTION_EVENTS,
+    PEER_TRANSPORT_CONGESTION_WINDOW_BYTES, PEER_TRANSPORT_LOST_PACKETS,
+    PEER_TRANSPORT_RTT_SECONDS,
+};
+use crate::net::p2p_connection::{DynConnectionStatusUpdates, DynP2PConnection, P2PTransportStats};
 use crate::net::p2p_connector::DynP2PConnector;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +172,8 @@ impl<M: Clone + Send + 'static> IP2PConnections<M> for ReconnectP2PConnections<M
 struct P2PConnection<M> {
     outgoing_sender: Sender<M>,
     incoming_receiver: Receiver<M>,
+    our_id_str: String,
+    peer_id_str: String,
 }
 
 impl<M: Send + 'static> P2PConnection<M> {
@@ -187,6 +194,16 @@ impl<M: Send + 'static> P2PConnection<M> {
         // nature there.
         let (outgoing_sender, outgoing_receiver) = bounded(5);
         let (incoming_sender, incoming_receiver) = bounded(5);
+
+        // Start both drop counters at zero, so a scrape tells "no drops" apart
+        // from "no data".
+        for direction in ["outgoing", "incoming"] {
+            PEER_MESSAGES_DROPPED.with_label_values(&[
+                our_id.to_string().as_str(),
+                &peer_id.to_string(),
+                direction,
+            ]);
+        }
 
         task_group.spawn_cancellable(
             format!("io-state-machine-{peer_id}"),
@@ -225,11 +242,20 @@ impl<M: Send + 'static> P2PConnection<M> {
         P2PConnection {
             outgoing_sender,
             incoming_receiver,
+            our_id_str: our_id.to_string(),
+            peer_id_str: peer_id.to_string(),
         }
     }
 
     fn try_send(&self, message: M) {
         if self.outgoing_sender.try_send(message).is_err() {
+            PEER_MESSAGES_DROPPED
+                .with_label_values(&[
+                    self.our_id_str.as_str(),
+                    self.peer_id_str.as_str(),
+                    "outgoing",
+                ])
+                .inc();
             debug!(target: LOG_NET_PEER, "Outgoing message channel is full");
         }
     }
@@ -378,9 +404,13 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
 
         tokio::pin!(send_loop, receive_loop);
 
+        // What this connection's counters were when last added to the metrics.
+        let mut recorded_transport = P2PTransportStats::default();
+
         loop {
             tokio::select! {
                 halt = &mut send_loop => {
+                    self.record_transport(&connection, &mut recorded_transport);
                     // A frame may be part way through `read_to_end`, which is not
                     // cancel-safe, so the receive half is stopped between frames
                     // rather than dropped here. Shutdown is the exception: nothing
@@ -408,6 +438,7 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                     };
                 },
                 halt = &mut receive_loop => {
+                    self.record_transport(&connection, &mut recorded_transport);
                     return Some(self.disconnect(match halt {
                         ReceiveHalt::Failed(e) => e,
                         ReceiveHalt::Stopped => anyhow!("Receive half stopped unprompted"),
@@ -427,6 +458,7 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                     // provide. Only `rtt` needs this; transport changes still
                     // arrive on the status update stream above.
                     self.refresh_status(&connection);
+                    self.record_transport(&connection, &mut recorded_transport);
                 },
             }
         }
@@ -475,7 +507,13 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
             // while keepalives hold the connection open. Bound it, so the link
             // is re-established instead of looking connected while every
             // further message is dropped.
-            match timeout(SEND_TIMEOUT, connection.send(message)).await {
+            let send_timer = PEER_SEND_DURATION_SECONDS
+                .with_label_values(&[our_id_str, peer_id_str])
+                .start_timer();
+            let sent = timeout(SEND_TIMEOUT, connection.send(message)).await;
+            send_timer.observe_duration();
+
+            match sent {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return SendHalt::Failed(e),
                 Err(_) => {
@@ -515,6 +553,9 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                         .inc();
 
                     if incoming_sender.try_send(message).is_err() {
+                        PEER_MESSAGES_DROPPED
+                            .with_label_values(&[our_id_str, peer_id_str, "incoming"])
+                            .inc();
                         debug!(target: LOG_NET_PEER, "Incoming message channel is full");
                     }
                 }
@@ -541,6 +582,56 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
         });
     }
 
+    /// Adds the transport counters that `connection` accumulated since
+    /// `recorded` to the peer metrics, and publishes its current RTT and
+    /// congestion window.
+    fn record_transport(&self, connection: &DynP2PConnection<M>, recorded: &mut P2PTransportStats) {
+        let Some(current) = connection.transport_stats() else {
+            return;
+        };
+        let labels = [self.our_id_str.as_str(), self.peer_id_str.as_str()];
+        for (direction, current, recorded) in [
+            ("outgoing", current.sent_bytes, recorded.sent_bytes),
+            ("incoming", current.received_bytes, recorded.received_bytes),
+        ] {
+            PEER_TRANSPORT_BYTES
+                .with_label_values(&[labels[0], labels[1], direction])
+                .inc_by(current.saturating_sub(recorded));
+        }
+        PEER_TRANSPORT_LOST_PACKETS
+            .with_label_values(&labels)
+            .inc_by(current.lost_packets.saturating_sub(recorded.lost_packets));
+        // Each path counts its own events, so a path the connection
+        // migrates to adds everything it counted since it was last recorded.
+        let congestion_events: u64 = current
+            .congestion_events
+            .iter()
+            .map(|(path, events)| {
+                events.saturating_sub(recorded.congestion_events.get(path).copied().unwrap_or(0))
+            })
+            .sum();
+        PEER_TRANSPORT_CONGESTION_EVENTS
+            .with_label_values(&labels)
+            .inc_by(congestion_events);
+        match current.congestion_window_bytes {
+            Some(window) => PEER_TRANSPORT_CONGESTION_WINDOW_BYTES
+                .with_label_values(&labels)
+                .set(i64::try_from(window).unwrap_or(i64::MAX)),
+            None => {
+                let _ = PEER_TRANSPORT_CONGESTION_WINDOW_BYTES.remove_label_values(&labels);
+            }
+        }
+        match connection.rtt() {
+            Some(rtt) => PEER_TRANSPORT_RTT_SECONDS
+                .with_label_values(&labels)
+                .set(rtt.as_secs_f64()),
+            None => {
+                let _ = PEER_TRANSPORT_RTT_SECONDS.remove_label_values(&labels);
+            }
+        }
+        *recorded = current;
+    }
+
     fn disconnect(&self, error: anyhow::Error) -> P2PConnectionSMState<M> {
         let last_error = error.fmt_compact().to_string();
 
@@ -553,6 +644,10 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
         PEER_DISCONNECT_COUNT
             .with_label_values(&[&self.our_id_str, &self.peer_id_str])
             .inc();
+        // A disconnected peer has no current RTT or congestion window.
+        let labels = [self.our_id_str.as_str(), self.peer_id_str.as_str()];
+        let _ = PEER_TRANSPORT_CONGESTION_WINDOW_BYTES.remove_label_values(&labels);
+        let _ = PEER_TRANSPORT_RTT_SECONDS.remove_label_values(&labels);
 
         P2PConnectionSMState::Disconnected {
             backoff: api_networking_backoff(),

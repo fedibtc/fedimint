@@ -13,6 +13,8 @@ use std::env;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -31,15 +33,16 @@ use fedimint_core::task::TaskGroup;
 use fedimint_core::timing;
 use fedimint_core::util::{FmtCompact as _, SafeUrl, handle_version_hash_command};
 use fedimint_ln_server::LightningInit;
-use fedimint_logging::{LOG_CORE, LOG_SERVER, TracingSetup};
+use fedimint_logging::{ExtraTracingLayer, LOG_CORE, LOG_SERVER, TracingSetup};
 use fedimint_meta_server::MetaInit;
 use fedimint_mint_server::MintInit;
 use fedimint_rocksdb::RocksDb;
-use fedimint_server::IrohNextApiSettings;
 use fedimint_server::config::ConfigGenSettings;
+use fedimint_server::config::driven::FM_DKG_CTRL_ENV;
 use fedimint_server::config::io::{DB_FILE, PLAINTEXT_PASSWORD};
 use fedimint_server::core::ServerModuleInitRegistry;
 use fedimint_server::net::api::ApiSecrets;
+use fedimint_server::{ConsensusStop, IrohNextApiSettings, SessionTimedOut, ShutdownRequest};
 use fedimint_server_bitcoin_rpc::BitcoindClientWithFallback;
 use fedimint_server_bitcoin_rpc::bitcoind::BitcoindClient;
 use fedimint_server_bitcoin_rpc::esplora::EsploraClient;
@@ -70,6 +73,17 @@ use crate::metrics::APP_START_TS;
 
 /// Time we will wait before forcefully shutting down tasks
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Exit code of a fedimintd that stopped because a shutdown requested through
+/// `shutdown_after_current_session` took effect at a session boundary: its
+/// last session completed and no later session began, so it signed no units
+/// of an unfinished session.
+///
+/// Only that path exits with this code. Every other exit, including a
+/// shutdown scheduled for a given session through `shutdown`, a session
+/// timeout, a failed main task, a panic, a signal, or a failed task shutdown,
+/// exits with a different code or by signal.
+pub const SESSION_BOUNDARY_EXIT_CODE: i32 = 3;
 
 #[derive(Parser)]
 #[command(version)]
@@ -146,10 +160,11 @@ struct ServerOpts {
     /// Trusted Esplora HTTP base URL, e.g. <https://mempool.space/api>
     ///
     /// With bitcoind configured, retries individual failed reads and supplies
-    /// block count while bitcoind reports initial block download. Their chain
-    /// identities are compared once at startup when both respond. Esplora can
-    /// bootstrap while bitcoind is offline and is trusted for chain selection,
-    /// not independently verified.
+    /// block count while bitcoind reports initial block download. Hybrid
+    /// construction does not probe either backend or compare their chain
+    /// identities. Esplora can bootstrap while bitcoind is offline and must
+    /// be trusted to serve the intended chain; its chain selection is not
+    /// independently verified.
     /// Transactions go to Esplora only after a bitcoind broadcast error.
     /// See SECURITY.md for the trust model.
     #[arg(long, env = FM_ESPLORA_URL_ENV)]
@@ -305,7 +320,7 @@ impl ServerOpts {
             let password = self
                 .bitcoind_password
                 .clone()
-                .expect("FM_BITCOIND_URL is set but FM_BITCOIND_PASSWORD is not");
+                .context("FM_BITCOIND_URL is set but FM_BITCOIND_PASSWORD is not")?;
             Ok((url, password))
         }
     }
@@ -334,6 +349,42 @@ pub async fn run(
     module_init_registry: ServerModuleInitRegistry,
     code_version_hash: &str,
     code_version_vendor_suffix: Option<&str>,
+) -> anyhow::Result<Infallible> {
+    run_inner(
+        module_init_registry,
+        code_version_hash,
+        code_version_vendor_suffix,
+        None,
+    )
+    .await
+}
+
+/// Run fedimintd with an additional process-wide tracing layer.
+///
+/// Fedimint's normal stderr, filtering, console, and OpenTelemetry setup is
+/// retained. This is primarily useful for binaries that bundle fedimintd and
+/// need to attach their own structured logging sink.
+pub async fn run_with_extra_logging_layer(
+    module_init_registry: ServerModuleInitRegistry,
+    code_version_hash: &str,
+    code_version_vendor_suffix: Option<&str>,
+    layer: ExtraTracingLayer,
+) -> anyhow::Result<Infallible> {
+    run_inner(
+        module_init_registry,
+        code_version_hash,
+        code_version_vendor_suffix,
+        Some(layer),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_inner(
+    module_init_registry: ServerModuleInitRegistry,
+    code_version_hash: &str,
+    code_version_vendor_suffix: Option<&str>,
+    extra_logging_layer: Option<ExtraTracingLayer>,
 ) -> anyhow::Result<Infallible> {
     assert_eq!(
         env!("FEDIMINT_BUILD_CODE_VERSION").len(),
@@ -371,13 +422,21 @@ pub async fn run(
         .tokio_console_bind(server_opts.bind_tokio_console)
         .with_jaeger(server_opts.with_jaeger);
 
-    tracing_builder.init().map_err(anyhow::Error::from).unwrap();
+    if let Some(layer) = extra_logging_layer {
+        tracing_builder.with_boxed_extra_layer(layer);
+    }
+    tracing_builder
+        .init()
+        .expect("logging initialization succeeds");
 
     // Install the provider before constructing the hybrid backend, which
     // checks the Esplora chain identity over HTTPS during initialization.
     install_crypto_provider().await;
 
-    info!("Starting fedimintd (version: {fedimint_version} version_hash: {code_version_hash})");
+    info!(
+        safe_to_share = true,
+        "Starting fedimintd (version: {fedimint_version} version_hash: {code_version_hash})"
+    );
 
     #[cfg(all(
         not(feature = "jemalloc"),
@@ -385,6 +444,7 @@ pub async fn run(
     ))]
     warn!(
         target: LOG_SERVER,
+        safe_to_share = true,
         "fedimintd was built without the `jemalloc` feature. rocksdb is prone to memory \
          fragmentation with the default allocator; consider rebuilding with `--features jemalloc`."
     );
@@ -412,7 +472,23 @@ pub async fn run(
             url = %format!("http://{}/metrics", bind_metrics),
             "Initializing metrics server",
         );
-        fedimint_metrics::spawn_api_server(*bind_metrics, root_task_group.clone()).await?;
+        if let Err(err) =
+            fedimint_metrics::spawn_api_server(*bind_metrics, root_task_group.clone()).await
+        {
+            error!(
+                target: LOG_SERVER,
+                error = format_args!("{err:#}"),
+                "metrics server startup failed"
+            );
+            error!(
+                target: LOG_SERVER,
+                safe_to_share = true,
+                stage = "metrics_server",
+                failure_kind = "startup_failed",
+                "fedimintd startup failed"
+            );
+            return Err(err.into());
+        }
     }
 
     let enable_iroh = server_opts.enable_iroh.unwrap_or(!is_running_in_test_env());
@@ -436,53 +512,90 @@ pub async fn run(
         default_modules: module_init_registry.default_modules(),
     };
 
-    let db = Database::new(
-        RocksDb::build(server_opts.data_dir.join(DB_FILE))
-            .open()
-            .await
-            .map_err(anyhow::Error::from)
-            .unwrap(),
-        ModuleRegistry::default(),
-    );
+    let driven_dkg = is_env_var_set(FM_DKG_CTRL_ENV);
+    let db = if driven_dkg {
+        None
+    } else {
+        Some(
+            open_server_database(server_opts.data_dir.clone())
+                .await
+                .map_err(|err| {
+                    error!(
+                        target: LOG_SERVER,
+                        error = format_args!("{err:#}"),
+                        "fedimintd database open failed"
+                    );
+                    error!(
+                        target: LOG_SERVER,
+                        safe_to_share = true,
+                        stage = "database_open",
+                        failure_kind = "open_failed",
+                        "fedimintd startup failed"
+                    );
+                    err
+                })?,
+        )
+    };
 
-    let dyn_server_bitcoin_rpc = match (
-        server_opts.bitcoind_url.as_ref(),
-        server_opts.esplora_url.as_ref(),
-    ) {
-        (Some(_), None) => {
-            let bitcoind_username = server_opts
-                .bitcoind_username
-                .clone()
-                .expect("FM_BITCOIND_URL is set but FM_BITCOIND_USERNAME is not");
-            let (bitcoind_url, bitcoind_password) = server_opts
-                .get_bitcoind_url_and_password()
-                .await
-                .expect("Failed to get bitcoind url");
-            BitcoindClient::new(bitcoind_username, bitcoind_password, &bitcoind_url)
-                .unwrap()
-                .into_dyn()
+    let dyn_server_bitcoin_rpc = async {
+        Ok::<_, anyhow::Error>(
+            match (
+                server_opts.bitcoind_url.as_ref(),
+                server_opts.esplora_url.as_ref(),
+            ) {
+                (Some(_), None) => {
+                    let bitcoind_username = server_opts
+                        .bitcoind_username
+                        .clone()
+                        .context("FM_BITCOIND_URL is set but FM_BITCOIND_USERNAME is not")?;
+                    let (bitcoind_url, bitcoind_password) = server_opts
+                        .get_bitcoind_url_and_password()
+                        .await
+                        .context("Failed to get bitcoind url")?;
+                    BitcoindClient::new(bitcoind_username, bitcoind_password, &bitcoind_url)?
+                        .into_dyn()
+                }
+                (None, Some(url)) => EsploraClient::new(url)?.into_dyn(),
+                (Some(_), Some(esplora_url)) => {
+                    let bitcoind_username = server_opts
+                        .bitcoind_username
+                        .clone()
+                        .context("FM_BITCOIND_URL is set but FM_BITCOIND_USERNAME is not")?;
+                    let (bitcoind_url, bitcoind_password) = server_opts
+                        .get_bitcoind_url_and_password()
+                        .await
+                        .context("Failed to get bitcoind url")?;
+                    BitcoindClientWithFallback::new(
+                        bitcoind_username,
+                        bitcoind_password,
+                        &bitcoind_url,
+                        esplora_url,
+                    )
+                    .await?
+                    .into_dyn()
+                }
+                _ => unreachable!("ArgGroup already enforced XOR relation"),
+            },
+        )
+    }
+    .await;
+    let dyn_server_bitcoin_rpc = match dyn_server_bitcoin_rpc {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                target: LOG_SERVER,
+                error = format_args!("{err:#}"),
+                "bitcoin RPC client initialization failed"
+            );
+            error!(
+                target: LOG_SERVER,
+                safe_to_share = true,
+                stage = "bitcoin_rpc_client",
+                failure_kind = "initialization_failed",
+                "fedimintd startup failed"
+            );
+            return Err(err);
         }
-        (None, Some(url)) => EsploraClient::new(url).unwrap().into_dyn(),
-        (Some(_), Some(esplora_url)) => {
-            let bitcoind_username = server_opts
-                .bitcoind_username
-                .clone()
-                .expect("FM_BITCOIND_URL is set but FM_BITCOIND_USERNAME is not");
-            let (bitcoind_url, bitcoind_password) = server_opts
-                .get_bitcoind_url_and_password()
-                .await
-                .expect("Failed to get bitcoind url");
-            BitcoindClientWithFallback::new(
-                bitcoind_username,
-                bitcoind_password,
-                &bitcoind_url,
-                esplora_url,
-            )
-            .await
-            .unwrap()
-            .into_dyn()
-        }
-        _ => unreachable!("ArgGroup already enforced at least one Bitcoin backend"),
     };
     let dyn_server_bitcoin_rpc =
         ServerBitcoinRpcTracked::new(dyn_server_bitcoin_rpc, "server").into_dyn();
@@ -504,59 +617,130 @@ pub async fn run(
 
     let task_group = root_task_group.clone();
     let code_version_hash = code_version_hash.to_string();
+    let stopped_at_session_boundary = Arc::new(AtomicBool::new(false));
+    let main_stopped_at_session_boundary = stopped_at_session_boundary.clone();
     root_task_group.spawn_cancellable("main", async move {
-        fedimint_server::run_with_iroh_p2p_relays_and_next_api(
-            server_opts.data_dir,
-            auth_ui,
-            auth_api,
-            server_opts.force_api_secrets,
-            settings,
-            db,
-            code_version_str,
-            code_version_hash,
-            module_init_registry,
-            task_group,
-            dyn_server_bitcoin_rpc,
-            Box::new(fedimint_server_ui::setup::router),
-            Box::new(fedimint_server_ui::dashboard::router),
-            server_opts.db_checkpoint_retention,
-            Duration::from_secs(server_opts.session_timeout_secs),
-            server_opts
-                .p2p_max_connection_age_secs
-                .map(Duration::from_secs),
-            fedimint_server::ConnectionLimits::new(
-                server_opts.iroh_api_max_connections,
-                server_opts.iroh_api_max_requests_per_connection,
-            ),
-            server_opts.iroh_p2p_relays,
-            iroh_next_api_settings,
-        )
-        .await
-        .unwrap_or_else(|err| panic!("Main task returned error: {}", err.fmt_compact()));
+        let connection_limits = fedimint_server::ConnectionLimits::new(
+            server_opts.iroh_api_max_connections,
+            server_opts.iroh_api_max_requests_per_connection,
+        );
+        let result = if driven_dkg {
+            fedimint_server::run_driven(
+                server_opts.data_dir,
+                auth_ui,
+                auth_api,
+                server_opts.force_api_secrets,
+                settings,
+                Box::new(|data_dir| Box::pin(open_server_database(data_dir))),
+                code_version_str,
+                module_init_registry,
+                task_group,
+                dyn_server_bitcoin_rpc,
+                Box::new(fedimint_server_ui::dashboard::router),
+                server_opts.db_checkpoint_retention,
+                connection_limits,
+                code_version_hash,
+                Duration::from_secs(server_opts.session_timeout_secs),
+                server_opts
+                    .p2p_max_connection_age_secs
+                    .map(Duration::from_secs),
+                server_opts.iroh_p2p_relays,
+                iroh_next_api_settings,
+            )
+            .await
+        } else {
+            fedimint_server::run_with_iroh_p2p_relays_and_next_api(
+                server_opts.data_dir,
+                auth_ui,
+                auth_api,
+                server_opts.force_api_secrets,
+                settings,
+                db.expect("database is opened outside driven-DKG mode"),
+                code_version_str,
+                code_version_hash,
+                module_init_registry,
+                task_group,
+                dyn_server_bitcoin_rpc,
+                Box::new(fedimint_server_ui::setup::router),
+                Box::new(fedimint_server_ui::dashboard::router),
+                server_opts.db_checkpoint_retention,
+                Duration::from_secs(server_opts.session_timeout_secs),
+                server_opts
+                    .p2p_max_connection_age_secs
+                    .map(Duration::from_secs),
+                fedimint_server::ConnectionLimits::new(
+                    server_opts.iroh_api_max_connections,
+                    server_opts.iroh_api_max_requests_per_connection,
+                ),
+                server_opts.iroh_p2p_relays,
+                iroh_next_api_settings,
+            )
+            .await
+        };
+        let stop = result.unwrap_or_else(|err| {
+            error!(
+                target: LOG_SERVER,
+                error = format_args!("{err:#}"),
+                "fedimintd main task failed"
+            );
+            let reason = if err.downcast_ref::<SessionTimedOut>().is_some() {
+                "session_timeout"
+            } else {
+                "other"
+            };
+            error!(
+                target: LOG_SERVER,
+                safe_to_share = true,
+                stage = "server_main",
+                failure_kind = "fatal",
+                reason,
+                "fedimintd main task failed"
+            );
+            panic!("fedimintd main task failed");
+        });
+        if stop == ConsensusStop::ScheduledShutdown(ShutdownRequest::AfterCurrentSession) {
+            main_stopped_at_session_boundary.store(true, Ordering::SeqCst);
+        }
     });
 
     let shutdown_future = root_task_group
         .make_handle()
         .make_shutdown_rx()
         .then(|()| async {
-            info!(target: LOG_CORE, "Shutdown called");
+            info!(target: LOG_CORE, safe_to_share = true, "Shutdown called");
         });
 
     shutdown_future.await;
 
-    debug!(target: LOG_CORE, "Terminating main task");
+    debug!(target: LOG_CORE, safe_to_share = true, "Terminating main task");
 
-    if let Err(err) = root_task_group.join_all(Some(SHUTDOWN_TIMEOUT)).await {
+    let joined = root_task_group.join_all(Some(SHUTDOWN_TIMEOUT)).await;
+    if let Err(err) = &joined {
         error!(target: LOG_CORE, err = %err.fmt_compact(), "Error while shutting down task group");
+        error!(
+            target: LOG_CORE,
+            safe_to_share = true,
+            stage = "shutdown",
+            failure_kind = "task_join_failed",
+            "fedimintd shutdown failed"
+        );
     }
 
-    debug!(target: LOG_CORE, "Shutdown complete");
+    debug!(target: LOG_CORE, safe_to_share = true, "Shutdown complete");
 
     fedimint_logging::shutdown();
 
     drop(timing_total_runtime);
 
+    if joined.is_ok() && stopped_at_session_boundary.load(Ordering::SeqCst) {
+        std::process::exit(SESSION_BOUNDARY_EXIT_CODE);
+    }
     std::process::exit(-1);
+}
+
+async fn open_server_database(data_dir: PathBuf) -> anyhow::Result<Database> {
+    let rocks_db = RocksDb::build(data_dir.join(DB_FILE)).open().await?;
+    Ok(Database::new(rocks_db, ModuleRegistry::default()))
 }
 
 pub fn default_modules() -> ServerModuleInitRegistry {

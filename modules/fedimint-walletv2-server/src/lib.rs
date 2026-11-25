@@ -11,7 +11,9 @@
 #![allow(clippy::too_many_lines)]
 
 pub mod db;
+pub mod envs;
 mod metrics;
+mod pending;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,6 +34,7 @@ use db::{
     SignaturesKey, SignaturesPrefix, SignaturesTxidPrefix, SpentOutputKey, SpentOutputPrefix,
     TxInfoIndexKey, TxInfoIndexPrefix,
 };
+use envs::FM_WALLETV2_DISABLE_MEMPOOL_SCAN_ENV;
 use fedimint_core::config::{
     ServerModuleConfig, ServerModuleConsensusConfig, TypedServerModuleConfig,
     TypedServerModuleConsensusConfig,
@@ -47,7 +50,7 @@ use fedimint_core::envs::{
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
     Amounts, ApiEndpoint, ApiVersion, CoreConsensusVersion, InputMeta, ModuleConsensusVersion,
-    ModuleInit, MultiApiVersion, TransactionItemAmounts, public_api_endpoint,
+    ModuleInit, MultiApiVersion, TransactionItemAmounts, admin_api_endpoint, public_api_endpoint,
 };
 #[cfg(not(target_family = "wasm"))]
 use fedimint_core::task::TaskGroup;
@@ -60,6 +63,7 @@ use fedimint_logging::LOG_MODULE_WALLETV2;
 use fedimint_server_core::bitcoin_rpc::ServerBitcoinRpcMonitor;
 use fedimint_server_core::config::{PeerHandleOps, PeerHandleOpsExt};
 use fedimint_server_core::migration::ServerModuleDbMigrationFn;
+use fedimint_server_core::volume::{counted_whole_window, volume_bucket, volume_buckets};
 use fedimint_server_core::{
     ConfigGenModuleArgs, EnvVarDoc, ServerModule, ServerModuleInit, ServerModuleInitArgs,
 };
@@ -69,12 +73,17 @@ use fedimint_walletv2_common::config::{
 };
 use fedimint_walletv2_common::endpoint_constants::{
     CONSENSUS_BLOCK_COUNT_ENDPOINT, CONSENSUS_FEERATE_ENDPOINT, FEDERATION_WALLET_ENDPOINT,
-    OUTPUT_INFO_SLICE_ENDPOINT, PENDING_TRANSACTION_CHAIN_ENDPOINT, RECEIVE_FEE_ENDPOINT,
-    SEND_FEE_ENDPOINT, TRANSACTION_CHAIN_ENDPOINT, TRANSACTION_ID_ENDPOINT,
+    OUTPUT_INFO_SLICE_ENDPOINT, PENDING_OUTPUTS_ENDPOINT, PENDING_TRANSACTION_CHAIN_ENDPOINT,
+    RECEIVE_FEE_ENDPOINT, SEND_FEE_ENDPOINT, TRANSACTION_CHAIN_ENDPOINT, TRANSACTION_ID_ENDPOINT,
+    VOLUME_STATS_ENDPOINT,
 };
+/// Re-exported for existing callers; the constants live in the common crate so
+/// that the client can render peg-in confirmation progress against them.
+pub use fedimint_walletv2_common::{BLOCK_COUNT_VOTE_DELAY, CONFIRMATION_FINALITY_DELAY};
 use fedimint_walletv2_common::{
-    FederationWallet, MODULE_CONSENSUS_VERSION, TxInfo, WalletInputError, WalletOutputError,
-    descriptor, is_potential_receive, tweak_public_key,
+    FederationWallet, MODULE_CONSENSUS_VERSION, PendingOutputs, TxInfo, WalletInputError,
+    WalletOutputError, WalletVolume, WalletVolumeStats, descriptor, is_potential_receive,
+    tweak_public_key,
 };
 use futures::StreamExt;
 use miniscript::descriptor::Wsh;
@@ -83,29 +92,18 @@ use secp256k1::ecdsa::Signature;
 use secp256k1::{PublicKey, Scalar, SecretKey};
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
+use tokio::sync::watch;
 use tracing::{debug, info};
 
 use crate::db::{
     BlockCountVoteKey, BlockCountVotePrefix, FeeRateVoteKey, FeeRateVotePrefix, TxInfoKey,
     TxInfoPrefix, UnconfirmedTxKey, UnconfirmedTxPrefix, UnsignedTxKey, UnsignedTxPrefix,
+    VolumeBucket, VolumeBucketKey, VolumeBucketPrefix, VolumeStartKey, VolumeStartPrefix,
 };
 use crate::metrics::{
     WALLET_BLOCK_COUNT, WALLET_INOUT_FEES_SATS, WALLET_INOUT_SATS, WALLET_PEGIN_FEES_SATS,
     WALLET_PEGIN_SATS, WALLET_PEGOUT_FEES_SATS, WALLET_PEGOUT_SATS,
 };
-
-/// Number of confirmations required for a transaction to be considered as
-/// final by the federation. The block that mines the transaction does
-/// not count towards the number of confirmations.
-pub const CONFIRMATION_FINALITY_DELAY: u64 = 6;
-
-/// How many blocks a peer's block count vote trails its bitcoin backend: the
-/// finality delay, plus one block of slack. Processing a new consensus block
-/// count waits for the local backend to report the consensus count plus the
-/// finality delay, and without the slack that is exactly the block the voter
-/// saw, so a backend a little behind, or a backend status that is stale (it is
-/// polled once a minute), stalled item processing on every new block.
-pub const BLOCK_COUNT_VOTE_DELAY: u64 = CONFIRMATION_FINALITY_DELAY + 1;
 
 /// Maximum number of blocks the consensus block count can advance in a single
 /// consensus item to limit the work done in one `process_consensus_item` step.
@@ -270,6 +268,26 @@ impl ModuleInit for WalletInit {
                         "Federation Wallet"
                     );
                 }
+                DbKeyPrefix::VolumeBucket => {
+                    push_db_pair_items!(
+                        dbtx,
+                        VolumeBucketPrefix,
+                        VolumeBucketKey,
+                        VolumeBucket,
+                        wallet,
+                        "Wallet Volume Buckets"
+                    );
+                }
+                DbKeyPrefix::VolumeStart => {
+                    push_db_pair_items!(
+                        dbtx,
+                        VolumeStartPrefix,
+                        VolumeStartKey,
+                        u64,
+                        wallet,
+                        "Wallet Volume Start"
+                    );
+                }
             }
         }
 
@@ -290,10 +308,18 @@ impl ServerModuleInit for WalletInit {
     }
 
     fn get_documented_env_vars(&self) -> Vec<EnvVarDoc> {
-        vec![EnvVarDoc {
-            name: FM_ENABLE_MODULE_WALLETV2_ENV,
-            description: "Set to 0/false to disable the WalletV2 module. Enabled by default.",
-        }]
+        vec![
+            EnvVarDoc {
+                name: FM_ENABLE_MODULE_WALLETV2_ENV,
+                description: "Set to 0/false to disable the WalletV2 module. Enabled by default.",
+            },
+            EnvVarDoc {
+                name: FM_WALLETV2_DISABLE_MEMPOOL_SCAN_ENV,
+                description: "Set to 1/true to stop scanning the mempool for pending receives. \
+                              Peg-in progress is then only reported once a deposit is mined, as \
+                              it already is on an esplora backend. Enabled by default.",
+            },
+        ]
     }
 
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
@@ -310,6 +336,7 @@ impl ServerModuleInit for WalletInit {
         WALLET_PEGIN_FEES_SATS.get_sample_count();
         WALLET_PEGOUT_SATS.get_sample_count();
         WALLET_PEGOUT_FEES_SATS.get_sample_count();
+        WALLET_BLOCK_COUNT.get();
 
         Ok(Wallet::new(
             args.cfg().to_typed()?,
@@ -491,6 +518,16 @@ impl ServerModule for Wallet {
         consensus_item: WalletConsensusItem,
         peer: PeerId,
     ) -> anyhow::Result<()> {
+        // Consensus items arrive every session, so this marks the start of
+        // counting no later than the first session that counts. A deposit or
+        // withdrawal can still be processed earlier in that session, at the
+        // same block count, which is why the bucket counting started in is
+        // never complete.
+        if dbtx.get_value(&VolumeStartKey).await.is_none() {
+            let now = self.consensus_block_count(dbtx).await;
+            dbtx.insert_new_entry(&VolumeStartKey, &now).await;
+        }
+
         match consensus_item {
             WalletConsensusItem::BlockCount(block_count_vote) => {
                 self.process_block_count(dbtx, block_count_vote, peer).await
@@ -558,6 +595,7 @@ impl ServerModule for Wallet {
             .checked_sub(input.fee)
             .ok_or(WalletInputError::ArithmeticOverflow)?;
 
+        let block_count = self.consensus_block_count(dbtx).await;
         if let Some(wallet) = dbtx.remove_entry(&FederationWalletKey).await {
             // Assuming the first receive into the federation is made through a
             // standard transaction, its output value is over the P2WSH dust
@@ -605,8 +643,6 @@ impl ServerModule for Wallet {
 
             let tx_index = self.total_txs(dbtx).await;
 
-            let created = self.consensus_block_count(dbtx).await;
-
             dbtx.insert_new_entry(
                 &TxInfoKey(tx_index),
                 &TxInfo {
@@ -616,7 +652,7 @@ impl ServerModule for Wallet {
                     output: change_value,
                     vbytes: self.cfg.consensus.receive_tx_vbytes,
                     fee: input.fee,
-                    created,
+                    created: block_count,
                 },
             )
             .await;
@@ -661,6 +697,16 @@ impl ServerModule for Wallet {
         let fee = self.cfg.consensus.fee_consensus.fee(amount);
 
         calculate_pegin_metrics(dbtx, amount, fee);
+
+        Self::count_volume(
+            dbtx,
+            block_count,
+            VolumeBucket {
+                deposited: tracked_output.value,
+                withdrawn: Amount::ZERO,
+            },
+        )
+        .await;
 
         Ok(InputMeta {
             amount: TransactionItemAmounts {
@@ -756,7 +802,7 @@ impl ServerModule for Wallet {
 
         let tx_index = self.total_txs(dbtx).await;
 
-        let created = self.consensus_block_count(dbtx).await;
+        let block_count = self.consensus_block_count(dbtx).await;
 
         dbtx.insert_new_entry(
             &TxInfoKey(tx_index),
@@ -767,7 +813,7 @@ impl ServerModule for Wallet {
                 output: change_value,
                 vbytes: self.cfg.consensus.send_tx_vbytes,
                 fee: output.fee,
-                created,
+                created: block_count,
             },
         )
         .await;
@@ -798,6 +844,16 @@ impl ServerModule for Wallet {
         let fee = self.cfg.consensus.fee_consensus.fee(amount);
 
         calculate_pegout_metrics(dbtx, amount, fee);
+
+        Self::count_volume(
+            dbtx,
+            block_count,
+            VolumeBucket {
+                deposited: Amount::ZERO,
+                withdrawn: output.value,
+            },
+        )
+        .await;
 
         Ok(TransactionItemAmounts {
             amounts: Amounts::new_bitcoin(amount),
@@ -831,6 +887,15 @@ impl ServerModule for Wallet {
 
     fn api_endpoints(&self) -> Vec<ApiEndpoint<Self>> {
         vec![
+            admin_api_endpoint! {
+                VOLUME_STATS_ENDPOINT,
+                ApiVersion::new(0, 0),
+                async |module: &Wallet, context, _params: ()| -> WalletVolumeStats {
+                    let db = context.db();
+                    let mut dbtx = db.begin_transaction_nc().await;
+                    Ok(module.volume_stats(&mut dbtx).await)
+                }
+            },
             public_api_endpoint! {
                 CONSENSUS_BLOCK_COUNT_ENDPOINT,
                 ApiVersion::new(0, 0),
@@ -912,11 +977,21 @@ impl ServerModule for Wallet {
                     Ok(module.tx_chain(&mut dbtx).await)
                 }
             },
+            public_api_endpoint! {
+                PENDING_OUTPUTS_ENDPOINT,
+                ApiVersion::new(0, 2),
+                async |module: &Wallet, _context, _params: ()| -> PendingOutputs {
+                    // Deliberately reads local, non-consensus state rather than
+                    // the database. Clients must not request this via threshold
+                    // consensus; see the client side api for details.
+                    Ok(module.pending_outputs.borrow().clone())
+                }
+            },
         ]
     }
 
     fn supported_api_versions(&self) -> MultiApiVersion {
-        MultiApiVersion::try_from_iter([ApiVersion::new(0, 1)])
+        MultiApiVersion::try_from_iter([ApiVersion::new(0, 2)])
             .expect("walletv2 declares one API version per major version")
     }
 }
@@ -926,6 +1001,17 @@ pub struct Wallet {
     cfg: WalletConfig,
     db: Database,
     btc_rpc: ServerBitcoinRpcMonitor,
+    /// Local, non-consensus view of the receive outputs this guardian can see
+    /// ahead of the consensus output log: mempool candidates plus the receive
+    /// outputs of the last [`pending::MAX_PENDING_DEPTH`] blocks, the latter
+    /// retained past finality so that clients see continuous progress.
+    ///
+    /// Maintained by the `scan_pending_receives` background task and read by
+    /// the pending outputs endpoint. This is intentionally in-memory only: it
+    /// is per-guardian divergent data that has no business in the consensus
+    /// database, and it is cheap to rebuild from a handful of blocks on
+    /// restart.
+    pending_outputs: watch::Receiver<PendingOutputs>,
 }
 
 impl Wallet {
@@ -937,10 +1023,20 @@ impl Wallet {
     ) -> Wallet {
         Self::spawn_broadcast_unconfirmed_txs_task(btc_rpc.clone(), db.clone(), task_group);
 
+        let (pending_sender, pending_outputs) = watch::channel(PendingOutputs::default());
+
+        pending::spawn_pending_receive_scanner(
+            btc_rpc.clone(),
+            cfg.consensus.bitcoin_pks.consensus_hash(),
+            pending_sender,
+            task_group,
+        );
+
         Wallet {
             cfg,
             btc_rpc,
             db: db.clone(),
+            pending_outputs,
         }
     }
 
@@ -1176,6 +1272,47 @@ impl Wallet {
             info!(target: LOG_MODULE_WALLETV2, "Waiting for local bitcoin backend to sync to block count {block_count}");
 
             sleep(common::sleep_duration()).await;
+        }
+    }
+
+    /// Add a processed flow to the current volume bucket.
+    async fn count_volume(
+        dbtx: &mut DatabaseTransaction<'_>,
+        block_count: u64,
+        delta: VolumeBucket,
+    ) {
+        let key = VolumeBucketKey(volume_bucket(block_count));
+        let mut bucket = dbtx.get_value(&key).await.unwrap_or_default();
+        bucket.accumulate(delta);
+        dbtx.insert_entry(&key, &bucket).await;
+    }
+
+    async fn volume_stats(&self, dbtx: &mut DatabaseTransaction<'_>) -> WalletVolumeStats {
+        let block_count = self.consensus_block_count(dbtx).await;
+        let start = dbtx.get_value(&VolumeStartKey).await;
+        // 7 and 30 buckets of 144 blocks.
+        let short = volume_buckets(block_count, 7);
+        let long = volume_buckets(block_count, 30);
+        let mut last_1008_blocks = VolumeBucket::default();
+        let mut last_4320_blocks = VolumeBucket::default();
+        let mut stream = dbtx
+            .find_by_range(VolumeBucketKey(long.start)..VolumeBucketKey(long.end))
+            .await;
+        while let Some((key, bucket)) = stream.next().await {
+            last_4320_blocks.accumulate(bucket);
+            if key.0 >= short.start {
+                last_1008_blocks.accumulate(bucket);
+            }
+        }
+        let report = |total: VolumeBucket, first_bucket: u64| WalletVolume {
+            deposited: total.deposited,
+            withdrawn: total.withdrawn,
+            complete: counted_whole_window(start, first_bucket),
+        };
+        WalletVolumeStats {
+            block_count,
+            last_1008_blocks: report(last_1008_blocks, short.start),
+            last_4320_blocks: report(last_4320_blocks, long.start),
         }
     }
 

@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -33,6 +34,28 @@ pub type DynIP2PFrame<M> = Box<dyn IP2PFrame<M>>;
 /// Type-erased stream notifying the P2P state machine that connection metadata
 /// may have changed.
 pub type DynConnectionStatusUpdates = Pin<Box<dyn Stream<Item = ()> + Send + 'static>>;
+
+/// Transport counters of one live connection, cumulative since it was
+/// established, and its current congestion window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct P2PTransportStats {
+    pub sent_bytes: u64,
+    pub received_bytes: u64,
+    pub lost_packets: u64,
+    /// Congestion events of each open path, cumulative on that path. A
+    /// connection that migrates keeps one count per path.
+    pub congestion_events: BTreeMap<P2PPathKey, u64>,
+    /// Congestion window of the selected path, if one is selected.
+    pub congestion_window_bytes: Option<u64>,
+}
+
+/// Identifies one path of a connection for as long as the connection lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum P2PPathKey {
+    /// The one path of a transport without multipath.
+    Single,
+    IrohV1(iroh_next::endpoint::PathId),
+}
 
 #[async_trait]
 pub trait IP2PFrame<M>: Send + 'static {
@@ -73,6 +96,12 @@ pub trait IP2PConnection<M>: Send + Sync + 'static {
 
     /// Get the transport type currently backing this live connection.
     fn connection_type(&self) -> Option<ConnectionType> {
+        None
+    }
+
+    /// Get the transport counters of this live connection, if the transport
+    /// keeps them.
+    fn transport_stats(&self) -> Option<P2PTransportStats> {
         None
     }
 
@@ -228,6 +257,17 @@ where
     fn rtt(&self) -> Option<Duration> {
         Some(iroh::endpoint::Connection::rtt(self))
     }
+
+    fn transport_stats(&self) -> Option<P2PTransportStats> {
+        let stats = iroh::endpoint::Connection::stats(self);
+        Some(P2PTransportStats {
+            sent_bytes: stats.udp_tx.bytes,
+            received_bytes: stats.udp_rx.bytes,
+            lost_packets: stats.path.lost_packets,
+            congestion_events: BTreeMap::from([(P2PPathKey::Single, stats.path.congestion_events)]),
+            congestion_window_bytes: Some(stats.path.cwnd),
+        })
+    }
 }
 
 /// Implementations of the P2P traits for Iroh 1.0.
@@ -276,6 +316,26 @@ where
             .iter()
             .find(iroh_next::endpoint::Path::is_selected)
             .and_then(|path| IrohV1Connection::rtt(self, path.id()))
+    }
+
+    fn transport_stats(&self) -> Option<P2PTransportStats> {
+        let stats = IrohV1Connection::stats(self);
+        let mut congestion_events = BTreeMap::new();
+        let mut congestion_window_bytes = None;
+        for path in self.paths().iter() {
+            let path_stats = path.stats();
+            congestion_events.insert(P2PPathKey::IrohV1(path.id()), path_stats.congestion_events);
+            if path.is_selected() {
+                congestion_window_bytes = Some(path_stats.cwnd);
+            }
+        }
+        Some(P2PTransportStats {
+            sent_bytes: stats.udp_tx.bytes,
+            received_bytes: stats.udp_rx.bytes,
+            lost_packets: stats.lost_packets,
+            congestion_events,
+            congestion_window_bytes,
+        })
     }
 
     fn connection_type(&self) -> Option<ConnectionType> {

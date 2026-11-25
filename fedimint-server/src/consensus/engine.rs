@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aleph_bft::Keychain as KeychainTrait;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail};
 use async_channel::Receiver;
 use fedimint_api_client::api::{DynGlobalApi, FederationApiExt, ServerError};
 use fedimint_api_client::query::FilterMap;
@@ -51,12 +51,14 @@ use crate::consensus::db::{
     SignedSessionOutcomeKey, SignedSessionOutcomePrefix,
 };
 use crate::consensus::debug::{DebugConsensusItem, DebugConsensusItemCompact};
+use crate::consensus::outcome_download::ObservedFederationApi;
+use crate::consensus::peer_availability::PeerActivity;
 use crate::consensus::transaction::{TxProcessingMode, process_transaction_with_dbtx};
 use crate::metrics::{
-    CONSENSUS_ITEM_PROCESSING_DURATION_SECONDS,
+    CONSENSUS_ITEM_COMMIT_DURATION_SECONDS, CONSENSUS_ITEM_PROCESSING_DURATION_SECONDS,
     CONSENSUS_ITEM_PROCESSING_MODULE_AUDIT_DURATION_SECONDS, CONSENSUS_ITEMS_PROCESSED_TOTAL,
     CONSENSUS_ORDERING_LATENCY_SECONDS, CONSENSUS_PEER_CONTRIBUTION_SESSION_IDX,
-    CONSENSUS_SESSION_COUNT,
+    CONSENSUS_SESSION_COUNT, CONSENSUS_SESSIONS_COMPLETED,
 };
 
 // The name of the directory where the database checkpoints are stored.
@@ -68,6 +70,80 @@ const DB_CHECKPOINTS_DIR: &str = "db_checkpoints";
 /// than a couple of these means something is wrong beyond a stale snapshot.
 const MAX_ITEM_PROCESSING_ATTEMPTS: usize = 10;
 
+/// How this guardian obtained the signed outcome of a session it completed.
+///
+/// A guardian that keeps completing sessions with a peer's outcome while it is
+/// still ordering items is behind the federation: its own units arrive too
+/// late to be ordered, even though its session count stays level.
+#[derive(Debug, Clone, Copy)]
+pub enum SessionCompletion {
+    /// We ordered every round and collected a threshold of signatures.
+    OwnSignatures,
+    /// We ordered every round and signed, but a peer's signed outcome arrived
+    /// first.
+    PeerOutcomeAfterSigning,
+    /// A peer's signed outcome arrived while we were still ordering items.
+    PeerOutcomeWhileOrdering,
+}
+
+impl SessionCompletion {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnSignatures => "own_signatures",
+            Self::PeerOutcomeAfterSigning => "peer_outcome_after_signing",
+            Self::PeerOutcomeWhileOrdering => "peer_outcome_while_ordering",
+        }
+    }
+}
+
+/// How an admin scheduled a shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownRequest {
+    /// `shutdown` for a given session.
+    AtSession,
+    /// `shutdown_after_current_session`.
+    AfterCurrentSession,
+}
+
+/// A shutdown scheduled through the admin API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledShutdown {
+    /// Consensus shuts down at the first session boundary at or after the
+    /// completion of this session.
+    pub session: u64,
+    pub request: ShutdownRequest,
+}
+
+/// The consensus loop gave up on a session that did not complete within the
+/// session timeout, so the process exits for its supervisor to restart it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTimedOut {
+    pub session_index: u64,
+}
+
+impl std::fmt::Display for SessionTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Consensus session {} timed out, exiting...",
+            self.session_index
+        )
+    }
+}
+
+impl std::error::Error for SessionTimedOut {}
+
+/// Why the consensus loop returned without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsensusStop {
+    /// The task group is shutting down; the current session may be
+    /// unfinished.
+    TaskShutdown,
+    /// A scheduled shutdown took effect after its session completed, so this
+    /// guardian holds no units of an unfinished session.
+    ScheduledShutdown(ShutdownRequest),
+}
+
 /// Runs the main server consensus loop
 pub struct ConsensusEngine {
     pub modules: ServerModuleRegistry,
@@ -75,18 +151,19 @@ pub struct ConsensusEngine {
     pub federation_api: DynGlobalApi,
     pub cfg: ServerConfig,
     pub submission_receiver: Receiver<ConsensusItem>,
-    pub shutdown_receiver: watch::Receiver<Option<u64>>,
+    pub shutdown_receiver: watch::Receiver<Option<ScheduledShutdown>>,
     pub connections: DynP2PConnections<P2PMessage>,
     pub ci_status_senders: BTreeMap<PeerId, watch::Sender<Option<u64>>>,
     pub ord_latency_sender: watch::Sender<Option<Duration>>,
     /// Notified whenever consensus accepts an item.
     pub accepted_item_sender: watch::Sender<()>,
     /// Notified whenever consensus completes a session.
-    pub completed_session_sender: watch::Sender<()>,
+    pub completed_session_sender: watch::Sender<super::session_cache::CompletedSession>,
     pub task_group: TaskGroup,
     pub data_dir: PathBuf,
     pub db_checkpoint_retention: u64,
     pub session_timeout: Duration,
+    pub peer_activity: Arc<std::sync::Mutex<PeerActivity>>,
 }
 
 impl ConsensusEngine {
@@ -99,7 +176,7 @@ impl ConsensusEngine {
     }
 
     #[instrument(target = LOG_CONSENSUS, name = "run", skip_all, fields(id=%self.cfg.local.identity))]
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(self) -> anyhow::Result<ConsensusStop> {
         if self.num_peers().total() == 1 {
             self.run_single_guardian(self.task_group.make_handle())
                 .await
@@ -108,7 +185,10 @@ impl ConsensusEngine {
         }
     }
 
-    pub async fn run_single_guardian(&self, task_handle: TaskHandle) -> anyhow::Result<()> {
+    pub async fn run_single_guardian(
+        &self,
+        task_handle: TaskHandle,
+    ) -> anyhow::Result<ConsensusStop> {
         assert_eq!(self.num_peers(), NumPeers::from(1));
 
         self.initialize_checkpoint_directory(self.get_finished_session_count().await)?;
@@ -156,21 +236,36 @@ impl ConsensusEngine {
 
             self.checkpoint_database(session_index);
 
+            CONSENSUS_SESSIONS_COMPLETED
+                .with_label_values(&[SessionCompletion::OwnSignatures.as_str()])
+                .inc();
+
             info!(target: LOG_CONSENSUS, "Session {session_index} completed");
 
-            if Some(session_index) == self.shutdown_receiver.borrow().to_owned() {
-                break;
+            let due = due_shutdown(*self.shutdown_receiver.borrow(), session_index);
+            if let Some(request) = due {
+                return Ok(ConsensusStop::ScheduledShutdown(request));
             }
         }
 
         info!(target: LOG_CONSENSUS, "Consensus task shut down");
 
-        Ok(())
+        Ok(ConsensusStop::TaskShutdown)
     }
 
-    pub async fn run_consensus(&self, task_handle: TaskHandle) -> anyhow::Result<()> {
+    pub async fn run_consensus(&self, task_handle: TaskHandle) -> anyhow::Result<ConsensusStop> {
         // We need four peers to run the atomic broadcast
         assert!(self.num_peers().total() >= 4);
+
+        // Start every completion path at zero, so a scrape tells a path that
+        // never happened apart from no data.
+        for path in [
+            SessionCompletion::OwnSignatures,
+            SessionCompletion::PeerOutcomeAfterSigning,
+            SessionCompletion::PeerOutcomeWhileOrdering,
+        ] {
+            CONSENSUS_SESSIONS_COMPLETED.with_label_values(&[path.as_str()]);
+        }
 
         self.initialize_checkpoint_directory(self.get_finished_session_count().await)?;
 
@@ -193,31 +288,41 @@ impl ConsensusEngine {
             // has been observed to resolve stuck sessions. Since AlephBFT
             // persists its units to the database this is equivalent to a crash
             // and therefore safe.
-            let session = tokio::time::timeout(
+            let Ok(session) = tokio::time::timeout(
                 self.session_timeout,
                 self.run_session(self.connections.clone(), session_index),
             )
             .await
-            .context("Consensus session timed out, exiting...")?;
+            else {
+                warn!(
+                    target: LOG_CONSENSUS,
+                    safe_to_share = true,
+                    session_index,
+                    timeout_secs = self.session_timeout.as_secs(),
+                    "Consensus session timed out"
+                );
+                return Err(SessionTimedOut { session_index }.into());
+            };
 
             if session.is_none() {
-                return Ok(());
+                return Ok(ConsensusStop::TaskShutdown);
             }
 
             info!(target: LOG_CONSENSUS, ?session_index, "Completed consensus session");
 
-            if Some(session_index) == self.shutdown_receiver.borrow().to_owned() {
+            let due = due_shutdown(*self.shutdown_receiver.borrow(), session_index);
+            if let Some(request) = due {
                 info!(target: LOG_CONSENSUS, "Initiating shutdown, waiting for peers to complete the session...");
 
                 sleep(Duration::from_mins(1)).await;
 
-                break;
+                return Ok(ConsensusStop::ScheduledShutdown(request));
             }
         }
 
         info!(target: LOG_CONSENSUS, "Consensus task shut down");
 
-        Ok(())
+        Ok(ConsensusStop::TaskShutdown)
     }
 
     pub async fn run_session(
@@ -313,6 +418,7 @@ impl ConsensusEngine {
                 ),
                 Network::new(
                     connections.clone(),
+                    self.peer_activity.clone(),
                     signed_outcomes_sender,
                     signatures_sender,
                     self.db.clone(),
@@ -325,7 +431,7 @@ impl ConsensusEngine {
 
         self.ord_latency_sender.send_replace(None);
 
-        let signed_session_outcome = self
+        let (signed_session_outcome, completion) = self
             .complete_signed_session_outcome(
                 session_index,
                 unit_data_receiver,
@@ -341,6 +447,10 @@ impl ConsensusEngine {
             self.validate_signed_session_outcome(&signed_session_outcome, session_index),
             "Our created signed session outcome fails validation"
         );
+
+        CONSENSUS_SESSIONS_COMPLETED
+            .with_label_values(&[completion.as_str()])
+            .inc();
 
         info!(target: LOG_CONSENSUS, ?session_index, "Terminating Aleph BFT session");
 
@@ -381,7 +491,7 @@ impl ConsensusEngine {
         signed_outcomes_receiver: Receiver<(PeerId, SignedSessionOutcome)>,
         signatures_receiver: Receiver<(PeerId, schnorr::Signature)>,
         _connections: DynP2PConnections<P2PMessage>,
-    ) -> Option<SignedSessionOutcome> {
+    ) -> Option<(SignedSessionOutcome, SessionCompletion)> {
         // It is guaranteed that aleph bft will always replay all previously processed
         // items from the current session from index zero
         let mut item_index = 0;
@@ -499,7 +609,7 @@ impl ConsensusEngine {
                         }
                     }
 
-                    return Some(signed_session_outcome);
+                    return Some((signed_session_outcome, SessionCompletion::PeerOutcomeWhileOrdering));
                 },
                 result = signed_outcomes_receiver.recv() => {
                     let (peer_id, p2p_outcome) = result.ok()?;
@@ -556,7 +666,7 @@ impl ConsensusEngine {
                             "Successfully recovered session via P2P"
                         );
 
-                        return Some(p2p_outcome);
+                        return Some((p2p_outcome, SessionCompletion::PeerOutcomeWhileOrdering));
                     }
 
                     debug!(
@@ -675,7 +785,7 @@ impl ConsensusEngine {
                         "Consensus Failure: header disagrees with federation consensus"
                     );
 
-                    return Some(signed_session_outcome);
+                    return Some((signed_session_outcome, SessionCompletion::PeerOutcomeAfterSigning));
                 },
                 result = signed_outcomes_receiver.recv() => {
                     let (peer_id, p2p_outcome) = result.ok()?;
@@ -694,7 +804,7 @@ impl ConsensusEngine {
                             "Recovered session via P2P while collecting signatures"
                         );
 
-                        return Some(p2p_outcome);
+                        return Some((p2p_outcome, SessionCompletion::PeerOutcomeAfterSigning));
                     }
 
                     debug!(
@@ -726,10 +836,13 @@ impl ConsensusEngine {
             "Successfully collected threshold of signatures"
         );
 
-        Some(SignedSessionOutcome {
-            session_outcome,
-            signatures,
-        })
+        Some((
+            SignedSessionOutcome {
+                session_outcome,
+                signatures,
+            },
+            SessionCompletion::OwnSignatures,
+        ))
     }
 
     /// Returns a random peer ID excluding ourselves
@@ -798,11 +911,15 @@ impl ConsensusEngine {
             panic!("We tried to overwrite a signed session outcome");
         }
 
+        super::session_cache::publish_on_commit(
+            &mut dbtx,
+            self.completed_session_sender.clone(),
+            session_index,
+            &signed_session_outcome,
+        );
         dbtx.commit_tx_result()
             .await
             .expect("This is the only place where we write to this key");
-
-        self.completed_session_sender.send_replace(());
     }
 
     /// Returns the full path where the database checkpoints are stored.
@@ -1072,7 +1189,10 @@ impl ConsensusEngine {
             "Balance sheet of the fed has gone negative, this should never happen! {audit}"
         );
 
-        dbtx.commit_tx_result().await?;
+        let commit_timer = CONSENSUS_ITEM_COMMIT_DURATION_SECONDS.start_timer();
+        let committed = dbtx.commit_tx_result().await;
+        commit_timer.observe_duration();
+        committed?;
 
         self.accepted_item_sender.send_replace(());
 
@@ -1187,7 +1307,8 @@ impl ConsensusEngine {
             }
         };
 
-        federation_api
+        // Each failed request is counted for a rate-limited shareable event.
+        ObservedFederationApi::new(federation_api.clone(), index)
             .request_with_strategy_retry(
                 FilterMap::new(filter_map.clone()),
                 AWAIT_SIGNED_SESSION_OUTCOME_ENDPOINT.to_string(),
@@ -1203,10 +1324,60 @@ impl ConsensusEngine {
     }
 }
 
+/// The request of a shutdown that takes effect now that `completed_session`
+/// has completed: at the first session boundary at or after the scheduled
+/// session, so a schedule that arrives after its session completed still
+/// stops at the next boundary rather than never.
+fn due_shutdown(
+    scheduled: Option<ScheduledShutdown>,
+    completed_session: u64,
+) -> Option<ShutdownRequest> {
+    scheduled
+        .filter(|scheduled| scheduled.session <= completed_session)
+        .map(|scheduled| scheduled.request)
+}
+
 pub async fn get_finished_session_count_static(dbtx: &mut DatabaseTransaction<'_>) -> u64 {
     dbtx.find_by_prefix_sorted_descending(&SignedSessionOutcomePrefix)
         .await
         .next()
         .await
         .map_or(0, |entry| (entry.0.0) + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ScheduledShutdown, SessionTimedOut, ShutdownRequest, due_shutdown};
+
+    #[test]
+    fn shutdown_takes_effect_at_the_first_boundary_at_or_after_its_session() {
+        let at = |session| {
+            Some(ScheduledShutdown {
+                session,
+                request: ShutdownRequest::AtSession,
+            })
+        };
+        assert_eq!(due_shutdown(None, 0), None);
+        assert_eq!(due_shutdown(at(5), 4), None);
+        assert_eq!(due_shutdown(at(5), 5), Some(ShutdownRequest::AtSession));
+        // Scheduled while session 5 was completing: the next boundary.
+        assert_eq!(due_shutdown(at(5), 6), Some(ShutdownRequest::AtSession));
+    }
+
+    /// fedimintd names the exit reason by downcasting the error the
+    /// consensus loop returns, which callers may have wrapped in context.
+    #[test]
+    fn a_session_timeout_is_recognized_through_added_context() {
+        let error: anyhow::Error = SessionTimedOut { session_index: 7 }.into();
+        let wrapped = error.context("running consensus").context("server main");
+        assert_eq!(
+            wrapped.downcast_ref::<SessionTimedOut>(),
+            Some(&SessionTimedOut { session_index: 7 })
+        );
+        assert!(
+            anyhow::anyhow!("other failure")
+                .downcast_ref::<SessionTimedOut>()
+                .is_none()
+        );
+    }
 }

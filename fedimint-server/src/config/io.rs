@@ -171,7 +171,7 @@ fn plaintext_json_write<T: Serialize + DeserializeOwned>(
     Ok(())
 }
 
-fn plaintext_display_write<T: Display>(obj: &T, path: &Path) -> anyhow::Result<()> {
+pub(crate) fn plaintext_display_write<T: Display>(obj: &T, path: &Path) -> anyhow::Result<()> {
     use std::io::Write;
     let mut file = fs::File::options()
         .create_new(true)

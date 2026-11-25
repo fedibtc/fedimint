@@ -85,7 +85,18 @@ impl RocksDb {
         // AbsoluteConsistency was used previously but made the database
         // permanently unrecoverable after any unclean shutdown.
         // See: https://github.com/fedimint/fedimint/issues/8072
-        opts.set_wal_recovery_mode(DBRecoveryMode::TolerateCorruptedTailRecords);
+        //
+        // Manifold: reuse WAL files instead of creating a new one per memtable
+        // switch. Every commit syncs the WAL, and on ext4 a sync that grows a
+        // file also commits a journal transaction for its new size; a
+        // recycled file is already full size, so a sync writes only the data.
+        // RocksDB requires PointInTime recovery for recycling (it disables
+        // recycling under TolerateCorruptedTailRecords): a recycled file's
+        // tail holds records from its previous use, which PointInTime treats
+        // as the end of the log. After an unclean shutdown it recovers the
+        // same synced prefix as TolerateCorruptedTailRecords.
+        opts.set_wal_recovery_mode(DBRecoveryMode::PointInTime);
+        opts.set_recycle_log_file_num(4);
         let db: rocksdb::OptimisticTransactionDB =
             rocksdb::OptimisticTransactionDB::<rocksdb::SingleThreaded>::open(&opts, db_path)?;
         Ok(RocksDb(db))
@@ -125,8 +136,12 @@ fn is_power_of_two_sanity() {
     assert!(!is_power_of_two((2 << 10) + 1));
 }
 
-/// Default write buffer size: 2 MiB (`RocksDB` default is 64 MiB)
-const DEFAULT_WRITE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+/// Default write buffer size: 16 MiB (`RocksDB` default is 64 MiB).
+/// Manifold: upstream uses 2 MiB. Every flush writes a level-0 table that
+/// compaction then rewrites together with the rest of the (small) database,
+/// so fewer, larger flushes cut compaction writes roughly in half under load.
+/// With at most 2 write buffers this bounds memtable memory at 32 MiB.
+const DEFAULT_WRITE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
 /// Default block cache size: 2 MiB (`RocksDB` default is 8 MiB).
 /// Index/filter blocks are placed in this cache too
@@ -300,6 +315,14 @@ impl IRawDatabase for RocksDb {
     }
 
     fn checkpoint(&self, backup_path: &Path) -> DatabaseResult<()> {
+        // Manifold: flush before the checkpoint. The checkpoint disables file
+        // deletions and then flushes, and RocksDB does not reuse a recycled
+        // WAL file while file deletions are disabled, so with large write
+        // buffers (where this is the only memtable switch in an idle session)
+        // no WAL file would ever be recycled. Flushing here switches the WAL
+        // with deletions enabled; the checkpoint's own flush then has an
+        // empty memtable and creates no WAL.
+        self.0.flush().map_err(DatabaseError::backend)?;
         let checkpoint =
             rocksdb::checkpoint::Checkpoint::new(&self.0).map_err(DatabaseError::backend)?;
         checkpoint

@@ -91,8 +91,9 @@ use crate::client_db::{
 };
 use crate::deposit::DepositStateMachine;
 pub use crate::error::{
-    ConsensusVersionVotingError, DepositAddressError, MaxWithdrawableAmountError, PegInError,
-    PegOutError, SubscribeDepositError, SubscribeWithdrawError, WithdrawFeesError,
+    ConsensusVersionVotingError, DepositAddressError, DepositProgressError,
+    MaxWithdrawableAmountError, PegInError, PegOutError, SubscribeDepositError,
+    SubscribeWithdrawError, WithdrawFeesError,
 };
 use crate::withdraw::{CreatedWithdrawState, WithdrawStateMachine, WithdrawStates};
 
@@ -114,6 +115,21 @@ pub enum DepositStateV1 {
     Confirmed(BitcoinTransactionData),
     Claimed(BitcoinTransactionData),
     Failed(String),
+}
+
+/// How far an unclaimed deposit is from being claimable, as reported by
+/// [`WalletClientModule::deposit_progress`].
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DepositProgress {
+    pub outpoint: bitcoin::OutPoint,
+    pub value: bitcoin::Amount,
+    /// Zero while unmined. Reaches `required` exactly when the deposit can be
+    /// claimed and stays there.
+    pub confirmations: u64,
+    /// The confirmation threshold at which the peg-in monitor tries to claim
+    /// the deposit. Reaching it does not guarantee a credit: a deposit that
+    /// does not cover the peg-in fee is never claimed.
+    pub required: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -914,6 +930,11 @@ impl WalletClientModule {
         self.cfg().finality_delay
     }
 
+    /// Confirmations a deposit needs before this client can claim it.
+    pub fn required_confirmations(&self) -> u64 {
+        pegin_monitor::required_confirmations(self.cfg().finality_delay)
+    }
+
     pub fn get_fee_consensus(&self) -> FeeConsensus {
         self.cfg().fee_consensus
     }
@@ -1678,6 +1699,29 @@ impl WalletClientModule {
                 }
             }
         }}))
+    }
+
+    /// The progress of every output the bitcoin backend reports paying the
+    /// address of this deposit operation that this client has no claim record
+    /// for, re-read from the backend and the federation on each call, so poll
+    /// it sparingly. An entry with no confirmations is not proof that its
+    /// transaction is in a mempool, and a reorged or replaced deposit stays
+    /// listed for as long as the backend keeps reporting it.
+    ///
+    /// Only for display: claiming stays with the peg-in monitor.
+    pub async fn deposit_progress(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Vec<DepositProgress>, DepositProgressError> {
+        let tweak_idx = self.find_tweak_idx_by_operation_id(operation_id).await?;
+        pegin_monitor::deposit_progress(
+            &self.data,
+            tweak_idx,
+            &self.rpc,
+            &self.module_api,
+            &self.db,
+        )
+        .await
     }
 
     pub async fn list_peg_in_tweak_idxes(&self) -> BTreeMap<TweakIdx, PegInTweakIndexData> {

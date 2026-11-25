@@ -13,10 +13,17 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::{
-    P2PConnectionSMCommon, P2PConnectionSMState, P2PConnectionState, P2PConnectionStateMachine,
+    P2PConnection, P2PConnectionSMCommon, P2PConnectionSMState, P2PConnectionState,
+    P2PConnectionStateMachine,
+};
+use crate::metrics::{
+    PEER_MESSAGES_DROPPED, PEER_SEND_DURATION_SECONDS, PEER_TRANSPORT_BYTES,
+    PEER_TRANSPORT_CONGESTION_EVENTS, PEER_TRANSPORT_CONGESTION_WINDOW_BYTES,
+    PEER_TRANSPORT_LOST_PACKETS, PEER_TRANSPORT_RTT_SECONDS,
 };
 use crate::net::p2p_connection::{
     DynConnectionStatusUpdates, DynIP2PFrame, DynP2PConnection, IP2PConnection, IP2PFrame,
+    P2PPathKey, P2PTransportStats,
 };
 use crate::net::p2p_connector::{DynP2PConnector, IP2PConnector};
 
@@ -35,6 +42,8 @@ struct FakeConnectionControl {
     update_stream_polls: Arc<AtomicUsize>,
     disconnect: Arc<Notify>,
     update_stream: UpdateStream,
+    transport: Arc<Mutex<Option<P2PTransportStats>>>,
+    rtt: Arc<Mutex<Option<Duration>>>,
 }
 
 impl FakeConnectionControl {
@@ -52,6 +61,8 @@ impl FakeConnectionControl {
             update_stream_polls: Arc::new(AtomicUsize::new(0)),
             disconnect: Arc::new(Notify::new()),
             update_stream: UpdateStream::Events,
+            transport: Arc::new(Mutex::new(None)),
+            rtt: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -78,6 +89,11 @@ impl FakeConnectionControl {
 
     fn disconnect(&self) {
         self.disconnect.notify_one();
+    }
+
+    fn set_transport(&self, transport: P2PTransportStats, rtt: Option<Duration>) {
+        *self.transport.lock().expect("transport mutex poisoned") = Some(transport);
+        *self.rtt.lock().expect("rtt mutex poisoned") = rtt;
     }
 
     fn subscriptions(&self) -> usize {
@@ -107,7 +123,15 @@ impl IP2PConnection<u64> for FakeConnection {
     }
 
     fn rtt(&self) -> Option<Duration> {
-        None
+        *self.control.rtt.lock().expect("rtt mutex poisoned")
+    }
+
+    fn transport_stats(&self) -> Option<P2PTransportStats> {
+        self.control
+            .transport
+            .lock()
+            .expect("transport mutex poisoned")
+            .clone()
     }
 
     fn connection_type(&self) -> Option<ConnectionType> {
@@ -200,6 +224,14 @@ impl StatusMachineHarness {
     }
 
     fn spawn_with_fallback(connection: FakeConnection, fallback: Option<ConnectionType>) -> Self {
+        Self::spawn_for_peer(connection, fallback, PeerId::from(0))
+    }
+
+    fn spawn_for_peer(
+        connection: FakeConnection,
+        fallback: Option<ConnectionType>,
+        peer_id: PeerId,
+    ) -> Self {
         let (connection_sender, incoming_connections) = async_channel::bounded(4);
         let (outgoing_sender, outgoing_receiver) = async_channel::bounded(5);
         let (incoming_sender, incoming_receiver) = async_channel::bounded(5);
@@ -215,8 +247,8 @@ impl StatusMachineHarness {
                 outgoing_receiver,
                 our_id: PeerId::from(1),
                 our_id_str: "1".to_owned(),
-                peer_id: PeerId::from(0),
-                peer_id_str: "0".to_owned(),
+                peer_id,
+                peer_id_str: peer_id.to_string(),
                 connector,
                 incoming_connections,
                 status_sender,
@@ -274,6 +306,191 @@ impl Drop for StatusMachineHarness {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// The per-peer transport metrics of the test peer, which no other test uses.
+#[derive(Debug, PartialEq)]
+struct TransportMetrics {
+    sent_bytes: u64,
+    received_bytes: u64,
+    lost_packets: u64,
+    congestion_events: u64,
+    /// `None` when the gauge has no series for the peer.
+    congestion_window_bytes: Option<i64>,
+    rtt_seconds: Option<f64>,
+}
+
+const TRANSPORT_PEER: &str = "7";
+
+fn transport_metrics() -> TransportMetrics {
+    use fedimint_metrics::prometheus::core::Collector as _;
+    use fedimint_metrics::prometheus::proto::MetricFamily;
+
+    let counter = |vec: &fedimint_metrics::prometheus::IntCounterVec, labels: &[&str]| {
+        vec.with_label_values(labels).get()
+    };
+    let has_series = |families: Vec<MetricFamily>| {
+        families
+            .iter()
+            .flat_map(MetricFamily::get_metric)
+            .any(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "peer_id" && label.value() == TRANSPORT_PEER)
+            })
+    };
+    let labels = ["1", TRANSPORT_PEER];
+    TransportMetrics {
+        sent_bytes: counter(&PEER_TRANSPORT_BYTES, &["1", TRANSPORT_PEER, "outgoing"]),
+        received_bytes: counter(&PEER_TRANSPORT_BYTES, &["1", TRANSPORT_PEER, "incoming"]),
+        lost_packets: counter(&PEER_TRANSPORT_LOST_PACKETS, &labels),
+        congestion_events: counter(&PEER_TRANSPORT_CONGESTION_EVENTS, &labels),
+        congestion_window_bytes: has_series(PEER_TRANSPORT_CONGESTION_WINDOW_BYTES.collect()).then(
+            || {
+                PEER_TRANSPORT_CONGESTION_WINDOW_BYTES
+                    .with_label_values(&labels)
+                    .get()
+            },
+        ),
+        rtt_seconds: has_series(PEER_TRANSPORT_RTT_SECONDS.collect())
+            .then(|| PEER_TRANSPORT_RTT_SECONDS.with_label_values(&labels).get()),
+    }
+}
+
+async fn wait_for_transport_metrics(expected: TransportMetrics) {
+    let result = timeout(Duration::from_mins(5), async {
+        while transport_metrics() != expected {
+            runtime::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "transport metrics stayed at {:?}, expected {expected:?}",
+        transport_metrics()
+    );
+}
+
+fn transport(
+    sent_bytes: u64,
+    received_bytes: u64,
+    lost_packets: u64,
+    congestion_events: &[(P2PPathKey, u64)],
+    congestion_window_bytes: Option<u64>,
+) -> P2PTransportStats {
+    P2PTransportStats {
+        sent_bytes,
+        received_bytes,
+        lost_packets,
+        congestion_events: congestion_events.iter().copied().collect(),
+        congestion_window_bytes,
+    }
+}
+
+fn path(id: u32) -> P2PPathKey {
+    P2PPathKey::IrohV1(iroh_next::endpoint::PathId::from(id))
+}
+
+#[tokio::test(start_paused = true)]
+async fn transport_metrics_accumulate_across_connections_and_paths() {
+    let rtt = Some(Duration::from_millis(40));
+    let first = FakeConnectionControl::new(ConnectionType::Direct);
+    first.set_transport(transport(1000, 300, 2, &[(path(0), 10)], Some(5000)), rtt);
+    let mut harness = StatusMachineHarness::spawn_for_peer(
+        FakeConnection::new(first.clone()),
+        None,
+        TRANSPORT_PEER.parse().expect("valid peer id"),
+    );
+    harness
+        .wait_for_status(ExpectedStatus::Connected(ConnectionType::Direct))
+        .await;
+
+    // The periodic refresh adds this connection's counters once, however
+    // often it runs.
+    wait_for_transport_metrics(TransportMetrics {
+        sent_bytes: 1000,
+        received_bytes: 300,
+        lost_packets: 2,
+        congestion_events: 10,
+        congestion_window_bytes: Some(5000),
+        rtt_seconds: Some(0.04),
+    })
+    .await;
+    runtime::sleep(Duration::from_mins(1)).await;
+    assert_eq!(transport_metrics().sent_bytes, 1000);
+
+    // The connection migrates to a path that has already counted more
+    // events than the old one. All of the new path's events count.
+    first.set_transport(
+        transport(1500, 300, 2, &[(path(0), 10), (path(1), 15)], Some(4000)),
+        rtt,
+    );
+    wait_for_transport_metrics(TransportMetrics {
+        sent_bytes: 1500,
+        received_bytes: 300,
+        lost_packets: 2,
+        congestion_events: 10 + 15,
+        congestion_window_bytes: Some(4000),
+        rtt_seconds: Some(0.04),
+    })
+    .await;
+
+    // The old path closes. With no selected path and no RTT estimate, the
+    // gauges show nothing rather than stale values.
+    first.set_transport(transport(1600, 300, 2, &[(path(1), 16)], None), None);
+    wait_for_transport_metrics(TransportMetrics {
+        sent_bytes: 1600,
+        received_bytes: 300,
+        lost_packets: 2,
+        congestion_events: 10 + 16,
+        congestion_window_bytes: None,
+        rtt_seconds: None,
+    })
+    .await;
+
+    // The replacement connection starts its own counters. Counts of the
+    // replaced connection since the last refresh are recorded first.
+    first.set_transport(transport(1700, 310, 3, &[(path(1), 17)], None), None);
+    let second = FakeConnectionControl::new(ConnectionType::Direct);
+    second.set_transport(
+        transport(1800, 50, 0, &[(P2PPathKey::Single, 0)], Some(9000)),
+        Some(Duration::from_millis(90)),
+    );
+    harness
+        .connection_sender
+        .send(Arc::new(FakeConnection::new(second.clone())))
+        .await
+        .expect("state machine accepts replacement");
+    wait_for_transport_metrics(TransportMetrics {
+        sent_bytes: 1700 + 1800,
+        received_bytes: 310 + 50,
+        lost_packets: 3,
+        congestion_events: 10 + 17,
+        congestion_window_bytes: Some(9000),
+        rtt_seconds: Some(0.09),
+    })
+    .await;
+
+    // Counters added after the last refresh are recorded on disconnect, and
+    // the peer has no current RTT or window afterwards.
+    second.set_transport(
+        transport(2000, 60, 1, &[(P2PPathKey::Single, 2)], Some(9000)),
+        Some(Duration::from_millis(90)),
+    );
+    second.disconnect();
+    harness.wait_for_status(ExpectedStatus::Disconnected).await;
+    assert_eq!(
+        transport_metrics(),
+        TransportMetrics {
+            sent_bytes: 1700 + 2000,
+            received_bytes: 310 + 60,
+            lost_packets: 3 + 1,
+            congestion_events: 10 + 17 + 2,
+            congestion_window_bytes: None,
+            rtt_seconds: None,
+        }
+    );
 }
 
 #[tokio::test]
@@ -872,6 +1089,144 @@ async fn redials_when_a_send_stalls() {
         .expect("the link recovers after a send stalls");
 
     assert_eq!(connects.load(Ordering::Relaxed), 1);
+
+    task.abort();
+}
+
+fn dropped_messages(peer: &str, direction: &str) -> u64 {
+    PEER_MESSAGES_DROPPED
+        .with_label_values(&["1", peer, direction])
+        .get()
+}
+
+/// Messages that consensus hands to a peer whose queue is full are dropped,
+/// and each drop is counted for that peer and direction only.
+#[test]
+fn full_outgoing_queue_counts_dropped_messages() {
+    const PEER: &str = "13";
+
+    let (outgoing_sender, _outgoing_receiver) = async_channel::bounded(2);
+    let (_incoming_sender, incoming_receiver) = async_channel::bounded(2);
+    let connection = P2PConnection {
+        outgoing_sender,
+        incoming_receiver,
+        our_id_str: "1".to_owned(),
+        peer_id_str: PEER.to_owned(),
+    };
+
+    for message in 0..5u64 {
+        connection.try_send(message);
+    }
+
+    assert_eq!(dropped_messages(PEER, "outgoing"), 3);
+    assert_eq!(dropped_messages(PEER, "incoming"), 0);
+}
+
+/// A connection that delivers queued frames and whose sends take as many
+/// milliseconds as the message says.
+struct TimedConnection {
+    frames: async_channel::Receiver<u64>,
+    sends_completed: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl IP2PConnection<u64> for TimedConnection {
+    async fn send(&self, message: u64) -> anyhow::Result<()> {
+        runtime::sleep(Duration::from_millis(message)).await;
+        self.sends_completed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn receive(&self) -> anyhow::Result<DynIP2PFrame<u64>> {
+        let message = self
+            .frames
+            .recv()
+            .await
+            .map_err(|_| anyhow!("frame channel closed"))?;
+
+        Ok(FakeFrame(message).into_dyn())
+    }
+
+    fn rtt(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Frames that arrive while consensus does not drain the incoming queue are
+/// dropped and counted, and every send is timed including the time the
+/// transport holds it.
+#[tokio::test]
+async fn counts_incoming_drops_and_times_sends() {
+    const PEER: u16 = 12;
+    let peer = PEER.to_string();
+
+    let (frame_sender, frames) = async_channel::bounded(8);
+    let (_connection_sender, incoming_connections) = async_channel::bounded(1);
+    let (outgoing_sender, outgoing_receiver) = async_channel::bounded(5);
+    let (incoming_sender, incoming_receiver) = async_channel::bounded(1);
+    let (status_sender, _status_receiver) = watch::channel(P2PConnectionState {
+        connected: None,
+        last_error: None,
+    });
+    let sends_completed = Arc::new(AtomicUsize::new(0));
+
+    let mut state_machine = P2PConnectionStateMachine {
+        state: P2PConnectionSMState::Connected(Arc::new(TimedConnection {
+            frames,
+            sends_completed: sends_completed.clone(),
+        })),
+        common: P2PConnectionSMCommon {
+            incoming_sender,
+            outgoing_receiver,
+            our_id: PeerId::from(1),
+            our_id_str: "1".to_owned(),
+            peer_id: PeerId::from(PEER),
+            peer_id_str: peer.clone(),
+            connector: Arc::new(PendingConnector { fallback: None }),
+            incoming_connections,
+            status_sender,
+            max_connection_age: None,
+            connection_deadline: None,
+        },
+    };
+    let task = runtime::spawn("p2p-drop-metrics-test", async move {
+        while let Some(next) = state_machine.state_transition().await {
+            state_machine = next;
+        }
+    });
+
+    // Nothing reads the incoming queue of one slot: the first frame fills
+    // it and the other three are dropped.
+    for frame in 0..4 {
+        frame_sender.send(frame).await.expect("frame queued");
+    }
+    timeout(Duration::from_secs(5), async {
+        while dropped_messages(&peer, "incoming") < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("three incoming frames are dropped");
+    assert_eq!(incoming_receiver.len(), 1);
+
+    // Two quick sends and one the transport holds for 150 ms.
+    for millis in [0, 0, 150] {
+        outgoing_sender.send(millis).await.expect("outgoing queued");
+    }
+    timeout(Duration::from_secs(5), async {
+        while sends_completed.load(Ordering::Relaxed) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all sends complete");
+
+    let sends = PEER_SEND_DURATION_SECONDS.with_label_values(&["1", peer.as_str()]);
+    assert_eq!(sends.get_sample_count(), 3);
+    assert!(sends.get_sample_sum() >= 0.15, "{}", sends.get_sample_sum());
+    assert!(sends.get_sample_sum() < 1.0, "{}", sends.get_sample_sum());
+    assert_eq!(dropped_messages(&peer, "incoming"), 3);
+    assert_eq!(dropped_messages(&peer, "outgoing"), 0);
 
     task.abort();
 }

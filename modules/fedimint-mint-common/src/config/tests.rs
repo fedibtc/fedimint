@@ -60,3 +60,40 @@ fn decoded_fee_consensus_is_validated() {
         assert!(FeeConsensus::consensus_decode_whole(&encoded, &modules).is_err());
     }
 }
+
+/// Fedi federations formed before the 10 msat base fee keep their 100 msat one,
+/// so both bases must decode. Upstream 0.13 accepts any base fee up to 100 msat,
+/// which covers both, and nothing beyond the limits.
+#[test]
+fn both_fedi_base_fees_decode() {
+    use fedimint_core::encoding::Encodable as _;
+    use fedimint_core::module::registry::ModuleDecoderRegistry;
+
+    let modules = ModuleDecoderRegistry::default();
+    assert_eq!(
+        FeeConsensus::new(0).expect("valid").base,
+        Amount::from_msats(10)
+    );
+    for (base, ppm, valid) in [
+        (Amount::from_msats(10), 0_u64, true),
+        (Amount::from_msats(10), 1_000, true),
+        (Amount::from_msats(100), 0, true),
+        (Amount::from_msats(100), 1_000, true),
+        (Amount::from_msats(10), 1_001, false),
+        (Amount::from_msats(101), 0, false),
+        (Amount::from_msats(1_000), 0, false),
+    ] {
+        let json = serde_json::json!({ "base": base, "parts_per_million": ppm });
+        assert_eq!(
+            serde_json::from_value::<FeeConsensus>(json).is_ok(),
+            valid,
+            "{base} {ppm}"
+        );
+        assert_eq!(
+            FeeConsensus::consensus_decode_whole(&(base, ppm).consensus_encode_to_vec(), &modules)
+                .is_ok(),
+            valid,
+            "{base} {ppm}"
+        );
+    }
+}

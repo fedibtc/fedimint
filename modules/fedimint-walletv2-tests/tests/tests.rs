@@ -5,6 +5,7 @@ use std::time::Duration;
 use assert_matches::assert_matches;
 use async_stream::stream;
 use bitcoin::Amount;
+use fedimint_api_client::api::FederationApiExt as _;
 use fedimint_client::ClientHandleArc;
 use fedimint_client::db::DbKeyPrefix;
 use fedimint_client::error::OperationLookupError;
@@ -12,10 +13,13 @@ use fedimint_core::core::OperationId;
 use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::impl_db_record;
+use fedimint_core::module::ApiRequestErased;
 use fedimint_core::task::{sleep, sleep_in_test};
 use fedimint_dummy_client::DummyClientInit;
 use fedimint_dummy_server::DummyInit;
 use fedimint_eventlog::{Event, EventLogEntry, EventLogId};
+use fedimint_logging::LOG_TEST;
+use fedimint_testing::API_AUTH;
 use fedimint_testing::btc::BitcoinTest;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_walletv2_client::events::{
@@ -23,12 +27,14 @@ use fedimint_walletv2_client::events::{
     SendPaymentUpdateEvent,
 };
 use fedimint_walletv2_client::{
-    FinalSendOperationState, SendError, WalletClientInit, WalletClientModule,
+    FinalReceiveOperationState, FinalSendOperationState, MempoolVisibility, ReceiveProgress,
+    SendError, WalletClientInit, WalletClientModule,
 };
-use fedimint_walletv2_common::KIND;
+use fedimint_walletv2_common::endpoint_constants::VOLUME_STATS_ENDPOINT;
+use fedimint_walletv2_common::{KIND, WalletVolume, WalletVolumeStats};
 use fedimint_walletv2_server::{BLOCK_COUNT_VOTE_DELAY, CONFIRMATION_FINALITY_DELAY, WalletInit};
 use futures::StreamExt;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 enum WalletEvent {
@@ -161,6 +167,513 @@ async fn await_federation_total_value(
     }
 }
 
+/// A peg-in should report progress while it waits out the finality delay,
+/// rather than leaving the user with no feedback at all between broadcasting
+/// and the ecash being issued.
+///
+/// Also covers an address paid twice: `receive` hands out the same address
+/// until a deposit is detected at it, so two deposits to one address is an
+/// ordinary flow and each must be tracked separately rather than one
+/// overwriting the other.
+#[tokio::test(flavor = "multi_thread")]
+async fn receive_reports_confirmation_progress() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = fed.new_client().await;
+    let bitcoin = fixtures.bitcoin();
+
+    initialize_consensus(&client, &bitcoin).await?;
+
+    let module = client.get_first_module::<WalletClientModule>()?;
+
+    // Read before handing out the address, so that the claims for both deposits
+    // fall at or after this position.
+    let position = client.get_next_event_log_id().await;
+
+    let address = module.receive().await;
+
+    assert!(
+        module
+            .address_receive_progress(&address)
+            .await?
+            .deposits
+            .is_empty(),
+        "An address with nothing sent to it has no deposits to report"
+    );
+
+    info!("Broadcast the first deposit without mining it...");
+
+    let mined_tx = bitcoin
+        .send_without_mining(&address, Amount::from_int_btc(1))
+        .await;
+
+    // Guardians report the unmined deposit straight out of their mempools,
+    // which is the whole point: the user gets feedback before the first block.
+    let mined_outpoint = await_receive_mempool(&client, &address, mined_tx.compute_txid()).await?;
+
+    // The per-deposit lookup must agree with the address-wide one.
+    assert_eq!(
+        module.receive_progress(mined_outpoint).await?,
+        ReceiveProgress::Mempool {
+            value: Amount::from_int_btc(1)
+        },
+    );
+
+    bitcoin.mine_blocks(1).await;
+
+    // The tip is the block that just mined the deposit, and `get_block_count`
+    // returns a count rather than a height.
+    let mined_height = bitcoin.get_block_count().await - 1;
+
+    // The deposit is now mined but still short of the finality delay, so the
+    // federation has not recorded it and only the advisory view can see it.
+    let confirmations = await_receive_confirmations(&client, &address, 1).await?;
+
+    assert_eq!(
+        confirmations,
+        BLOCK_COUNT_VOTE_DELAY + 1,
+        "Progress should count up to the depth at which the federation claims"
+    );
+
+    info!("Send a second deposit to the same address and leave it unmined...");
+
+    let unmined_tx = bitcoin
+        .send_without_mining(&address, Amount::from_int_btc(2))
+        .await;
+
+    let unmined_outpoint = await_deposit_count(&client, &address, 2)
+        .await?
+        .into_iter()
+        .find_map(|(outpoint, _)| (outpoint.txid == unmined_tx.compute_txid()).then_some(outpoint))
+        .expect("The second deposit must be reported against its own transaction");
+
+    // The two deposits sit at different stages, so neither may mask the other.
+    let progress = module.address_receive_progress(&address).await?.deposits;
+
+    // The query across all addresses must agree, and keep the address.
+    let all = module.all_receive_progress().await.deposits;
+    assert!(all.iter().all(|(paid, _, _)| *paid == address));
+    assert_eq!(
+        all.into_iter()
+            .map(|(_, outpoint, deposit)| (outpoint, deposit))
+            .collect::<Vec<_>>(),
+        progress
+    );
+
+    let mined = lookup_progress(&progress, mined_outpoint);
+    let unmined = lookup_progress(&progress, unmined_outpoint);
+
+    assert_eq!(
+        unmined,
+        ReceiveProgress::Mempool {
+            value: Amount::from_int_btc(2)
+        },
+        "The unmined deposit must be reported from the mempool, with its own value"
+    );
+
+    match mined {
+        ReceiveProgress::Confirming {
+            value,
+            height,
+            confirmations,
+            required,
+        } => {
+            assert_eq!(
+                value,
+                Amount::from_int_btc(1),
+                "Each deposit reports its own value, not a combined one"
+            );
+            assert!(
+                (1..required).contains(&confirmations),
+                "The mined deposit is confirming, got {confirmations} of {required}"
+            );
+            assert_eq!(
+                height, mined_height,
+                "The deposit must report the height of the block that mined it"
+            );
+        }
+        state => panic!("The mined deposit should still be confirming, got {state:?}"),
+    }
+
+    assert_eq!(
+        module.receive_progress(mined_outpoint).await?,
+        mined,
+        "The per-deposit lookup must agree with the address-wide one"
+    );
+
+    info!("Mine both deposits to finality and confirm they are claimed...");
+
+    // The second deposit is still unmined, so it is mined by the first of these
+    // blocks and needs the full delay on top of that. Mining only the delay
+    // would leave it one block short of claimable forever.
+    let consensus_block_count = module.block_count().await?;
+
+    bitcoin.mine_blocks(BLOCK_COUNT_VOTE_DELAY + 1).await;
+
+    await_consensus_block_count(&client, consensus_block_count + BLOCK_COUNT_VOTE_DELAY + 1)
+        .await?;
+
+    // The advisory view cannot tell a claimed deposit from a reorged one, and
+    // keeps reporting an output for a while after it turns final, so the receive
+    // operations themselves settle it. Only these two deposits exist, so waiting
+    // for two successful receives covers both.
+    let (state, position) = module.await_receive(position).await?;
+
+    assert_eq!(state, FinalReceiveOperationState::Success);
+
+    let (state, _) = module.await_receive(position).await?;
+
+    assert_eq!(state, FinalReceiveOperationState::Success);
+
+    Ok(())
+}
+
+/// A guardian whose backend starts failing partway through a mempool scan must
+/// keep reporting the deposits it had already cached.
+///
+/// The scan caches one transaction per mempool entry it has never seen, so
+/// discarding the cache on a transient error would both hide deposits the
+/// guardian can still account for and force the whole mempool to be refetched
+/// on the next pass. A pass that fails is reported as far as it got instead,
+/// but flagged as partial: the unfetched deposit is missing from it, so its
+/// absence must not read as nothing having been sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_mempool_fetch_keeps_the_deposits_already_seen() -> anyhow::Result<()> {
+    if Fixtures::is_real_test() {
+        warn!(
+            target: LOG_TEST,
+            "Skipping test as only the mock bitcoin backend can fail a mempool fetch"
+        );
+
+        return Ok(());
+    }
+
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = fed.new_client().await;
+    let bitcoin = fixtures.bitcoin();
+
+    initialize_consensus(&client, &bitcoin).await?;
+
+    let module = client.get_first_module::<WalletClientModule>()?;
+
+    let address = module.receive().await;
+
+    info!("Broadcast a deposit and wait for the guardians to cache it...");
+
+    let cached = bitcoin
+        .send_without_mining(&address, Amount::from_int_btc(1))
+        .await;
+
+    let cached_outpoint = await_receive_mempool(&client, &address, cached.compute_txid()).await?;
+
+    info!("Break every mempool fetch, then broadcast a second deposit...");
+
+    // Listing the mempool keeps working, so from here each scan sees both
+    // transactions, keeps the one it has already cached and fails to fetch the
+    // new one.
+    bitcoin.fail_mempool_tx_fetches(true);
+
+    let unfetchable = bitcoin
+        .send_without_mining(&address, Amount::from_int_btc(2))
+        .await;
+
+    await_mempool_visibility(&client, &address, MempoolVisibility::Partial).await?;
+
+    // The guardians rescan on their bitcoin monitor's interval, which is 100ms
+    // under test, so this covers many failing passes rather than a single one.
+    for _ in 0..20 {
+        let progress = module.address_receive_progress(&address).await?;
+
+        assert_eq!(
+            lookup_progress(&progress.deposits, cached_outpoint),
+            ReceiveProgress::Mempool {
+                value: Amount::from_int_btc(1)
+            },
+            "A failing scan must not drop the deposit the guardians had already cached"
+        );
+
+        assert_eq!(
+            progress.mempool_visibility,
+            MempoolVisibility::Partial,
+            "A scan that fails partway through must not claim to have seen the whole mempool"
+        );
+
+        assert!(
+            !progress
+                .deposits
+                .iter()
+                .any(|(outpoint, _)| outpoint.txid == unfetchable.compute_txid()),
+            "The deposit whose transaction could not be fetched must not be reported"
+        );
+
+        sleep_in_test(
+            "Letting the guardians run failing mempool scans",
+            Duration::from_millis(100),
+        )
+        .await;
+    }
+
+    info!("Let fetches succeed again and confirm the second deposit is picked up...");
+
+    bitcoin.fail_mempool_tx_fetches(false);
+
+    let deposits = await_deposit_count(&client, &address, 2).await?;
+
+    assert_eq!(
+        lookup_progress(&deposits, cached_outpoint),
+        ReceiveProgress::Mempool {
+            value: Amount::from_int_btc(1)
+        },
+        "The recovered scan must still report the originally cached deposit"
+    );
+
+    await_mempool_visibility(&client, &address, MempoolVisibility::Complete).await?;
+
+    let recovered = deposits
+        .iter()
+        .find_map(|(outpoint, state)| {
+            (outpoint.txid == unfetchable.compute_txid()).then(|| state.clone())
+        })
+        .expect("The second deposit is reported once its transaction can be fetched");
+
+    assert_eq!(
+        recovered,
+        ReceiveProgress::Mempool {
+            value: Amount::from_int_btc(2)
+        }
+    );
+
+    Ok(())
+}
+
+/// Polls receive progress until the federation reports `expected` mempool
+/// visibility for `address`.
+async fn await_mempool_visibility(
+    client: &ClientHandleArc,
+    address: &bitcoin::Address,
+    expected: MempoolVisibility,
+) -> anyhow::Result<()> {
+    loop {
+        let progress = client
+            .get_first_module::<WalletClientModule>()?
+            .address_receive_progress(address)
+            .await?;
+
+        if progress.mempool_visibility == expected {
+            return Ok(());
+        }
+
+        sleep_in_test(
+            format!("Waiting for {expected:?} mempool visibility"),
+            Duration::from_millis(100),
+        )
+        .await;
+    }
+}
+
+/// A mempool scan that outlasts its time budget must publish what it has
+/// gathered so far, flagged as partial, instead of holding back the whole view
+/// until every transaction has been fetched.
+///
+/// Every fetch is slowed past the test budget, so each pass fetches a single
+/// transaction. Deposits must therefore show up a few at a time under `Partial`
+/// before the view completes, rather than all at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_mempool_scan_publishes_partial_progress() -> anyhow::Result<()> {
+    if Fixtures::is_real_test() {
+        warn!(
+            target: LOG_TEST,
+            "Skipping test as only the mock bitcoin backend can slow a mempool fetch"
+        );
+
+        return Ok(());
+    }
+
+    const DEPOSITS: usize = 4;
+
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = fed.new_client().await;
+    let bitcoin = fixtures.bitcoin();
+
+    initialize_consensus(&client, &bitcoin).await?;
+
+    let module = client.get_first_module::<WalletClientModule>()?;
+    let address = module.receive().await;
+
+    info!("Slow every mempool fetch past the budget, then broadcast the deposits...");
+
+    bitcoin.delay_mempool_tx_fetches(Duration::from_millis(500));
+
+    for btc in 1..=DEPOSITS {
+        bitcoin
+            .send_without_mining(&address, Amount::from_int_btc(btc as u64))
+            .await;
+    }
+
+    let mut saw_partial_progress = false;
+
+    for _ in 0..600 {
+        let progress = module.address_receive_progress(&address).await?;
+
+        match (progress.mempool_visibility, progress.deposits.len()) {
+            (MempoolVisibility::Complete, DEPOSITS) => {
+                assert!(
+                    saw_partial_progress,
+                    "The deposits only appeared once the whole mempool was fetched"
+                );
+
+                bitcoin.delay_mempool_tx_fetches(Duration::ZERO);
+
+                return Ok(());
+            }
+            (MempoolVisibility::Partial, found) if 0 < found && found < DEPOSITS => {
+                saw_partial_progress = true;
+            }
+            _ => {}
+        }
+
+        sleep_in_test(
+            "Waiting for the slow mempool scan to complete",
+            Duration::from_millis(50),
+        )
+        .await;
+    }
+
+    panic!("The slow mempool scan never completed");
+}
+
+/// Returns the progress reported for `outpoint`, panicking if it is absent.
+fn lookup_progress(
+    progress: &[(bitcoin::OutPoint, ReceiveProgress)],
+    outpoint: bitcoin::OutPoint,
+) -> ReceiveProgress {
+    progress
+        .iter()
+        .find(|(reported, _)| *reported == outpoint)
+        .map(|(_, state)| state.clone())
+        .unwrap_or_else(|| panic!("No progress reported for {outpoint}, got {progress:?}"))
+}
+
+/// Polls until the address reports exactly `count` deposits.
+async fn await_deposit_count(
+    client: &ClientHandleArc,
+    address: &bitcoin::Address,
+    count: usize,
+) -> anyhow::Result<Vec<(bitcoin::OutPoint, ReceiveProgress)>> {
+    loop {
+        let progress = client
+            .get_first_module::<WalletClientModule>()?
+            .address_receive_progress(address)
+            .await?;
+
+        assert!(
+            progress.deposits.len() <= count,
+            "More deposits reported than were sent: {progress:?}"
+        );
+
+        if progress.deposits.len() == count {
+            return Ok(progress.deposits);
+        }
+
+        sleep_in_test(
+            format!("Waiting for the address to report {count} deposits"),
+            Duration::from_secs(1),
+        )
+        .await;
+    }
+}
+
+/// Polls receive progress until the unmined peg-in is visible in the
+/// guardians' mempools, returning its outpoint.
+///
+/// Asserts it is reported against the expected transaction and value, and as
+/// exactly one deposit.
+async fn await_receive_mempool(
+    client: &ClientHandleArc,
+    address: &bitcoin::Address,
+    txid: bitcoin::Txid,
+) -> anyhow::Result<bitcoin::OutPoint> {
+    loop {
+        let progress = client
+            .get_first_module::<WalletClientModule>()?
+            .address_receive_progress(address)
+            .await?;
+
+        assert_ne!(
+            progress.mempool_visibility,
+            MempoolVisibility::Unavailable,
+            "The mock backend can enumerate its mempool, so the federation must see one"
+        );
+
+        match progress.deposits.as_slice() {
+            [(outpoint, ReceiveProgress::Mempool { value })] => {
+                assert_eq!(*value, Amount::from_int_btc(1));
+                assert_eq!(outpoint.txid, txid);
+
+                return Ok(*outpoint);
+            }
+            [] => {}
+            states => panic!("Peg-in reached {states:?} while still unmined"),
+        }
+
+        sleep_in_test(
+            "Waiting for the peg-in to appear in the mempool",
+            Duration::from_secs(1),
+        )
+        .await;
+    }
+}
+
+/// Polls receive progress until the peg-in is at least `min` confirmations
+/// deep, returning the `required` depth it is counting towards.
+///
+/// Asserts along the way that a mined-but-not-final peg-in is never reported as
+/// claimable, and that its reported value matches what was sent.
+async fn await_receive_confirmations(
+    client: &ClientHandleArc,
+    address: &bitcoin::Address,
+    min: u64,
+) -> anyhow::Result<u64> {
+    loop {
+        let progress = client
+            .get_first_module::<WalletClientModule>()?
+            .address_receive_progress(address)
+            .await?;
+
+        match progress.deposits.as_slice() {
+            [
+                (
+                    _,
+                    ReceiveProgress::Confirming {
+                        value,
+                        confirmations,
+                        required,
+                        ..
+                    },
+                ),
+            ] => {
+                assert_eq!(*value, Amount::from_int_btc(1));
+
+                if *confirmations >= min {
+                    return Ok(*required);
+                }
+            }
+            // Still legitimate here: the scanner may not have observed the new
+            // block yet, so the peg-in can briefly read as unmined.
+            [] | [(_, ReceiveProgress::Mempool { .. })] => {}
+            states => panic!("Peg-in reached {states:?} before the finality delay elapsed"),
+        }
+
+        sleep_in_test(
+            format!("Waiting for the peg-in to reach {min} confirmations"),
+            Duration::from_secs(1),
+        )
+        .await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn fee_exceeds_one_bitcoin_with_many_pending_txs() -> anyhow::Result<()> {
     let fixtures = fixtures();
@@ -243,6 +756,114 @@ async fn fee_exceeds_one_bitcoin_with_many_pending_txs() -> anyhow::Result<()> {
     }
 
     panic!("Transaction fee did not exceed one bitcoin")
+}
+
+/// The guardians count a claimed deposit at its on-chain value and a
+/// withdrawal at the value sent, neither including fees.
+#[tokio::test(flavor = "multi_thread")]
+async fn volume_stats_count_deposits_and_withdrawals() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = fed.new_client().await;
+    let bitcoin = fixtures.bitcoin();
+
+    initialize_consensus(&client, &bitcoin).await?;
+
+    let module = client.get_first_module::<WalletClientModule>()?;
+
+    bitcoin
+        .send_and_mine_block(&module.receive().await, Amount::from_int_btc(1))
+        .await;
+
+    await_finality_delay(&client, &bitcoin).await?;
+
+    await_federation_total_value(&client, Amount::from_sat(99_000_000)).await?;
+
+    let send = module
+        .send(
+            bitcoin.get_new_address().await.as_unchecked().clone(),
+            Amount::from_sat(10_000),
+            None,
+            serde_json::Value::Null,
+        )
+        .await?;
+
+    assert!(matches!(
+        module.await_final_send_operation_state(send).await?,
+        FinalSendOperationState::Success(_)
+    ));
+
+    let wallet_module_id = client
+        .get_first_instance(&KIND)
+        .expect("the fixture federation runs walletv2");
+
+    let peer = fed
+        .online_peer_ids()
+        .next()
+        .expect("fixture has an online peer");
+    let api = fed.new_admin_api(peer).await?.with_module(wallet_module_id);
+    let denied = api
+        .request_single_peer::<WalletVolumeStats>(
+            VOLUME_STATS_ENDPOINT.to_owned(),
+            ApiRequestErased::default(),
+            peer,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        denied.to_string().contains("Invalid authorization"),
+        "{denied}"
+    );
+    // The federation can reach a block count before this guardian does, so
+    // wait for this guardian's own count.
+    let stats_at = |min_block_count: u64| {
+        let api = api.clone();
+        async move {
+            loop {
+                let stats: WalletVolumeStats = api
+                    .request_admin(
+                        VOLUME_STATS_ENDPOINT,
+                        ApiRequestErased::default(),
+                        API_AUTH.clone(),
+                    )
+                    .await?;
+                if stats.block_count >= min_block_count {
+                    return Ok::<_, anyhow::Error>(stats);
+                }
+                sleep_in_test(
+                    format!("Waiting for the guardian to reach block count {min_block_count}"),
+                    Duration::from_millis(100),
+                )
+                .await;
+            }
+        }
+    };
+    let none = WalletVolume {
+        deposited: Amount::ZERO,
+        withdrawn: Amount::ZERO,
+        complete: true,
+    };
+
+    // Both flows were processed in the current bucket, which no window
+    // includes yet.
+    let stats = stats_at(0).await?;
+    assert_eq!(stats.last_1008_blocks, none);
+    assert_eq!(stats.last_4320_blocks, none);
+
+    // Once that bucket ends, both windows include it.
+    let bucket_end = (stats.block_count / 144 + 1) * 144;
+    bitcoin.mine_blocks(bucket_end - stats.block_count).await;
+    let stats = stats_at(bucket_end).await?;
+    let expected = WalletVolume {
+        deposited: Amount::from_int_btc(1),
+        withdrawn: Amount::from_sat(10_000),
+        // The federation formed with the counting code.
+        complete: true,
+    };
+    assert_eq!(stats.last_1008_blocks, expected);
+    assert_eq!(stats.last_4320_blocks, expected);
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

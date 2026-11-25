@@ -71,6 +71,25 @@ impl From<AutocommitError<PegInError>> for PegInError {
     }
 }
 
+/// A failure to report the progress of a deposit operation's unclaimed
+/// outputs.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum DepositProgressError {
+    /// The operation's deposit address could not be looked up.
+    #[error(transparent)]
+    PegIn(#[from] PegInError),
+
+    /// The federation could not report its consensus block count.
+    #[error(transparent)]
+    Federation(#[from] FederationError),
+
+    /// The bitcoin backend could not report the address's history or a
+    /// deposit's block height.
+    #[error(transparent)]
+    BitcoinRpc(#[from] BitcoinRpcError),
+}
+
 /// A failure to hand out a deposit address.
 ///
 /// Covers both the plain allocation and the pooled one, which can also lose a

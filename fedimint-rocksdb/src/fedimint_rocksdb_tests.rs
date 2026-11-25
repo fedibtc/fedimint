@@ -4,7 +4,7 @@ use fedimint_core::module::registry::{ModuleDecoderRegistry, ModuleRegistry};
 use fedimint_core::{impl_db_lookup, impl_db_record};
 use futures::StreamExt;
 
-use super::{RocksDb, RocksDbReadOnly, next_prefix};
+use super::{DEFAULT_WRITE_BUFFER_SIZE, RocksDb, RocksDbReadOnly, next_prefix};
 
 fn open_temp_db(temp_path: &str) -> Database {
     let path = tempfile::Builder::new()
@@ -317,7 +317,7 @@ async fn test_retrieve_descending_order() {
 /// `RocksDB` validates an optimistic transaction at commit time against the
 /// write history it still keeps in memory. That history is bounded by
 /// `max_write_buffer_size_to_maintain`, which `OptimisticTransactionDB`
-/// defaults to `max_write_buffer_number * write_buffer_size` — 4 MiB with
+/// defaults to `max_write_buffer_number * write_buffer_size` — 32 MiB with
 /// our options. Once a transaction's snapshot falls out of that window
 /// `RocksDB` can no longer tell whether anything conflicted, and fails the
 /// commit with `TryAgain` even though no other transaction ever touched any
@@ -347,12 +347,13 @@ async fn test_long_lived_transaction_fails_without_key_overlap() {
         .insert_entry(&TestKey(vec![0]), &TestVal(vec![0]))
         .await;
 
-    // Unrelated writers commit 8 MiB over keys that are disjoint from the
-    // above, which is enough to push the retained history past the snapshot.
-    // 6 MiB was the observed threshold, so this leaves some headroom.
+    // Unrelated writers commit twice the retained history over keys that
+    // are disjoint from the above, which pushes it past the snapshot. With
+    // 2 MiB buffers the observed threshold was 1.5 times the history.
     let value = vec![0xab; 64 * 1024];
+    let writes = 2 * 2 * DEFAULT_WRITE_BUFFER_SIZE / value.len();
 
-    for index in 0u32..128 {
+    for index in 0..u32::try_from(writes).unwrap() {
         let mut dbtx = db.begin_transaction().await;
         dbtx.insert_entry(
             &TestKey2(index.to_be_bytes().to_vec()),
