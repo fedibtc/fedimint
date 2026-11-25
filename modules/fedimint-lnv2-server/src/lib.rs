@@ -88,6 +88,37 @@ use crate::metrics::{LN_FUNDED_CONTRACT_SATS, LN_OUTGOING_CONTRACT_SETTLED};
 /// 128 at a time, so this leaves ample headroom.
 const MAX_INCOMING_CONTRACTS_BATCH: usize = 1024;
 
+/// Default `UnixTimeVote` rounding interval (1 minute).
+const UNIX_TIME_VOTE_GRANULARITY_SECS: u64 = 60;
+
+/// Coarser `UnixTimeVote` rounding interval (5 minutes) used when AlephBFT
+/// quiescence is enabled and no Lightning contracts are active.
+///
+/// Caller audit of `consensus_unix_time` and `UnixTimeVote`:
+/// - `process_consensus_item`: accepts any strictly increasing `u64` timestamp
+///   (`current_vote < vote`), so switching between 60 s and 300 s is
+///   consensus-safe as long as we never propose a non-increasing timestamp.
+/// - `process_output` (`LightningOutputV0::Incoming`): rejects a newly funded
+///   incoming contract when `expiration_or_fee <= consensus_unix_time`. Because
+///   floored timestamps never exceed wall-clock time, an unexpired contract is
+///   never wrongly rejected; an already-expired contract could remain
+///   acceptable for up to 5 minutes instead of 1 minute when idle (once any
+///   contract is funded, `has_active_contracts` immediately restores 60 s
+///   granularity).
+/// - `await_incoming_contract`: returns `None` when
+///   `expiration <= consensus_unix_time`. A funded invoice returns immediately
+///   via `wait_key_exists`; an unpaid invoice on a Lightning-idle federation
+///   observes expiry up to 5 minutes after wall-clock expiry instead of
+///   1 minute.
+/// - `consensus_unix_time_ui`: guardian dashboard display; refreshes every
+///   5 minutes while idle.
+/// - Outgoing contracts (`process_input`, `await_preimage`,
+///   `outgoing_contract_expiration`) depend on `consensus_block_count`, not
+///   `consensus_unix_time`, but keeping 60 s cadence whenever either incoming
+///   or outgoing contracts exist avoids changing behavior during any active
+///   Lightning traffic.
+const QUIESCENT_IDLE_UNIX_TIME_VOTE_GRANULARITY_SECS: u64 = 300;
+
 #[derive(Debug, Clone)]
 pub struct LightningInit;
 
@@ -456,9 +487,14 @@ impl ServerModule for Lightning {
 
         // We reduce the time granularity to deduplicate votes more often and not save
         // one consensus item every second.
-        let unix_time = 60 * (duration_since_epoch().as_secs() / 60);
-
-        if !quiescent || unix_time > self.our_unix_time_vote(dbtx).await {
+        if let Some(unix_time) = Self::unix_time_vote_proposal(
+            dbtx,
+            self.our_peer_id,
+            duration_since_epoch().as_secs(),
+            quiescent,
+        )
+        .await
+        {
             items.push(LightningConsensusItem::UnixTimeVote(unix_time));
         }
 
@@ -859,10 +895,47 @@ impl Lightning {
             .unwrap_or(0)
     }
 
-    async fn our_unix_time_vote(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
-        dbtx.get_value(&UnixTimeVoteKey(self.our_peer_id))
+    async fn our_unix_time_vote(dbtx: &mut DatabaseTransaction<'_>, peer_id: PeerId) -> u64 {
+        dbtx.get_value(&UnixTimeVoteKey(peer_id)).await.unwrap_or(0)
+    }
+
+    async fn has_active_contracts(dbtx: &mut DatabaseTransaction<'_>) -> bool {
+        if dbtx
+            .find_by_prefix(&IncomingContractPrefix)
             .await
-            .unwrap_or(0)
+            .next()
+            .await
+            .is_some()
+        {
+            return true;
+        }
+
+        dbtx.find_by_prefix(&OutgoingContractPrefix)
+            .await
+            .next()
+            .await
+            .is_some()
+    }
+
+    async fn unix_time_vote_proposal(
+        dbtx: &mut DatabaseTransaction<'_>,
+        peer_id: PeerId,
+        now_secs: u64,
+        quiescent: bool,
+    ) -> Option<u64> {
+        let granularity = if quiescent && !Self::has_active_contracts(dbtx).await {
+            QUIESCENT_IDLE_UNIX_TIME_VOTE_GRANULARITY_SECS
+        } else {
+            UNIX_TIME_VOTE_GRANULARITY_SECS
+        };
+
+        let unix_time = granularity * (now_secs / granularity);
+
+        if !quiescent || unix_time > Self::our_unix_time_vote(dbtx, peer_id).await {
+            Some(unix_time)
+        } else {
+            None
+        }
     }
 
     async fn consensus_block_count(&self, dbtx: &mut DatabaseTransaction<'_>) -> u64 {
@@ -1123,4 +1196,211 @@ fn observe_funded_contract(
             .with_label_values(&[direction])
             .observe(amount.sats_f64());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::TransactionId;
+    use fedimint_core::bitcoin::hashes::Hash;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::secp256k1::{SECP256K1, SecretKey};
+    use fedimint_lnv2_common::contracts::PaymentImage;
+
+    use super::*;
+
+    fn test_outpoint(idx: u64) -> OutPoint {
+        OutPoint {
+            txid: TransactionId::all_zeros(),
+            out_idx: idx,
+        }
+    }
+
+    fn test_pubkey(byte: u8) -> fedimint_core::secp256k1::PublicKey {
+        SecretKey::from_slice(&[byte; 32])
+            .expect("valid secret key")
+            .public_key(SECP256K1)
+    }
+
+    fn test_incoming_contract() -> IncomingContract {
+        let pk = test_pubkey(1);
+        IncomingContract::new(
+            AggregatePublicKey(G1Projective::generator().to_affine()),
+            [2; 32],
+            [3; 32],
+            PaymentImage::Point(pk),
+            Amount::from_sats(100),
+            10_000,
+            pk,
+            pk,
+            pk,
+        )
+    }
+
+    fn test_outgoing_contract() -> OutgoingContract {
+        let pk = test_pubkey(4);
+        OutgoingContract {
+            payment_image: PaymentImage::Point(pk),
+            amount: Amount::from_sats(100),
+            expiration: 100,
+            claim_pk: pk,
+            refund_pk: pk,
+            ephemeral_pk: pk,
+        }
+    }
+
+    async fn record_vote(dbtx: &mut DatabaseTransaction<'_>, peer: PeerId, vote: u64) {
+        let prev = dbtx
+            .insert_entry(&UnixTimeVoteKey(peer), &vote)
+            .await
+            .unwrap_or(0);
+        assert!(prev < vote, "proposed vote {vote} must exceed {prev}");
+    }
+
+    #[tokio::test]
+    async fn quiescence_off_votes_every_60s_even_when_idle() {
+        let db: Database = MemDatabase::new().into();
+        let peer = PeerId::from(0);
+        let mut dbtx = db.begin_transaction_nc().await;
+
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 300, false).await,
+            Some(300)
+        );
+        record_vote(&mut dbtx, peer, 300).await;
+
+        // With quiescence off, proposals stay at 60s granularity and are emitted
+        // even before the next minute boundary (matching pre-quiescence behavior).
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 320, false).await,
+            Some(300)
+        );
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 360, false).await,
+            Some(360)
+        );
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 420, false).await,
+            Some(420)
+        );
+    }
+
+    #[tokio::test]
+    async fn quiescence_on_idle_votes_every_300s_and_never_regresses() {
+        let db: Database = MemDatabase::new().into();
+        let peer = PeerId::from(0);
+        let mut dbtx = db.begin_transaction_nc().await;
+
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 300, true).await,
+            Some(300)
+        );
+        record_vote(&mut dbtx, peer, 300).await;
+
+        // Intermediate 60s boundaries are skipped while Lightning is idle.
+        for t in [301, 360, 420, 480, 540, 599] {
+            assert_eq!(
+                Lightning::unix_time_vote_proposal(&mut dbtx, peer, t, true).await,
+                None,
+                "should not propose a time vote at t={t}"
+            );
+        }
+
+        // Next 300s boundary produces a vote.
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 600, true).await,
+            Some(600)
+        );
+        record_vote(&mut dbtx, peer, 600).await;
+
+        // Simulate transitioning from active 60s voting (last vote at 660) back to
+        // idle 300s voting at t=700 (300 * (700/300) = 600 < 660): must NOT propose
+        // a backwards timestamp, and must resume at the next strictly higher 300s
+        // boundary (900).
+        record_vote(&mut dbtx, peer, 660).await;
+        for t in [700, 720, 840, 899] {
+            assert_eq!(
+                Lightning::unix_time_vote_proposal(&mut dbtx, peer, t, true).await,
+                None,
+                "must not regress or vote early at t={t}"
+            );
+        }
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 900, true).await,
+            Some(900)
+        );
+        record_vote(&mut dbtx, peer, 900).await;
+    }
+
+    #[tokio::test]
+    async fn quiescence_on_with_active_incoming_contract_votes_every_60s() {
+        let db: Database = MemDatabase::new().into();
+        let peer = PeerId::from(0);
+        let mut dbtx = db.begin_transaction_nc().await;
+
+        record_vote(&mut dbtx, peer, 300).await;
+
+        let outpoint = test_outpoint(0);
+        dbtx.insert_new_entry(&IncomingContractKey(outpoint), &test_incoming_contract())
+            .await;
+
+        // Still inside the same 60s bucket as our last vote (300) -> skip redundant vote.
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 320, true).await,
+            None
+        );
+
+        // Active incoming contract restores 60s cadence.
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 360, true).await,
+            Some(360)
+        );
+        record_vote(&mut dbtx, peer, 360).await;
+
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 420, true).await,
+            Some(420)
+        );
+        record_vote(&mut dbtx, peer, 420).await;
+
+        // Once the incoming contract is removed, idle 300s cadence resumes without
+        // proposing a backwards timestamp.
+        dbtx.remove_entry(&IncomingContractKey(outpoint)).await;
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 480, true).await,
+            None
+        );
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 600, true).await,
+            Some(600)
+        );
+    }
+
+    #[tokio::test]
+    async fn quiescence_on_with_active_outgoing_contract_votes_every_60s() {
+        let db: Database = MemDatabase::new().into();
+        let peer = PeerId::from(0);
+        let mut dbtx = db.begin_transaction_nc().await;
+
+        record_vote(&mut dbtx, peer, 300).await;
+
+        let outpoint = test_outpoint(1);
+        dbtx.insert_new_entry(&OutgoingContractKey(outpoint), &test_outgoing_contract())
+            .await;
+
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 360, true).await,
+            Some(360)
+        );
+        record_vote(&mut dbtx, peer, 360).await;
+
+        dbtx.remove_entry(&OutgoingContractKey(outpoint)).await;
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 420, true).await,
+            None
+        );
+        assert_eq!(
+            Lightning::unix_time_vote_proposal(&mut dbtx, peer, 600, true).await,
+            Some(600)
+        );
+    }
 }
