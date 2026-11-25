@@ -128,6 +128,22 @@ pub(crate) static CONSENSUS_ORDERING_LATENCY_SECONDS: LazyLock<Histogram> = Lazy
     .unwrap()
 });
 
+/// Clients submit a transaction to every guardian at once, so the ordering
+/// latency of our batches that carry one measures how far we lag behind our
+/// peers. With Aleph quiescence, a batch of votes that only we propose waits
+/// for our peers to wake instead, which says nothing about this guardian.
+pub(crate) static CONSENSUS_TRANSACTION_ORDERING_LATENCY_SECONDS: LazyLock<Histogram> =
+    LazyLock::new(|| {
+        register_histogram_with_registry!(
+            histogram_opts!(
+                "consensus_transaction_ordering_latency_seconds",
+                "Duration of ordering a batch of consensus items that carries a transaction",
+            ),
+            REGISTRY
+        )
+        .unwrap()
+    });
+
 pub(crate) static IROH_API_CONNECTIONS_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge_with_registry!(
         opts!(

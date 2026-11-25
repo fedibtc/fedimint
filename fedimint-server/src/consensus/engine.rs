@@ -58,6 +58,7 @@ use crate::metrics::{
     CONSENSUS_ITEM_PROCESSING_MODULE_AUDIT_DURATION_SECONDS, CONSENSUS_ITEMS_PROCESSED_TOTAL,
     CONSENSUS_ORDERING_LATENCY_SECONDS, CONSENSUS_PEER_CONTRIBUTION_SESSION_IDX,
     CONSENSUS_SESSION_COUNT, CONSENSUS_SESSIONS_COMPLETED,
+    CONSENSUS_TRANSACTION_ORDERING_LATENCY_SECONDS,
 };
 
 // The name of the directory where the database checkpoints are stored.
@@ -545,6 +546,8 @@ impl ConsensusEngine {
                     }
 
                     if let Some(UnitData::Batch(bytes)) = ordered_unit.data {
+                        let items = Vec::<ConsensusItem>::consensus_decode_whole(&bytes, &self.decoders());
+
                         if ordered_unit.creator == self.identity() {
                             match timestamp_receiver.try_recv() {
                                 Ok(timestamp) => {
@@ -556,6 +559,12 @@ impl ConsensusEngine {
                                     self.ord_latency_sender.send_replace(Some(latency));
 
                                     CONSENSUS_ORDERING_LATENCY_SECONDS.observe(timestamp.elapsed().as_secs_f64());
+
+                                    if items.as_ref().is_ok_and(|items| {
+                                        items.iter().any(|item| matches!(item, ConsensusItem::Transaction(..)))
+                                    }) {
+                                        CONSENSUS_TRANSACTION_ORDERING_LATENCY_SECONDS.observe(timestamp.elapsed().as_secs_f64());
+                                    }
                                 }
                                 Err(err) => {
                                     debug!(target: LOG_CONSENSUS, err = %err.fmt_compact(), "Missing submission timestamp. This is normal in recovery");
@@ -563,7 +572,7 @@ impl ConsensusEngine {
                             }
                         }
 
-                        match Vec::<ConsensusItem>::consensus_decode_whole(&bytes, &self.decoders()) {
+                        match items {
                             Ok(items) => {
                                 for item in items {
                                     if let Ok(()) = self.process_consensus_item(
