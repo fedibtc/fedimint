@@ -13,6 +13,7 @@ pub mod migration;
 pub mod quiescence;
 pub mod setup_ui;
 pub mod volume;
+pub mod walletv2_vote_delay;
 
 use std::any::Any;
 use std::collections::BTreeMap;

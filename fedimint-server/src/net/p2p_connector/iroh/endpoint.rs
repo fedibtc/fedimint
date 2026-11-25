@@ -13,7 +13,7 @@ use fedimint_core::envs::{
     FM_IROH_PKARR_RESOLVER_ENABLE_ENV, FM_IROH_RELAYS_ENABLE_ENV, is_env_var_set,
     is_env_var_set_opt,
 };
-use fedimint_core::net::iroh::{IROH_IDLE_TIMEOUT, IROH_KEEP_ALIVE_INTERVAL};
+use fedimint_core::net::iroh::{iroh_idle_timeout, iroh_keep_alive_interval};
 use fedimint_core::util::SafeUrl;
 use fedimint_logging::LOG_NET_IROH;
 use iroh_next::address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher, PkarrResolver};
@@ -73,11 +73,11 @@ pub(super) async fn build_iroh_endpoint(
 
     let transport_config = QuicTransportConfig::builder()
         .max_idle_timeout(Some(
-            IROH_IDLE_TIMEOUT
+            iroh_idle_timeout()
                 .try_into()
                 .expect("idle timeout fits in IdleTimeout"),
         ))
-        .keep_alive_interval(IROH_KEEP_ALIVE_INTERVAL)
+        .keep_alive_interval(iroh_keep_alive_interval())
         .build();
 
     let endpoint = Box::pin(

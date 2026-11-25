@@ -17,7 +17,7 @@ use fedimint_core::module::{
     ApiError, ApiMethod, ApiRequestErased, FEDIMINT_API_ALPN, FEDIMINT_GATEWAY_ALPN,
     IrohApiRequest, IrohGatewayRequest, IrohGatewayResponse,
 };
-use fedimint_core::net::iroh::{IROH_IDLE_TIMEOUT, IROH_KEEP_ALIVE_INTERVAL};
+use fedimint_core::net::iroh::{iroh_idle_timeout, iroh_keep_alive_interval};
 
 /// The maximum number of bytes we are willing to buffer when reading an API
 /// response from an iroh QUIC stream. This must be large enough to accommodate
@@ -756,11 +756,11 @@ impl IrohConnector {
 fn quic_transport_config() -> iroh::endpoint::TransportConfig {
     let mut config = iroh::endpoint::TransportConfig::default();
     config.max_idle_timeout(Some(
-        IROH_IDLE_TIMEOUT
+        iroh_idle_timeout()
             .try_into()
             .expect("idle timeout fits in IdleTimeout"),
     ));
-    config.keep_alive_interval(Some(IROH_KEEP_ALIVE_INTERVAL));
+    config.keep_alive_interval(Some(iroh_keep_alive_interval()));
     config
 }
 
@@ -769,11 +769,11 @@ fn quic_transport_config() -> iroh::endpoint::TransportConfig {
 fn quic_transport_config_next() -> iroh_next::endpoint::QuicTransportConfig {
     iroh_next::endpoint::QuicTransportConfig::builder()
         .max_idle_timeout(Some(
-            IROH_IDLE_TIMEOUT
+            iroh_idle_timeout()
                 .try_into()
                 .expect("idle timeout fits in IdleTimeout"),
         ))
-        .keep_alive_interval(IROH_KEEP_ALIVE_INTERVAL)
+        .keep_alive_interval(iroh_keep_alive_interval())
         .build()
 }
 

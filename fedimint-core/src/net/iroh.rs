@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fedimint_core::util::SafeUrl;
@@ -30,11 +31,44 @@ const DEFAULT_IROH_RELAYS: [&str; 2] = [
 /// the minimum of both sides', so a guardian setting this caps detection
 /// latency for clients whose endpoints keep iroh's defaults. The path-level
 /// settings stay untouched — iroh tunes those for hole punching.
-pub const IROH_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const IROH_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// QUIC keep-alive interval for every iroh endpoint, see
 /// [`IROH_IDLE_TIMEOUT`].
-pub const IROH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
+const IROH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Fedi: the 0.12 idle timeout, kept behind [`set_legacy_timeouts`].
+const LEGACY_IROH_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Fedi: the 0.12 keep-alive interval, kept behind [`set_legacy_timeouts`].
+const LEGACY_IROH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Fedi kill switch for the 0.13 timeouts. Endpoints read it when they are
+/// built, so it is set once at process start, before any endpoint exists.
+static LEGACY_TIMEOUTS: AtomicBool = AtomicBool::new(false);
+
+/// Make endpoints built from now on use 0.12's iroh timeouts.
+pub fn set_legacy_timeouts(legacy: bool) {
+    LEGACY_TIMEOUTS.store(legacy, Ordering::Relaxed);
+}
+
+/// The QUIC idle timeout for a new iroh endpoint.
+pub fn iroh_idle_timeout() -> Duration {
+    if LEGACY_TIMEOUTS.load(Ordering::Relaxed) {
+        LEGACY_IROH_IDLE_TIMEOUT
+    } else {
+        IROH_IDLE_TIMEOUT
+    }
+}
+
+/// The QUIC keep-alive interval for a new iroh endpoint.
+pub fn iroh_keep_alive_interval() -> Duration {
+    if LEGACY_TIMEOUTS.load(Ordering::Relaxed) {
+        LEGACY_IROH_KEEP_ALIVE_INTERVAL
+    } else {
+        IROH_KEEP_ALIVE_INTERVAL
+    }
+}
 
 pub async fn build_iroh_endpoint(
     secret_key: SecretKey,
@@ -113,13 +147,13 @@ pub async fn build_iroh_endpoint(
 
     let mut transport_config = TransportConfig::default();
     transport_config.max_idle_timeout(Some(
-        IROH_IDLE_TIMEOUT
+        iroh_idle_timeout()
             .try_into()
             .expect("idle timeout fits in IdleTimeout"),
     ));
     // Iroh's default builder sets keep_alive_interval to 1s, but since we're
     // providing a custom TransportConfig we need to set it explicitly.
-    transport_config.keep_alive_interval(Some(IROH_KEEP_ALIVE_INTERVAL));
+    transport_config.keep_alive_interval(Some(iroh_keep_alive_interval()));
 
     let builder = builder
         .relay_mode(relay_mode)

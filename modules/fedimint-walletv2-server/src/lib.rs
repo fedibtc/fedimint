@@ -481,7 +481,13 @@ impl ServerModule for Wallet {
         if let Some(status) = self.btc_rpc.status() {
             assert_eq!(status.network, self.cfg.consensus.network);
 
-            let block_count_vote = status.block_count.saturating_sub(BLOCK_COUNT_VOTE_DELAY);
+            // Fedi kill switch: 0.12 voted the finality delay behind the backend.
+            let vote_delay = if fedimint_server_core::walletv2_vote_delay::is_legacy() {
+                CONFIRMATION_FINALITY_DELAY
+            } else {
+                BLOCK_COUNT_VOTE_DELAY
+            };
+            let block_count_vote = status.block_count.saturating_sub(vote_delay);
 
             let consensus_block_count = self.consensus_block_count(dbtx).await;
 

@@ -167,6 +167,35 @@ async fn await_federation_total_value(
     }
 }
 
+/// The Fedi kill switch for 0.13's vote delay brings back 0.12's: a guardian
+/// votes the finality delay behind its backend, one block less than 0.13, so
+/// the consensus block count gets one block closer to the backend's.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_vote_delay_switch_votes_one_block_closer_to_the_tip() -> anyhow::Result<()> {
+    assert_eq!(BLOCK_COUNT_VOTE_DELAY, CONFIRMATION_FINALITY_DELAY + 1);
+    // Process-global, and nextest runs each test in its own process.
+    fedimint_server_core::walletv2_vote_delay::set_legacy(true);
+
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = fed.new_client().await;
+    let bitcoin = fixtures.bitcoin();
+
+    bitcoin.mine_blocks(1 + BLOCK_COUNT_VOTE_DELAY).await;
+    let backend_block_count = bitcoin.get_block_count().await;
+
+    // 0.13's delay stops one block short of this.
+    let legacy_consensus = backend_block_count - CONFIRMATION_FINALITY_DELAY;
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        await_consensus_block_count(&client, legacy_consensus),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("consensus did not reach {legacy_consensus}"))??;
+
+    Ok(())
+}
+
 /// A peg-in should report progress while it waits out the finality delay,
 /// rather than leaving the user with no feedback at all between broadcasting
 /// and the ecash being issued.

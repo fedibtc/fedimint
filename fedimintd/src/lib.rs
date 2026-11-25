@@ -438,6 +438,9 @@ async fn run_inner(
         "Starting fedimintd (version: {fedimint_version} version_hash: {code_version_hash})"
     );
 
+    // Before anything builds an iroh endpoint, whose timeouts it sets.
+    fedimint_server::config::driven::Features::apply_from_env()?;
+
     #[cfg(all(
         not(feature = "jemalloc"),
         not(any(target_env = "msvc", target_os = "ios", target_os = "android"))

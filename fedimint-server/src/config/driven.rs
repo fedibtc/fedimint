@@ -20,8 +20,8 @@
 //! [`ChildMessage::ConsensusStarted`] is the child's last frame. The channel
 //! then carries [`Features`] frames from the parent for the rest of the
 //! child's life: each is the complete set of runtime feature switches, applied
-//! as it arrives. Every child process starts with all features off. Parent EOF
-//! leaves the last applied features in place.
+//! as it arrives. A child starts with the features in [`FM_FEATURES_ENV`], or
+//! all off without it. Parent EOF leaves the last applied features in place.
 //!
 //! [`PROTOCOL_VERSION`] is incremented for incompatible changes. New optional
 //! map fields may be added within a version; peers must ignore fields they do
@@ -55,6 +55,11 @@ use crate::net::p2p_connector::dns_sanitize;
 
 /// Boolean environment switch selecting driven DKG over the stdin socket.
 pub const FM_DKG_CTRL_ENV: &str = "FM_DKG_CTRL";
+
+/// JSON [`Features`] a `fedimintd` process starts with (fedibtc fork). The
+/// only source of features fixed at process start, such as
+/// [`Features::iroh_legacy_timeouts`].
+pub const FM_FEATURES_ENV: &str = "FM_FEATURES";
 
 /// Current driven-DKG wire protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -138,17 +143,51 @@ pub enum ParentMessage {
 /// fork).
 ///
 /// Each frame is the complete set. A field missing from a frame is off, so a
-/// new switch is a new field that defaults to off.
+/// new switch is a new field that defaults to off. A kill switch for a new
+/// behaviour is therefore named for the old behaviour it restores.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Features {
     /// Create AlephBFT units only while there is something to order
     /// ([`fedimint_server_core::quiescence`]).
     pub aleph_quiescence: bool,
+    /// Kill switch: give iroh endpoints 0.12's QUIC timeouts, 60s idle and 30s
+    /// keep-alive, instead of 0.13's 5s and 1s. Endpoints fix their timeouts
+    /// when they are built, so only [`FM_FEATURES_ENV`] sets this; frames
+    /// change it at the next process start.
+    pub iroh_legacy_timeouts: bool,
+    /// Kill switch: vote the walletv2 block count as 0.12 does
+    /// ([`fedimint_server_core::walletv2_vote_delay`]).
+    pub walletv2_legacy_vote_delay: bool,
 }
 
 impl Features {
-    /// Switch this process to these features.
+    /// Apply the features in [`FM_FEATURES_ENV`], if it is set. Call at
+    /// process start, before any iroh endpoint is built.
+    pub fn apply_from_env() -> anyhow::Result<()> {
+        let Ok(json) = std::env::var(FM_FEATURES_ENV) else {
+            return Ok(());
+        };
+        serde_json::from_str::<Self>(&json)
+            .with_context(|| format!("Parsing {FM_FEATURES_ENV}"))?
+            .apply_at_start();
+        Ok(())
+    }
+
+    /// Switch this process to all of these features, including those fixed at
+    /// process start.
+    fn apply_at_start(&self) {
+        fedimint_core::net::iroh::set_legacy_timeouts(self.iroh_legacy_timeouts);
+        tracing::info!(
+            target: fedimint_logging::LOG_CONSENSUS,
+            safe_to_share = true,
+            iroh_legacy_timeouts = self.iroh_legacy_timeouts,
+            "Iroh timeouts set"
+        );
+        self.apply();
+    }
+
+    /// Switch this process to the runtime features among these.
     fn apply(&self) {
         let previous = fedimint_server_core::quiescence::set_enabled(self.aleph_quiescence);
         if previous != self.aleph_quiescence {
@@ -157,6 +196,16 @@ impl Features {
                 safe_to_share = true,
                 enabled = self.aleph_quiescence,
                 "Aleph quiescence switched"
+            );
+        }
+        let previous =
+            fedimint_server_core::walletv2_vote_delay::set_legacy(self.walletv2_legacy_vote_delay);
+        if previous != self.walletv2_legacy_vote_delay {
+            tracing::info!(
+                target: fedimint_logging::LOG_CONSENSUS,
+                safe_to_share = true,
+                legacy = self.walletv2_legacy_vote_delay,
+                "Walletv2 vote delay switched"
             );
         }
     }
@@ -1061,11 +1110,53 @@ mod tests {
         features
             .set(&Features {
                 aleph_quiescence: true,
+                ..Features::default()
             })
             .await
             .unwrap();
         let read: Features = read_frame(&mut child).await.unwrap();
         assert!(read.aleph_quiescence);
+    }
+
+    #[test]
+    fn start_features_set_the_iroh_timeouts_and_frames_do_not() {
+        use fedimint_core::net::iroh::{iroh_idle_timeout, iroh_keep_alive_interval};
+
+        let legacy: Features =
+            serde_json::from_str(r#"{"iroh_legacy_timeouts":true}"#).expect("valid features");
+        assert!(!legacy.walletv2_legacy_vote_delay);
+
+        legacy.apply_at_start();
+        assert_eq!(iroh_idle_timeout(), std::time::Duration::from_secs(60));
+        assert_eq!(
+            iroh_keep_alive_interval(),
+            std::time::Duration::from_secs(30)
+        );
+
+        Features::default().apply();
+        assert_eq!(iroh_idle_timeout(), std::time::Duration::from_secs(60));
+
+        Features::default().apply_at_start();
+        assert_eq!(iroh_idle_timeout(), std::time::Duration::from_secs(5));
+        assert_eq!(
+            iroh_keep_alive_interval(),
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn frames_switch_the_walletv2_vote_delay() {
+        use fedimint_server_core::walletv2_vote_delay::is_legacy;
+
+        Features {
+            walletv2_legacy_vote_delay: true,
+            ..Features::default()
+        }
+        .apply();
+        assert!(is_legacy());
+
+        Features::default().apply();
+        assert!(!is_legacy());
     }
 
     #[tokio::test]
