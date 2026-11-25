@@ -57,7 +57,7 @@ use fedimint_core::transaction::{
     SerdeTransaction, Transaction, TransactionError, TransactionSubmissionOutcome,
 };
 use fedimint_core::util::{FmtCompact, SafeUrl};
-use fedimint_core::version::non_zero_version_hash;
+use fedimint_core::version::{DkgVersion, non_zero_version_hash};
 use fedimint_core::{ChainId, OutPoint, OutPointRange, PeerId, TransactionId, secp256k1};
 use fedimint_logging::LOG_NET_API;
 use fedimint_server_core::bitcoin_rpc::ServerBitcoinRpcMonitor;
@@ -620,9 +620,17 @@ impl ConsensusApi {
             .await
     }
 
-    /// Returns the tagged fedimintd version currently running
+    /// Fedi: the version this guardian takes part in DKG as, not the build.
+    ///
+    /// Federation tooling reads this endpoint to learn which release line
+    /// new guardians must run to join a federation, and that is the DKG
+    /// line: [`DkgVersion::dkg_compatibility`] of the build. `version_hash`,
+    /// the guardian UI, and telemetry keep the real version.
     fn fedimintd_version(&self) -> String {
-        self.code_version_str.clone()
+        DkgVersion::dkg_compatibility(&self.code_version_str)
+            .expect("fedimintd validates its version at startup")
+            .setup_code_version()
+            .to_string()
     }
 
     /// Add an API URL announcement from a peer to our database to be returned

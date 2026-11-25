@@ -27,7 +27,8 @@ pub fn ensure_expected_fedimintd_version(
         Err(env::VarError::NotPresent) => None,
         Err(error) => return Err(error.into()),
     };
-    let expected_version = version_with_vendor(version, expected_vendor.as_deref())?;
+    let expected_version =
+        reported_fedimintd_version(version_with_vendor(version, expected_vendor.as_deref())?)?;
     let reported_version = Version::parse(reported_version)?;
 
     anyhow::ensure!(
@@ -35,6 +36,21 @@ pub fn ensure_expected_fedimintd_version(
         "Fedimintd reported version {reported_version}, expected {expected_version}"
     );
     Ok(())
+}
+
+/// The version a fedimintd built as `code_version` reports.
+///
+/// Fedi: from 0.13 on, fedimintd reports the release line it takes part in
+/// DKG as, not the build; earlier releases report the build.
+pub fn reported_fedimintd_version(code_version: Version) -> anyhow::Result<Version> {
+    if code_version < *VERSION_0_13_0_ALPHA {
+        return Ok(code_version);
+    }
+    Ok(
+        fedimint_core::version::DkgVersion::dkg_compatibility(&code_version.to_string())?
+            .setup_code_version()
+            .clone(),
+    )
 }
 
 pub static VERSION_0_10_0_ALPHA: LazyLock<Version> =
