@@ -1,7 +1,7 @@
 use aleph_bft::{NodeIndex, Round};
 use fedimint_core::PeerId;
 
-use super::data_provider::{PendingBatches, UnitData};
+use super::data_provider::{UnitData, UnorderedBatches};
 
 pub struct OrderedUnit {
     pub creator: PeerId,
@@ -12,19 +12,19 @@ pub struct OrderedUnit {
 pub struct FinalizationHandler {
     sender: async_channel::Sender<OrderedUnit>,
     identity: PeerId,
-    pending_batches: PendingBatches,
+    unordered_batches: UnorderedBatches,
 }
 
 impl FinalizationHandler {
     pub fn new(
         sender: async_channel::Sender<OrderedUnit>,
         identity: PeerId,
-        pending_batches: PendingBatches,
+        unordered_batches: UnorderedBatches,
     ) -> Self {
         Self {
             sender,
             identity,
-            pending_batches,
+            unordered_batches,
         }
     }
 }
@@ -43,9 +43,10 @@ impl aleph_bft::FinalizationHandler<UnitData> for FinalizationHandler {
         let creator = super::to_peer_id(creator)
             .expect("Finalized units were verified against the broadcast public key set");
 
-        if let Some(data) = &data {
-            self.pending_batches
-                .ordered(creator, round, creator == self.identity, data);
+        // the data provider stops creating units as soon as all of our batches have
+        // been ordered
+        if creator == self.identity && matches!(data, Some(UnitData::Batch(..))) {
+            self.unordered_batches.ordered();
         }
 
         // the channel is unbounded
