@@ -421,3 +421,13 @@ opt-level = 1
 # On Linux, Cargo also strips linked-in dependency debuginfo when debug is disabled.
 debug = false
 lto = "thin"
+
+[patch.crates-io]
+# Fedi: iroh-fedimint with the fix for a magicsock actor that deadlocks on its
+# own full inbox when relays are disabled, as in Fedimint API clients; it then
+# leaks every unanswered disco ping (fedibtc/iroh
+# `roboman/iroh-fedimint-0.35-fedi1`). `iroh-base` and `iroh-relay` come from
+# the same checkout because git `iroh-fedimint` uses them by path.
+iroh-base = { git = "https://github.com/fedibtc/iroh", rev = "7cf82f438a03ce14818443896c4dad962bab2e65" }
+iroh-fedimint = { git = "https://github.com/fedibtc/iroh", rev = "7cf82f438a03ce14818443896c4dad962bab2e65" }
+iroh-relay = { git = "https://github.com/fedibtc/iroh", rev = "7cf82f438a03ce14818443896c4dad962bab2e65" }
