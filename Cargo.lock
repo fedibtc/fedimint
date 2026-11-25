@@ -6557,7 +6557,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "0.35.0"
-source = "git+https://github.com/fedibtc/iroh?rev=7cf82f438a03ce14818443896c4dad962bab2e65#7cf82f438a03ce14818443896c4dad962bab2e65"
+source = "git+https://github.com/fedibtc/iroh?branch=roboman%2Firoh-fedimint-0.35-fedi1#7cf82f438a03ce14818443896c4dad962bab2e65"
 dependencies = [
  "curve25519-dalek 4.1.3",
  "data-encoding",
@@ -6616,7 +6616,7 @@ dependencies = [
 [[package]]
 name = "iroh-fedimint"
 version = "0.35.0"
-source = "git+https://github.com/fedibtc/iroh?rev=7cf82f438a03ce14818443896c4dad962bab2e65#7cf82f438a03ce14818443896c4dad962bab2e65"
+source = "git+https://github.com/fedibtc/iroh?branch=roboman%2Firoh-fedimint-0.35-fedi1#7cf82f438a03ce14818443896c4dad962bab2e65"
 dependencies = [
  "aead",
  "anyhow",
@@ -6801,7 +6801,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "0.35.0"
-source = "git+https://github.com/fedibtc/iroh?rev=7cf82f438a03ce14818443896c4dad962bab2e65#7cf82f438a03ce14818443896c4dad962bab2e65"
+source = "git+https://github.com/fedibtc/iroh?branch=roboman%2Firoh-fedimint-0.35-fedi1#7cf82f438a03ce14818443896c4dad962bab2e65"
 dependencies = [
  "anyhow",
  "bytes",

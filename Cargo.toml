@@ -428,6 +428,6 @@ lto = "thin"
 # leaks every unanswered disco ping (fedibtc/iroh
 # `roboman/iroh-fedimint-0.35-fedi1`). `iroh-base` and `iroh-relay` come from
 # the same checkout because git `iroh-fedimint` uses them by path.
-iroh-base = { git = "https://github.com/fedibtc/iroh", rev = "7cf82f438a03ce14818443896c4dad962bab2e65" }
-iroh-fedimint = { git = "https://github.com/fedibtc/iroh", rev = "7cf82f438a03ce14818443896c4dad962bab2e65" }
-iroh-relay = { git = "https://github.com/fedibtc/iroh", rev = "7cf82f438a03ce14818443896c4dad962bab2e65" }
+iroh-base = { git = "https://github.com/fedibtc/iroh", branch = "roboman/iroh-fedimint-0.35-fedi1" }
+iroh-fedimint = { git = "https://github.com/fedibtc/iroh", branch = "roboman/iroh-fedimint-0.35-fedi1" }
+iroh-relay = { git = "https://github.com/fedibtc/iroh", branch = "roboman/iroh-fedimint-0.35-fedi1" }
