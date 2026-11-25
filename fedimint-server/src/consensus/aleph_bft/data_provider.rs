@@ -11,6 +11,7 @@ use fedimint_core::{PeerId, TransactionId};
 use tokio::sync::watch;
 
 use crate::LOG_CONSENSUS;
+use crate::consensus::engine::ScheduledShutdown;
 
 #[derive(
     Clone, Debug, PartialEq, Eq, Hash, parity_scale_codec::Encode, parity_scale_codec::Decode,
@@ -164,6 +165,7 @@ pub struct DataProvider {
     pending_changes: watch::Receiver<PendingBatchesState>,
     park_deadline: Option<Instant>,
     quiescence: watch::Receiver<bool>,
+    shutdown: watch::Receiver<Option<ScheduledShutdown>>,
 }
 
 impl DataProvider {
@@ -174,6 +176,7 @@ impl DataProvider {
         is_recovery: bool,
         pending_batches: PendingBatches,
         park_deadline: Option<Instant>,
+        shutdown: watch::Receiver<Option<ScheduledShutdown>>,
     ) -> Self {
         Self {
             mempool_item_receiver,
@@ -186,7 +189,17 @@ impl DataProvider {
             pending_batches,
             park_deadline,
             quiescence: fedimint_server_core::quiescence::subscribe(),
+            shutdown,
         }
+    }
+
+    /// Whether an admin scheduled a shutdown at the end of this session. A
+    /// guardian transfer or a coordinated upgrade then waits for the session
+    /// to end, so we complete it as fast as without quiescence.
+    fn shutdown_due(&mut self) -> bool {
+        self.shutdown
+            .borrow_and_update()
+            .is_some_and(|scheduled| scheduled.session <= self.pending_batches.session)
     }
 
     /// Whether the item is not a transaction we already attached to a unit.
@@ -262,12 +275,14 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
             // units without data such that the broadcast grows the dag and orders it.
             // Otherwise there is no work to be done and we go quiescent until an item
             // is submitted to us, a peer's batch or a unit of this round arrives, the
-            // session ends, the park deadline passes, or quiescence is turned off.
+            // session ends, the park deadline passes, quiescence is turned off, or a
+            // shutdown is scheduled at the end of this session.
             let park_deadline = self.park_deadline?;
 
             if !*self.quiescence.borrow_and_update()
                 || Instant::now() >= park_deadline
                 || !self.pending_changes.borrow_and_update().idle_at(round)
+                || self.shutdown_due()
             {
                 return None;
             }
@@ -294,6 +309,11 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
                 _ = self.quiescence.changed() => {}
                 // We hold the sender ourselves.
                 _ = self.pending_changes.changed() => {}
+                changed = self.shutdown.changed() => {
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
                 () = tokio::time::sleep_until(park_deadline.into()) => {}
             }
         }
@@ -310,6 +330,7 @@ mod tests {
     use fedimint_core::transaction::{Transaction, TransactionSignature};
 
     use super::*;
+    use crate::consensus::engine::ShutdownRequest;
 
     const PARKED: Duration = Duration::from_millis(300);
 
@@ -341,6 +362,7 @@ mod tests {
         round: Round,
         mempool: async_channel::Sender<ConsensusItem>,
         signature: watch::Sender<Option<schnorr::Signature>>,
+        shutdown: watch::Sender<Option<ScheduledShutdown>>,
         batches: PendingBatches,
         _timestamps: async_channel::Receiver<Instant>,
     }
@@ -349,6 +371,7 @@ mod tests {
         let (mempool, mempool_receiver) = async_channel::unbounded();
         let (signature, signature_receiver) = watch::channel(None);
         let (timestamp_sender, timestamps) = async_channel::unbounded();
+        let (shutdown, shutdown_receiver) = watch::channel(None);
         let batches = PendingBatches::new(SESSION);
         Harness {
             provider: DataProvider::new(
@@ -358,10 +381,12 @@ mod tests {
                 false,
                 batches.clone(),
                 park_deadline,
+                shutdown_receiver,
             ),
             round: 0,
             mempool,
             signature,
+            shutdown,
             batches,
             _timestamps: timestamps,
         }
@@ -649,6 +674,29 @@ mod tests {
             })
             .await;
         assert_eq!(data, Some(UnitData::Signature(signature.serialize())));
+
+        // A shutdown scheduled after a later session does not wake a parked
+        // provider, but one at the end of this session does, and it then creates
+        // units without parking so the session completes promptly.
+        let mut h = harness(Some(far_deadline()));
+        assert!(h.parks().await);
+        h.shutdown.send_replace(Some(ScheduledShutdown {
+            session: SESSION + 1,
+            request: ShutdownRequest::AtSession,
+        }));
+        assert!(h.parks().await);
+        let shutdown = h.shutdown.clone();
+        let data = h
+            .woken_by(move || {
+                shutdown.send_replace(Some(ScheduledShutdown {
+                    session: SESSION,
+                    request: ShutdownRequest::AfterCurrentSession,
+                }));
+            })
+            .await;
+        assert_eq!(data, None);
+        assert_eq!(h.returns().await, None);
+        assert_eq!(h.returns().await, None);
 
         // A parked provider resumes creating units at its park deadline.
         let deadline = Instant::now() + Duration::from_millis(150);

@@ -425,6 +425,7 @@ impl ConsensusEngine {
                         is_recovery,
                         pending_batches.clone(),
                         park_deadline,
+                        self.shutdown_receiver.clone(),
                     ),
                     FinalizationHandler::new(
                         unit_data_sender,
