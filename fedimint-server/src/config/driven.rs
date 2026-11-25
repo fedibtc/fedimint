@@ -56,6 +56,11 @@ use crate::net::p2p_connector::dns_sanitize;
 /// Boolean environment switch selecting driven DKG over the stdin socket.
 pub const FM_DKG_CTRL_ENV: &str = "FM_DKG_CTRL";
 
+/// JSON [`Features`] a fedimintd 0.13 process starts with (fedibtc fork).
+/// This line does not read it; it is here so a parent linking this line can
+/// drive the 0.13 line, which shares this wire type.
+pub const FM_FEATURES_ENV: &str = "FM_FEATURES";
+
 /// Current driven-DKG wire protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
 
@@ -138,13 +143,21 @@ pub enum ParentMessage {
 /// fork).
 ///
 /// Each frame is the complete set. A field missing from a frame is off, so a
-/// new switch is a new field that defaults to off.
+/// new switch is a new field that defaults to off. A kill switch for a new
+/// behaviour is therefore named for the old behaviour it restores.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Features {
     /// Create AlephBFT units only while there is something to order
     /// ([`fedimint_server_core::quiescence`]).
     pub aleph_quiescence: bool,
+    /// Kill switch for the 0.13 line: give iroh endpoints 0.12's QUIC
+    /// timeouts. Fixed at process start, so only [`FM_FEATURES_ENV`] sets it.
+    /// This line always has them and ignores the field.
+    pub iroh_legacy_timeouts: bool,
+    /// Kill switch for the 0.13 line: vote the walletv2 block count as 0.12
+    /// does. This line always does and ignores the field.
+    pub walletv2_legacy_vote_delay: bool,
 }
 
 impl Features {
@@ -1058,6 +1071,7 @@ mod tests {
         features
             .set(&Features {
                 aleph_quiescence: true,
+                ..Features::default()
             })
             .await
             .unwrap();
