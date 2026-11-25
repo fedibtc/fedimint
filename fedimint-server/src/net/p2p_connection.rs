@@ -99,6 +99,14 @@ pub trait IP2PConnection<M>: Send + Sync + 'static {
         None
     }
 
+    /// Why the transport closed this connection, as a fixed category, or
+    /// `None` while it is open or when the transport does not say (fedibtc
+    /// fork). Separates idle timeouts from peer closes and resets in the
+    /// shareable disconnect event.
+    fn close_kind(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Get the transport counters of this live connection, if the transport
     /// keeps them.
     fn transport_stats(&self) -> Option<P2PTransportStats> {
@@ -258,6 +266,18 @@ where
         Some(iroh::endpoint::Connection::rtt(self))
     }
 
+    fn close_kind(&self) -> Option<&'static str> {
+        use iroh::endpoint::ConnectionError as E;
+        Some(match self.close_reason()? {
+            E::TimedOut => "idle_timeout",
+            E::ApplicationClosed(_) => "peer_closed",
+            E::ConnectionClosed(_) => "transport_closed",
+            E::Reset => "reset",
+            E::LocallyClosed => "locally_closed",
+            E::VersionMismatch | E::TransportError(_) | E::CidsExhausted => "transport_error",
+        })
+    }
+
     fn transport_stats(&self) -> Option<P2PTransportStats> {
         let stats = iroh::endpoint::Connection::stats(self);
         Some(P2PTransportStats {
@@ -309,6 +329,18 @@ where
 
     async fn receive(&self) -> anyhow::Result<DynIP2PFrame<M>> {
         Ok(self.accept_uni().await?.into_dyn())
+    }
+
+    fn close_kind(&self) -> Option<&'static str> {
+        use iroh_next::endpoint::ConnectionError as E;
+        Some(match self.close_reason()? {
+            E::TimedOut => "idle_timeout",
+            E::ApplicationClosed(_) => "peer_closed",
+            E::ConnectionClosed(_) => "transport_closed",
+            E::Reset => "reset",
+            E::LocallyClosed => "locally_closed",
+            E::VersionMismatch | E::TransportError(_) | E::CidsExhausted => "transport_error",
+        })
     }
 
     fn rtt(&self) -> Option<Duration> {

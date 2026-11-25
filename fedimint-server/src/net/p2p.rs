@@ -325,6 +325,8 @@ enum SendHalt<M> {
     Shutdown,
     /// The connection failed and should be re-established.
     Failed(anyhow::Error),
+    /// A send did not complete within [`SEND_TIMEOUT`].
+    Stalled,
     /// The peer opened a replacement connection that supersedes this one.
     Replaced(DynP2PConnection<M>),
     /// The connection exceeded the maximum age and should be re-established.
@@ -332,10 +334,46 @@ enum SendHalt<M> {
 }
 
 enum ReceiveHalt {
-    /// The connection failed and should be re-established.
+    /// Accepting the next frame failed: the connection failed and should be
+    /// re-established.
     Failed(anyhow::Error),
+    /// Reading or decoding an accepted frame failed.
+    FrameFailed(anyhow::Error),
     /// The send half halted and the receive half stopped between frames.
     Stopped,
+}
+
+/// Whether the receive half finished its frame after the send half halted.
+#[derive(Clone, Copy)]
+enum ReceiveDrain {
+    /// Nothing to drain: the receive half itself halted, or shutdown.
+    NotNeeded,
+    /// The receive half stopped between frames.
+    Drained,
+    /// The receive half was dropped after [`RECEIVE_DRAIN_TIMEOUT`], with any
+    /// frame it was reading.
+    TimedOut,
+}
+
+impl ReceiveDrain {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotNeeded => "not_needed",
+            Self::Drained => "drained",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Why a connection ended, in fixed categories for the shareable disconnect
+/// event (fedibtc fork).
+struct Disconnect {
+    /// Which half halted, and how.
+    reason: &'static str,
+    /// [`IP2PConnection::close_kind`] when the connection ended.
+    close_kind: Option<&'static str>,
+    receive_drain: ReceiveDrain,
+    connected_for: Duration,
 }
 
 impl<M: Send + 'static> P2PConnectionStateMachine<M> {
@@ -414,6 +452,7 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
 
         // What this connection's counters were when last added to the metrics.
         let mut recorded_transport = P2PTransportStats::default();
+        let connected_at = Instant::now();
 
         loop {
             tokio::select! {
@@ -423,18 +462,36 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                     // cancel-safe, so the receive half is stopped between frames
                     // rather than dropped here. Shutdown is the exception: nothing
                     // reads the incoming queue after it.
-                    if !matches!(halt, SendHalt::Shutdown) {
+                    let receive_drain = if matches!(halt, SendHalt::Shutdown) {
+                        ReceiveDrain::NotNeeded
+                    } else {
                         stop_receiving.notify_one();
 
-                        let _ = timeout(RECEIVE_DRAIN_TIMEOUT, &mut receive_loop).await;
-                    }
+                        match timeout(RECEIVE_DRAIN_TIMEOUT, &mut receive_loop).await {
+                            Ok(_) => ReceiveDrain::Drained,
+                            Err(_) => ReceiveDrain::TimedOut,
+                        }
+                    };
+                    let disconnect = |error, reason| {
+                        self.disconnect(error, Disconnect {
+                            reason,
+                            close_kind: connection.close_kind(),
+                            receive_drain,
+                            connected_for: connected_at.elapsed(),
+                        })
+                    };
 
                     return match halt {
                         SendHalt::Shutdown => None,
-                        SendHalt::Failed(e) => Some(self.disconnect(e)),
-                        SendHalt::MaxAge => {
-                            Some(self.disconnect(anyhow!("Connection exceeded the maximum age")))
-                        }
+                        SendHalt::Failed(e) => Some(disconnect(e, "send_failed")),
+                        SendHalt::Stalled => Some(disconnect(
+                            anyhow!("Sending a message did not complete within {SEND_TIMEOUT:?}"),
+                            "send_stalled",
+                        )),
+                        SendHalt::MaxAge => Some(disconnect(
+                            anyhow!("Connection exceeded the maximum age"),
+                            "max_age",
+                        )),
                         SendHalt::Replaced(connection) => {
                             info!(target: LOG_NET_PEER, "Connected to peer");
 
@@ -456,9 +513,18 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                 },
                 halt = &mut receive_loop => {
                     self.record_transport(&connection, &mut recorded_transport);
-                    return Some(self.disconnect(match halt {
-                        ReceiveHalt::Failed(e) => e,
-                        ReceiveHalt::Stopped => anyhow!("Receive half stopped unprompted"),
+                    let (error, reason) = match halt {
+                        ReceiveHalt::Failed(e) => (e, "receive_failed"),
+                        ReceiveHalt::FrameFailed(e) => (e, "frame_failed"),
+                        ReceiveHalt::Stopped => {
+                            (anyhow!("Receive half stopped unprompted"), "receive_stopped")
+                        }
+                    };
+                    return Some(self.disconnect(error, Disconnect {
+                        reason,
+                        close_kind: connection.close_kind(),
+                        receive_drain: ReceiveDrain::NotNeeded,
+                        connected_for: connected_at.elapsed(),
                     }));
                 },
                 Some(()) = async {
@@ -533,11 +599,7 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
             match sent {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return SendHalt::Failed(e),
-                Err(_) => {
-                    return SendHalt::Failed(anyhow!(
-                        "Sending a message did not complete within {SEND_TIMEOUT:?}"
-                    ));
-                }
+                Err(_) => return SendHalt::Stalled,
             }
         }
     }
@@ -576,7 +638,7 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
                         debug!(target: LOG_NET_PEER, "Incoming message channel is full");
                     }
                 }
-                Err(e) => return ReceiveHalt::Failed(e),
+                Err(e) => return ReceiveHalt::FrameFailed(e),
             }
         }
     }
@@ -649,7 +711,7 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
         *recorded = current;
     }
 
-    fn disconnect(&self, error: anyhow::Error) -> P2PConnectionSMState<M> {
+    fn disconnect(&self, error: anyhow::Error, disconnect: Disconnect) -> P2PConnectionSMState<M> {
         let last_error = error.fmt_compact().to_string();
 
         info!(
@@ -657,12 +719,18 @@ impl<M: Send + 'static> P2PConnectionSMCommon<M> {
             error = %last_error,
             "Disconnected from peer"
         );
+        // Every field is a fixed category or a duration, so the event can show
+        // which part of the 0.13 connection loop or transport ended the link.
         warn!(
             target: LOG_NET_PEER,
             safe_to_share = true,
             stage = "p2p_connection",
             failure_kind = "disconnected",
             peer_id = %self.peer_id,
+            reason = disconnect.reason,
+            close_kind = disconnect.close_kind.unwrap_or("open"),
+            receive_drain = disconnect.receive_drain.as_str(),
+            connected_secs = disconnect.connected_for.as_secs(),
             "Disconnected from DKG peer"
         );
 

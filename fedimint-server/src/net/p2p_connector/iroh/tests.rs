@@ -89,5 +89,13 @@ async fn production_connectors_exchange_messages_over_direct_override() -> anyho
     assert_eq!(incoming.receive().await?.read_to_end().await?, 42);
     assert_eq!(outgoing.connection_type(), Some(ConnectionType::Direct));
 
+    // The disconnect event's close kind: none while open, a peer close on
+    // the side that did not close.
+    assert_eq!(outgoing.close_kind(), None);
+    assert_eq!(incoming.close_kind(), None);
+    drop(outgoing);
+    assert!(incoming.receive().await.is_err());
+    assert_eq!(incoming.close_kind(), Some("peer_closed"));
+
     Ok(())
 }
