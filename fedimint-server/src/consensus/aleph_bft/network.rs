@@ -117,8 +117,7 @@ impl aleph_bft::Network<NetworkData> for Network {
                                 .filter_map(|unit| unit.data.as_ref())
                                 .all(UnitData::is_valid)
                             {
-                                // a quiescent data provider wakes up for our peers' batches and
-                                // for peers that are ahead of it
+                                // a quiescent data provider wakes up for our peers' batches
                                 for unit in &units {
                                     self.pending_batches.heard(unit);
                                 }

@@ -127,7 +127,7 @@ name = "fedimint"
 # Stores a round's units in one backup write; see fedimint-server's
 # `aleph_bft::backup`. This is fedibtc/AlephBFT tag v0.36.0-fedi1. Switch back
 # to a crates.io release once it includes it.
-aleph-bft = { package = "fedimint-aleph-bft", git = "https://github.com/fedibtc/AlephBFT", rev = "56c0bf5710bdcdc2547716e972a25ab2b6d9c322", default-features = false }
+aleph-bft = { package = "fedimint-aleph-bft", git = "https://github.com/fedibtc/AlephBFT", rev = "7b1de47ce3d10cf56f44c31929848696f3c880c1", default-features = false }
 anyhow = "1.0.98"
 aquamarine = "0.5.0"
 argon2 = "0.5.3"
