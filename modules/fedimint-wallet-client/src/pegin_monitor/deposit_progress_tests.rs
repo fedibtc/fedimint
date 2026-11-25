@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    ScriptBuf, blocks_until_claimable, deposit_confirmations, required_confirmations,
+    unique_deposit_outputs,
+};
 
 #[test]
 fn confirmations_reach_required_exactly_when_claimable() {
