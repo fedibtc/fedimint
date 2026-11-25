@@ -59,6 +59,7 @@ use crate::metrics::{
     CONSENSUS_ITEM_PROCESSING_MODULE_AUDIT_DURATION_SECONDS, CONSENSUS_ITEMS_PROCESSED_TOTAL,
     CONSENSUS_ORDERING_LATENCY_SECONDS, CONSENSUS_PEER_CONTRIBUTION_SESSION_IDX,
     CONSENSUS_SESSION_COUNT, CONSENSUS_SESSIONS_COMPLETED,
+    CONSENSUS_TRANSACTION_ORDERING_LATENCY_SECONDS,
 };
 
 // The name of the directory where the database checkpoints are stored.
@@ -409,8 +410,15 @@ impl ConsensusEngine {
         // resumed from our backup after a restart, as it may hold batches of ours
         // that we no longer count. Otherwise we go quiescent only until half of the
         // session timeout has passed, which leaves the other half to complete the
-        // session's remaining rounds before the timeout above restarts us.
-        let park_deadline = (!is_recovery).then(|| Instant::now() + self.session_timeout / 2);
+        // session's remaining rounds before the timeout above restarts us. Peers
+        // without quiescence restart on their own session timeout, so a park
+        // that outlasts theirs restarts them in every idle session: run all
+        // guardians of a federation with the same session timeout.
+        let park_deadline = if is_recovery {
+            None
+        } else {
+            Instant::now().checked_add(self.session_timeout / 2)
+        };
 
         let unordered_batches = UnorderedBatches::default();
 
@@ -539,6 +547,8 @@ impl ConsensusEngine {
                     }
 
                     if let Some(UnitData::Batch(bytes)) = ordered_unit.data {
+                        let items = Vec::<ConsensusItem>::consensus_decode_whole(&bytes, &self.decoders());
+
                         if ordered_unit.creator == self.identity() {
                             match timestamp_receiver.try_recv() {
                                 Ok(timestamp) => {
@@ -550,6 +560,12 @@ impl ConsensusEngine {
                                     self.ord_latency_sender.send_replace(Some(latency));
 
                                     CONSENSUS_ORDERING_LATENCY_SECONDS.observe(timestamp.elapsed().as_secs_f64());
+
+                                    if items.as_ref().is_ok_and(|items| {
+                                        items.iter().any(|item| matches!(item, ConsensusItem::Transaction(..)))
+                                    }) {
+                                        CONSENSUS_TRANSACTION_ORDERING_LATENCY_SECONDS.observe(timestamp.elapsed().as_secs_f64());
+                                    }
                                 }
                                 Err(err) => {
                                     debug!(target: LOG_CONSENSUS, err = %err.fmt_compact(), "Missing submission timestamp. This is normal in recovery");
@@ -557,7 +573,7 @@ impl ConsensusEngine {
                             }
                         }
 
-                        match Vec::<ConsensusItem>::consensus_decode_whole(&bytes, &self.decoders()) {
+                        match items {
                             Ok(items) => {
                                 for item in items {
                                     if let Ok(()) = self.process_consensus_item(

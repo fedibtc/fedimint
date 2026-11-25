@@ -59,3 +59,6 @@ impl aleph_bft::FinalizationHandler<UnitData> for FinalizationHandler {
             .ok();
     }
 }
+
+#[cfg(test)]
+mod tests;
