@@ -2788,8 +2788,7 @@ impl GatewayConnection for RealGatewayConnection {
         gateway: LightningGateway,
         payload: PayInvoicePayload,
     ) -> Result<String, GatewayPayError> {
-        let preimage: String = self
-            .api
+        self.api
             .request(
                 &gateway.api,
                 Method::POST,
@@ -2800,9 +2799,7 @@ impl GatewayConnection for RealGatewayConnection {
             .map_err(|e| GatewayPayError::GatewayInternalError {
                 error_code: None,
                 error_message: e.to_string(),
-            })?;
-        let length = preimage.len();
-        Ok(preimage[1..length - 1].to_string())
+            })
     }
 }
 
