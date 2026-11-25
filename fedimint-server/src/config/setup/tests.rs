@@ -5,6 +5,7 @@ use base64::Engine as _;
 use bitcoin::Network;
 use fedimint_core::db::IRawDatabaseExt;
 use fedimint_core::db::mem_impl::MemDatabase;
+use fedimint_core::version::DkgVersion;
 use fedimint_server_core::setup_ui::ISetupApi;
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -146,13 +147,51 @@ async fn rejects_peer_setup_code_with_different_network() {
     );
 }
 
+/// Re-encode `setup_code` as a guardian on `version` would have sent it.
+fn with_fedimint_version(setup_code: &str, version: &str) -> String {
+    let mut code = decode_setup_code(setup_code);
+    code.fedimint_version = DkgVersion::parse(version).expect("valid version");
+    base32::encode_prefixed(FEDIMINT_PREFIX, &code)
+}
+
 #[tokio::test]
-async fn rejects_peer_setup_code_from_different_fedimint_minor() {
-    let api = setup_api_with_version(Network::Regtest, "1.2.3-alpha");
-    let peer_api = setup_api_with_version(Network::Regtest, "1.3.0-beta");
+async fn advertises_the_dkg_compatibility_version_with_our_vendor() {
+    for (code_version, advertised) in [
+        ("0.13.1-alpha+fedi", "0.12.0+fedi"),
+        ("0.13.0", "0.12.0"),
+        ("1.4.2+acme", "0.12.0+acme"),
+    ] {
+        let api = setup_api_with_version(Network::Regtest, code_version);
+        let code = decode_setup_code(&setup_code(&api, "local").await);
+        assert_eq!(code.fedimint_version.to_string(), advertised);
+    }
+}
+
+#[tokio::test]
+async fn accepts_a_peer_on_the_fedi_0_12_line() {
+    let api = setup_api_with_version(Network::Regtest, "0.13.1-alpha+fedi");
+    let peer_api = setup_api_with_version(Network::Regtest, "0.13.1-alpha+fedi");
 
     setup_code(&api, "local").await;
-    let peer_code = setup_code(&peer_api, "peer").await;
+    // What a v0.12.0-fedi guardian sends.
+    let peer_code = with_fedimint_version(&setup_code(&peer_api, "peer").await, "0.12.0+fedi");
+
+    let added_peer = api
+        .add_peer_setup_code(peer_code)
+        .await
+        .expect("a 0.12 Fedi guardian should be accepted");
+
+    assert_eq!(added_peer, "peer");
+}
+
+#[tokio::test]
+async fn rejects_peer_setup_code_from_different_fedimint_minor() {
+    let api = setup_api_with_version(Network::Regtest, "0.13.1-alpha+fedi");
+    let peer_api = setup_api_with_version(Network::Regtest, "0.13.1-alpha+fedi");
+
+    setup_code(&api, "local").await;
+    // What a guardian that claims its real 0.13 version sends.
+    let peer_code = with_fedimint_version(&setup_code(&peer_api, "peer").await, "0.13.0+fedi");
 
     let err = api
         .add_peer_setup_code(peer_code)
@@ -161,18 +200,18 @@ async fn rejects_peer_setup_code_from_different_fedimint_minor() {
 
     assert!(
         err.to_string()
-            .contains("Guardian uses Fedimint version 1.3.0 but we use 1.2.3")
+            .contains("Guardian uses Fedimint version 0.13.0+fedi but we use 0.12.0+fedi"),
+        "{err}"
     );
 }
 
 #[tokio::test]
 async fn accepts_peer_setup_code_from_same_vendor_with_patch_skew() {
-    let api = setup_api_with_version(Network::Regtest, "1.2.3-alpha+fedi");
-    let peer_api = setup_api_with_version(Network::Regtest, "1.2.4-beta+fedi");
+    let api = setup_api_with_version(Network::Regtest, "0.13.1-alpha+fedi");
+    let peer_api = setup_api_with_version(Network::Regtest, "0.13.1-alpha+fedi");
 
-    let local_code = setup_code(&api, "local").await;
-    let peer_code = setup_code(&peer_api, "peer").await;
-    let peer_setup_code = decode_setup_code(&peer_code);
+    setup_code(&api, "local").await;
+    let peer_code = with_fedimint_version(&setup_code(&peer_api, "peer").await, "0.12.4+fedi");
 
     let added_peer = api
         .add_peer_setup_code(peer_code)
@@ -180,21 +219,18 @@ async fn accepts_peer_setup_code_from_same_vendor_with_patch_skew() {
         .expect("peer setup code from the same Fedimint minor should be accepted");
 
     assert_eq!(added_peer, "peer");
-    assert_eq!(
-        decode_setup_code(&local_code).fedimint_version.to_string(),
-        "1.2.3+fedi"
-    );
-    assert_eq!(peer_setup_code.fedimint_version.to_string(), "1.2.4+fedi");
 }
 
 #[tokio::test]
 async fn rejects_peer_setup_code_from_different_fedimint_vendor() {
-    for (local_version, peer_version) in [("1.2.3+fedi", "1.2.4"), ("1.2.3+fedi", "1.2.4+acme")] {
+    for (local_version, peer_version) in [("0.13.1+fedi", "0.13.1"), ("0.13.1+fedi", "0.13.1+acme")]
+    {
         let api = setup_api_with_version(Network::Regtest, local_version);
         let peer_api = setup_api_with_version(Network::Regtest, peer_version);
 
         setup_code(&api, "local").await;
         let peer_code = setup_code(&peer_api, "peer").await;
+        let advertised = decode_setup_code(&peer_code).fedimint_version.to_string();
 
         let err = api
             .add_peer_setup_code(peer_code)
@@ -203,7 +239,8 @@ async fn rejects_peer_setup_code_from_different_fedimint_vendor() {
 
         assert!(
             err.to_string()
-                .contains(&format!("Guardian uses Fedimint version {peer_version}"))
+                .contains(&format!("Guardian uses Fedimint version {advertised} but")),
+            "{err}"
         );
     }
 }
@@ -220,15 +257,16 @@ async fn rejects_malformed_local_fedimint_version() {
 
 #[tokio::test]
 async fn rejects_different_fedimint_minor_during_dkg() {
-    let api = setup_api_with_version(Network::Regtest, "1.2.3-alpha");
-    let peer_api = setup_api_with_version(Network::Regtest, "1.3.0-beta");
+    let api = setup_api_with_version(Network::Regtest, "0.13.1-alpha+fedi");
+    let peer_api = setup_api_with_version(Network::Regtest, "0.13.1-alpha+fedi");
 
     setup_code(&api, "local").await;
-    let peer_code = setup_code(&peer_api, "peer").await;
-    let peer_code = base32::decode_prefixed(FEDIMINT_PREFIX, &peer_code)
-        .expect("peer setup code should decode");
-
-    api.state.lock().await.setup_codes.insert(peer_code);
+    let peer_code = with_fedimint_version(&setup_code(&peer_api, "peer").await, "0.13.0+fedi");
+    api.state
+        .lock()
+        .await
+        .setup_codes
+        .insert(decode_setup_code(&peer_code));
 
     let err = api
         .start_dkg()
@@ -237,7 +275,8 @@ async fn rejects_different_fedimint_minor_during_dkg() {
 
     assert!(
         err.to_string()
-            .contains("Guardian uses Fedimint version 1.3.0 but we use 1.2.3")
+            .contains("Guardian uses Fedimint version 0.13.0+fedi but we use 0.12.0+fedi"),
+        "{err}"
     );
 }
 
@@ -277,12 +316,14 @@ async fn accepts_same_vendor_patch_versions_during_dkg() {
 
 #[tokio::test]
 async fn rejects_different_fedimint_vendor_during_dkg() {
-    for (local_version, peer_version) in [("1.2.3+fedi", "1.2.4"), ("1.2.3+fedi", "1.2.4+acme")] {
+    for (local_version, peer_version) in [("0.13.1+fedi", "0.13.1"), ("0.13.1+fedi", "0.13.1+acme")]
+    {
         let api = setup_api_with_version(Network::Regtest, local_version);
         let peer_api = setup_api_with_version(Network::Regtest, peer_version);
 
         setup_code(&api, "local").await;
         let peer_code = decode_setup_code(&setup_code(&peer_api, "peer").await);
+        let advertised = peer_code.fedimint_version.to_string();
         api.state.lock().await.setup_codes.insert(peer_code);
 
         let err = api
@@ -291,7 +332,8 @@ async fn rejects_different_fedimint_vendor_during_dkg() {
             .expect_err("DKG should reject a peer from a different vendor");
         assert!(
             err.to_string()
-                .contains(&format!("Guardian uses Fedimint version {peer_version}"))
+                .contains(&format!("Guardian uses Fedimint version {advertised} but")),
+            "{err}"
         );
     }
 }

@@ -338,10 +338,11 @@ impl ServerConfig {
             // Setup validates untrusted code versions before config generation.
             // Keep this lower-level API usable by test helpers that use opaque
             // version strings, as it was before DKG compatibility was added.
-            code_version: fedimint_core::version::DkgVersion::parse(&code_version).map_or_else(
-                |_| fedimint_core::version::release_version(&code_version).to_owned(),
-                |version| version.compatibility_version().to_string(),
-            ),
+            code_version: fedimint_core::version::DkgVersion::dkg_compatibility(&code_version)
+                .map_or_else(
+                    |_| fedimint_core::version::release_version(&code_version).to_owned(),
+                    |version| version.compatibility_version().to_string(),
+                ),
             version: CORE_CONSENSUS_VERSION,
             broadcast_public_keys,
             broadcast_rounds_per_session: if is_running_in_test_env() {

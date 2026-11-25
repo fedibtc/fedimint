@@ -44,7 +44,26 @@ pub struct DkgVersionCompatibility {
     vendor: Option<BuildMetadata>,
 }
 
+/// Fedi: the release version this fork takes part in DKG as.
+///
+/// The 0.13 line keeps 0.12's core and module consensus versions and database
+/// formats, so its guardians form federations together with 0.12 guardians.
+/// DKG compares major.minor, so they claim 0.12 there and nowhere else: the
+/// API, telemetry, and `version_hash` keep the real version.
+pub const DKG_COMPATIBILITY_VERSION: &str = "0.12.0";
+
 impl DkgVersion {
+    /// The version code built as `code_version` takes part in DKG as:
+    /// [`DKG_COMPATIBILITY_VERSION`] with `code_version`'s vendor.
+    pub fn dkg_compatibility(code_version: &str) -> Result<Self, semver::Error> {
+        let mut version = Version::parse(DKG_COMPATIBILITY_VERSION)?;
+        version.build = Version::parse(code_version)?.build;
+
+        Ok(Self {
+            setup_code_version: Box::new(version),
+        })
+    }
+
     /// Parse a semantic version and derive its setup-code and DKG forms.
     pub fn parse(version: &str) -> Result<Self, semver::Error> {
         let mut setup_code_version = Version::parse(version)?;

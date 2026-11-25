@@ -30,28 +30,20 @@ fn server_config_with_code_version(code_version: &str) -> ServerConfig {
 
 #[test]
 fn server_config_uses_dkg_compatibility_identity_as_consensus_code_version() {
-    let patch_3 = server_config_with_code_version("1.2.3-alpha+fedi");
-    let patch_4 = server_config_with_code_version("1.2.4+fedi");
-    let upstream = server_config_with_code_version("1.2.4");
-    let other_vendor = server_config_with_code_version("1.2.4+acme");
-    let next_minor = server_config_with_code_version("1.3.0");
+    let line_0_13 = server_config_with_code_version("0.13.1-alpha+fedi");
+    let upstream = server_config_with_code_version("0.13.1");
+    let other_vendor = server_config_with_code_version("0.13.1+acme");
 
-    assert_eq!(patch_3.consensus.code_version, "1.2+fedi");
-    assert_eq!(
-        patch_3.consensus.code_version,
-        patch_4.consensus.code_version
-    );
+    // What v0.12.0-fedi guardians write, so both lines agree on the consensus
+    // config checksum when they form a federation together.
+    assert_eq!(line_0_13.consensus.code_version, "0.12+fedi");
     assert_ne!(
-        patch_3.consensus.code_version,
+        line_0_13.consensus.code_version,
         upstream.consensus.code_version
     );
     assert_ne!(
-        patch_3.consensus.code_version,
+        line_0_13.consensus.code_version,
         other_vendor.consensus.code_version
-    );
-    assert_ne!(
-        patch_3.consensus.code_version,
-        next_minor.consensus.code_version
     );
 }
 

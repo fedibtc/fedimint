@@ -372,8 +372,8 @@ impl ISetupApi for SetupApi {
             "A restore is already in progress"
         );
 
-        let fedimint_version =
-            DkgVersion::parse(&self.code_version_str).context("Invalid local Fedimint version")?;
+        let fedimint_version = DkgVersion::dkg_compatibility(&self.code_version_str)
+            .context("Invalid local Fedimint version")?;
 
         let lp = if self.settings.enable_iroh {
             let iroh_api_sk = if let Ok(var) = std::env::var(FM_IROH_API_SECRET_KEY_OVERRIDE_ENV) {

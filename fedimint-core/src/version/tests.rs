@@ -1,4 +1,4 @@
-use super::{DkgVersion, release_version};
+use super::{DKG_COMPATIBILITY_VERSION, DkgVersion, release_version};
 use crate::encoding::{Decodable, Encodable};
 use crate::module::registry::ModuleDecoderRegistry;
 
@@ -78,4 +78,30 @@ fn dkg_version_rejects_malformed_string_encoding() {
     assert!(
         DkgVersion::consensus_decode_whole(&encoded, &ModuleDecoderRegistry::default()).is_err()
     );
+}
+
+#[test]
+fn dkg_compatibility_claims_the_fedi_0_12_line_with_our_vendor() {
+    let ours = DkgVersion::dkg_compatibility("0.13.1-alpha+fedi").expect("valid version");
+    let fedi_0_12 = DkgVersion::parse("0.12.0+fedi").expect("valid version");
+
+    assert_eq!(DKG_COMPATIBILITY_VERSION, "0.12.0");
+    assert_eq!(ours.setup_code_version().to_string(), "0.12.0+fedi");
+    assert_eq!(
+        ours.compatibility_version(),
+        fedi_0_12.compatibility_version()
+    );
+    assert_ne!(
+        ours.compatibility_version(),
+        DkgVersion::parse("0.13.0+fedi")
+            .expect("valid version")
+            .compatibility_version()
+    );
+    assert_eq!(
+        DkgVersion::dkg_compatibility("0.13.1")
+            .expect("valid version")
+            .to_string(),
+        "0.12.0"
+    );
+    assert!(DkgVersion::dkg_compatibility("not-a-version").is_err());
 }
