@@ -15,9 +15,13 @@
 //! request after any death. [`ChildMessage::ParamsRejected`] and
 //! [`ChildMessage::DkgFailed`] are followed by channel EOF and a nonzero child
 //! exit. Oversized, malformed, or unexpected frames also cause a logged nonzero
-//! exit, potentially without a final protocol message. After
-//! [`ChildMessage::ConsensusStarted`], EOF instead means the setup channel was
-//! successfully retired while the same child continues running consensus.
+//! exit, potentially without a final protocol message.
+//!
+//! [`ChildMessage::ConsensusStarted`] is the child's last frame. The channel
+//! then carries [`Features`] frames from the parent for the rest of the
+//! child's life: each is the complete set of runtime feature switches, applied
+//! as it arrives. Every child process starts with all features off. Parent EOF
+//! leaves the last applied features in place.
 //!
 //! [`PROTOCOL_VERSION`] is incremented for incompatible changes. New optional
 //! map fields may be added within a version; peers must ignore fields they do
@@ -53,7 +57,7 @@ use crate::net::p2p_connector::dns_sanitize;
 pub const FM_DKG_CTRL_ENV: &str = "FM_DKG_CTRL";
 
 /// Current driven-DKG wire protocol version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum encoded CBOR payload size accepted by the protocol.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
@@ -89,7 +93,8 @@ pub enum ChildMessage {
         /// This guardian's configured API URL.
         api_url: String,
     },
-    /// Consensus startup has begun; the child closes the control channel next.
+    /// Consensus startup has begun; the child sends nothing more and reads
+    /// [`Features`] frames from now on.
     ConsensusStarted {},
 }
 
@@ -129,6 +134,56 @@ pub enum ParentMessage {
     },
 }
 
+/// Runtime feature switches the parent sets once consensus runs (fedibtc
+/// fork).
+///
+/// Each frame is the complete set. A field missing from a frame is off, so a
+/// new switch is a new field that defaults to off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Features {
+    /// Create AlephBFT units only while there is something to order
+    /// ([`fedimint_server_core::quiescence`]).
+    pub aleph_quiescence: bool,
+}
+
+impl Features {
+    /// Switch this process to these features.
+    fn apply(&self) {
+        let previous = fedimint_server_core::quiescence::set_enabled(self.aleph_quiescence);
+        if previous != self.aleph_quiescence {
+            tracing::info!(
+                target: fedimint_logging::LOG_CONSENSUS,
+                safe_to_share = true,
+                enabled = self.aleph_quiescence,
+                "Aleph quiescence switched"
+            );
+        }
+    }
+}
+
+/// Apply each [`Features`] frame the parent sends until it closes the
+/// channel. Runs in the child after [`ChildMessage::ConsensusStarted`].
+pub(crate) async fn follow_features<R>(mut control: R)
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        match read_frame::<_, Features>(&mut control).await {
+            Ok(features) => features.apply(),
+            Err(error) if is_eof(&error) => return,
+            Err(error) => {
+                tracing::warn!(
+                    target: fedimint_logging::LOG_CONSENSUS,
+                    error = format_args!("{error:#}"),
+                    "Driven feature channel failed; keeping the current features"
+                );
+                return;
+            }
+        }
+    }
+}
+
 /// Parameters supplied by a parent to start a fresh driven-DKG ceremony.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunDkgParams {
@@ -165,8 +220,8 @@ impl From<RunDkgParams> for ParentMessage {
 /// A validated lifecycle event in a driven-DKG child conversation.
 ///
 /// [`Self::ParamsRejected`] and [`Self::DkgFailed`] end the conversation.
-/// [`Self::ControlChannelRetired`] is the successful terminal event and is
-/// produced only when EOF follows [`Self::ConsensusStarted`].
+/// [`Self::ConsensusStarted`] is the successful last event; the channel then
+/// carries features ([`DrivenDkgClient::into_features`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrivenDkgEvent {
     /// Supplied parameters were rejected before peer contact.
@@ -188,10 +243,8 @@ pub enum DrivenDkgEvent {
         /// This guardian's configured API URL.
         api_url: String,
     },
-    /// Consensus startup has begun; the next valid protocol observation is EOF.
+    /// Consensus startup has begun.
     ConsensusStarted,
-    /// The control channel closed after consensus startup and is retired.
-    ControlChannelRetired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +254,7 @@ enum ParentPhase {
     DkgRunning,
     ConfigPersisted,
     AwaitingConsensus,
-    AwaitingRetirement,
+    ConsensusStarted,
     Terminal,
 }
 
@@ -276,19 +329,19 @@ where
 
     /// Read the next validated lifecycle event.
     ///
-    /// Returns `None` after a terminal failure event or successful channel
-    /// retirement. EOF at any earlier phase is reported as child death.
+    /// Returns `None` after a terminal failure event or
+    /// [`DrivenDkgEvent::ConsensusStarted`]. EOF before either is reported as
+    /// child death.
     pub async fn next_event(&mut self) -> Option<anyhow::Result<DrivenDkgEvent>> {
-        if self.phase == ParentPhase::Terminal {
+        if matches!(
+            self.phase,
+            ParentPhase::Terminal | ParentPhase::ConsensusStarted
+        ) {
             return None;
         }
 
         let message = match read_frame::<_, ChildMessage>(&mut self.stream).await {
             Ok(message) => message,
-            Err(error) if is_eof(&error) && self.phase == ParentPhase::AwaitingRetirement => {
-                self.phase = ParentPhase::Terminal;
-                return Some(Ok(DrivenDkgEvent::ControlChannelRetired));
-            }
             Err(error) => {
                 let phase = self.phase;
                 self.phase = ParentPhase::Terminal;
@@ -336,7 +389,7 @@ where
                 ParentPhase::ConfigPersisted | ParentPhase::AwaitingConsensus,
                 ChildMessage::ConsensusStarted {},
             ) => {
-                self.phase = ParentPhase::AwaitingRetirement;
+                self.phase = ParentPhase::ConsensusStarted;
                 DrivenDkgEvent::ConsensusStarted
             }
             (phase, _) => {
@@ -347,6 +400,38 @@ where
             }
         };
         Some(Ok(event))
+    }
+}
+
+impl<S> DrivenDkgClient<S> {
+    /// Turn the channel of a child whose consensus started into its feature
+    /// channel.
+    pub fn into_features(self) -> anyhow::Result<DrivenFeatures<S>> {
+        ensure!(
+            self.phase == ParentPhase::ConsensusStarted,
+            "Driven-DKG child has not started consensus"
+        );
+        Ok(DrivenFeatures {
+            stream: self.stream,
+        })
+    }
+}
+
+/// Parent-side feature channel of a child that runs consensus.
+#[derive(Debug)]
+pub struct DrivenFeatures<S> {
+    stream: S,
+}
+
+impl<S> DrivenFeatures<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    /// Switch the child to `features`, the complete set.
+    pub async fn set(&mut self, features: &Features) -> anyhow::Result<()> {
+        write_frame(&mut self.stream, features)
+            .await
+            .context("Sending driven features")
     }
 }
 
@@ -878,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn parent_client_validates_happy_path_and_retirement() {
         let (parent, mut child) = tokio::io::duplex(4096);
-        let child_task = tokio::spawn(async move {
+        let child_task = fedimint_core::runtime::spawn("driven test child", async move {
             write_hello(&mut child, ChildState::NeedsParams).await;
             let _: ParentMessage = read_frame(&mut child).await.unwrap();
             write_frame(&mut child, &ChildMessage::DkgStarted {})
@@ -918,17 +1003,13 @@ mod tests {
             DrivenDkgEvent::ConsensusStarted
         );
         child_task.await.unwrap();
-        assert_eq!(
-            client.next_event().await.unwrap().unwrap(),
-            DrivenDkgEvent::ControlChannelRetired
-        );
         assert!(client.next_event().await.is_none());
     }
 
     #[tokio::test]
     async fn parent_client_accepts_already_configured_path() {
         let (parent, mut child) = tokio::io::duplex(1024);
-        tokio::spawn(async move {
+        fedimint_core::runtime::spawn("driven test child", async move {
             write_hello(
                 &mut child,
                 ChildState::AlreadyConfigured {
@@ -953,16 +1034,76 @@ mod tests {
             client.next_event().await.unwrap().unwrap(),
             DrivenDkgEvent::ConsensusStarted
         );
+        assert!(client.next_event().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn features_flow_only_after_consensus_starts() {
+        let (parent, mut child) = tokio::io::duplex(1024);
+        write_hello(&mut child, ChildState::NeedsParams).await;
+        let client = DrivenDkgClient::connect(parent).await.unwrap();
+        assert!(client.into_features().is_err());
+
+        let (parent, mut child) = tokio::io::duplex(1024);
+        write_hello(
+            &mut child,
+            ChildState::AlreadyConfigured {
+                invite_code: "invite".to_string(),
+            },
+        )
+        .await;
+        write_frame(&mut child, &ChildMessage::ConsensusStarted {})
+            .await
+            .unwrap();
+        let mut client = DrivenDkgClient::connect(parent).await.unwrap();
+        client.next_event().await.unwrap().unwrap();
+        let mut features = client.into_features().unwrap();
+        features
+            .set(&Features {
+                aleph_quiescence: true,
+            })
+            .await
+            .unwrap();
+        let read: Features = read_frame(&mut child).await.unwrap();
+        assert!(read.aleph_quiescence);
+    }
+
+    #[tokio::test]
+    async fn features_missing_from_a_frame_are_off() {
+        #[derive(Serialize)]
+        struct Empty {}
+        #[derive(Serialize)]
+        struct Future {
+            aleph_quiescence: bool,
+            not_yet_known: u8,
+        }
+        let (mut parent, mut child) = tokio::io::duplex(1024);
+        write_frame(&mut parent, &Empty {}).await.unwrap();
+        write_frame(
+            &mut parent,
+            &Future {
+                aleph_quiescence: true,
+                not_yet_known: 1,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            client.next_event().await.unwrap().unwrap(),
-            DrivenDkgEvent::ControlChannelRetired
+            read_frame::<_, Features>(&mut child).await.unwrap(),
+            Features::default()
+        );
+        assert!(
+            read_frame::<_, Features>(&mut child)
+                .await
+                .unwrap()
+                .aleph_quiescence
         );
     }
 
     #[tokio::test]
     async fn parent_client_reports_params_rejected_as_terminal() {
         let (parent, mut child) = tokio::io::duplex(1024);
-        tokio::spawn(async move {
+        fedimint_core::runtime::spawn("driven test child", async move {
             write_hello(&mut child, ChildState::NeedsParams).await;
             let _: ParentMessage = read_frame(&mut child).await.unwrap();
             write_frame(
@@ -1015,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn parent_client_rejects_version_mismatch() {
         let (parent, mut child) = tokio::io::duplex(1024);
-        tokio::spawn(async move {
+        fedimint_core::runtime::spawn("driven test child", async move {
             write_frame(
                 &mut child,
                 &ChildMessage::Hello {
@@ -1232,10 +1373,10 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let final_path = parent.path().join("fedimintd");
         fs::create_dir(&final_path).unwrap();
-        fs::write(final_path.join("partial"), b"partial").unwrap();
+        fedimint_core::util::write_new(final_path.join("partial"), b"partial").unwrap();
         let stale_staging = staging_path(&final_path).unwrap();
         fs::create_dir(&stale_staging).unwrap();
-        fs::write(stale_staging.join("stale"), b"stale").unwrap();
+        fedimint_core::util::write_new(stale_staging.join("stale"), b"stale").unwrap();
 
         let staging = prepare_staging(&final_path).unwrap();
         assert!(!final_path.exists());
@@ -1248,7 +1389,7 @@ mod tests {
                 0o700
             );
         }
-        fs::write(staging.join("complete"), b"complete").unwrap();
+        fedimint_core::util::write_new(staging.join("complete"), b"complete").unwrap();
 
         install_staging(&staging, &final_path).unwrap();
 
@@ -1261,7 +1402,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let final_path = parent.path().join("fedimintd");
         fs::create_dir(&final_path).unwrap();
-        fs::write(final_path.join(SALT_FILE), b"existing salt").unwrap();
+        fedimint_core::util::write_new(final_path.join(SALT_FILE), b"existing salt").unwrap();
 
         let error = ensure_no_config_artifacts(&final_path).unwrap_err();
 

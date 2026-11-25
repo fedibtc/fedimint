@@ -86,7 +86,7 @@ fn legacy_encrypted_layout_still_reads_with_disk_password() {
             serde_json::to_vec(&config.consensus).unwrap(),
         ),
     ] {
-        std::fs::write(
+        fedimint_core::util::write_new(
             directory
                 .path()
                 .join(name)

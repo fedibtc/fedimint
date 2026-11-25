@@ -40,7 +40,7 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 use crate::LOG_CONSENSUS;
 use crate::config::ServerConfig;
 use crate::consensus::aleph_bft::backup::{BackupReader, BackupWriter};
-use crate::consensus::aleph_bft::data_provider::{DataProvider, UnitData};
+use crate::consensus::aleph_bft::data_provider::{DataProvider, PendingBatches, UnitData};
 use crate::consensus::aleph_bft::finalization_handler::{FinalizationHandler, OrderedUnit};
 use crate::consensus::aleph_bft::keychain::Keychain;
 use crate::consensus::aleph_bft::network::Network;
@@ -401,6 +401,19 @@ impl ConsensusEngine {
         let (signed_outcomes_sender, signed_outcomes_receiver) = async_channel::unbounded();
         let (signatures_sender, signatures_receiver) = async_channel::unbounded();
 
+        let is_recovery = self.is_recovery().await;
+
+        // With quiescence on, a peer only creates units while it has items to
+        // order or knows of a batch that awaits ordering, hence the broadcast is
+        // quiescent on an idle federation. We never go quiescent in a session we
+        // resumed from our backup after a restart, as it may hold batches of ours
+        // that we no longer count. Otherwise we go quiescent only until half of the
+        // session timeout has passed, which leaves the other half to complete the
+        // session's remaining rounds before the timeout above restarts us.
+        let park_deadline = (!is_recovery).then(|| Instant::now() + self.session_timeout / 2);
+
+        let pending_batches = PendingBatches::new(session_index);
+
         let aleph_handle = spawn(
             "aleph run session",
             aleph_bft::run_session(
@@ -410,9 +423,16 @@ impl ConsensusEngine {
                         self.submission_receiver.clone(),
                         signature_receiver,
                         timestamp_sender,
-                        self.is_recovery().await,
+                        is_recovery,
+                        pending_batches.clone(),
+                        park_deadline,
+                        self.shutdown_receiver.clone(),
                     ),
-                    FinalizationHandler::new(unit_data_sender),
+                    FinalizationHandler::new(
+                        unit_data_sender,
+                        self.identity(),
+                        pending_batches.clone(),
+                    ),
                     BackupWriter::new(self.db.clone()).await,
                     BackupReader::new(self.db.clone()),
                 ),
@@ -421,6 +441,7 @@ impl ConsensusEngine {
                     self.peer_activity.clone(),
                     signed_outcomes_sender,
                     signatures_sender,
+                    pending_batches,
                     self.db.clone(),
                 ),
                 Keychain::new(&self.cfg),
