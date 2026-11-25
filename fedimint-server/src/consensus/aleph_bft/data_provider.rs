@@ -108,9 +108,11 @@ impl DataProvider {
         }
     }
 
-    /// Whether an admin scheduled a shutdown at the end of this session. A
-    /// guardian transfer or a coordinated upgrade then waits for the session
-    /// to end, so we complete it as fast as without quiescence.
+    /// Whether an admin scheduled a shutdown at the end of this session. We
+    /// then stop parking, but a round needs units from 2f+1 guardians, so
+    /// this only shortens the session once 2f+1 guardians have a shutdown
+    /// due. A shutdown of one guardian, as in a guardian transfer, still
+    /// waits for its peers' park deadline.
     fn shutdown_due(&mut self) -> bool {
         self.shutdown
             .borrow_and_update()

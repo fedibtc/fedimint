@@ -408,8 +408,15 @@ impl ConsensusEngine {
         // resumed from our backup after a restart, as it may hold batches of ours
         // that we no longer count. Otherwise we go quiescent only until half of the
         // session timeout has passed, which leaves the other half to complete the
-        // session's remaining rounds before the timeout above restarts us.
-        let park_deadline = (!is_recovery).then(|| Instant::now() + self.session_timeout / 2);
+        // session's remaining rounds before the timeout above restarts us. Peers
+        // without quiescence restart on their own session timeout, so a park
+        // that outlasts theirs restarts them in every idle session: run all
+        // guardians of a federation with the same session timeout.
+        let park_deadline = if is_recovery {
+            None
+        } else {
+            Instant::now().checked_add(self.session_timeout / 2)
+        };
 
         let unordered_batches = UnorderedBatches::default();
 
