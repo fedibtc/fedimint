@@ -151,6 +151,11 @@ pub struct Features {
     /// Create AlephBFT units only while there is something to order
     /// ([`fedimint_server_core::quiescence`]).
     pub aleph_quiescence: bool,
+    /// Optional override for how long a quiescent session may park before
+    /// draining its remaining rounds, in seconds. `None` keeps the default
+    /// (`session_timeout / 2`, 30 min on the 1h default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aleph_quiescence_park_secs: Option<u64>,
     /// Kill switch: give iroh endpoints 0.12's QUIC timeouts, 60s idle and 30s
     /// keep-alive, instead of 0.13's 5s and 1s. Endpoints fix their timeouts
     /// when they are built, so only [`FM_FEATURES_ENV`] sets this; frames
@@ -196,6 +201,18 @@ impl Features {
                 safe_to_share = true,
                 enabled = self.aleph_quiescence,
                 "Aleph quiescence switched"
+            );
+        }
+        let park_duration = self
+            .aleph_quiescence_park_secs
+            .map(std::time::Duration::from_secs);
+        let previous = fedimint_server_core::quiescence::set_park_duration(park_duration);
+        if previous != park_duration {
+            tracing::info!(
+                target: fedimint_logging::LOG_CONSENSUS,
+                safe_to_share = true,
+                park_secs = self.aleph_quiescence_park_secs,
+                "Aleph quiescence park duration switched"
             );
         }
         let previous =

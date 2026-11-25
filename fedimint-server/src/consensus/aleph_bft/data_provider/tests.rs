@@ -36,6 +36,7 @@ struct Harness {
     signature: watch::Sender<Option<schnorr::Signature>>,
     shutdown: watch::Sender<Option<ScheduledShutdown>>,
     drain: watch::Sender<bool>,
+    parked: watch::Receiver<bool>,
     batches: UnorderedBatches,
     _timestamps: async_channel::Receiver<Instant>,
 }
@@ -46,7 +47,10 @@ fn harness(park_deadline: Option<Instant>) -> Harness {
     let (timestamp_sender, timestamps) = async_channel::unbounded();
     let (shutdown, shutdown_receiver) = watch::channel(None);
     let (drain, drain_receiver) = watch::channel(false);
+    let (parked_tx, parked) = watch::channel(false);
     let batches = UnorderedBatches::default();
+    let now = Instant::now();
+    let park_window = park_deadline.map(|deadline| (now, deadline.saturating_duration_since(now)));
     Harness {
         provider: DataProvider::new(
             mempool_receiver,
@@ -55,7 +59,8 @@ fn harness(park_deadline: Option<Instant>) -> Harness {
             false,
             batches.clone(),
             SESSION,
-            park_deadline,
+            park_window,
+            parked_tx,
             shutdown_receiver,
             drain_receiver,
         ),
@@ -63,6 +68,7 @@ fn harness(park_deadline: Option<Instant>) -> Harness {
         signature,
         shutdown,
         drain,
+        parked,
         batches,
         _timestamps: timestamps,
     }
@@ -237,6 +243,24 @@ async fn quiescence_parks_only_without_work_and_only_while_switched_on() {
     let mut h = harness(None);
     assert_eq!(h.returns().await, None);
     assert_eq!(h.returns().await, None);
+    assert!(!*h.parked.borrow());
 
+    // A policy override extends the park window past the default deadline, and
+    // shortening it mid-park wakes the parked provider immediately.
+    use fedimint_server_core::quiescence::set_park_duration;
+    set_park_duration(Some(Duration::from_secs(3600)));
+    let short_default = Instant::now() + Duration::from_millis(50);
+    let mut h = harness(Some(short_default));
+    assert!(h.parks().await);
+    // Clearing back to a shorter duration wakes a parked provider promptly.
+    let data = h
+        .woken_by(|| {
+            set_park_duration(Some(Duration::from_millis(10)));
+        })
+        .await;
+    assert_eq!(data, None);
+    assert!(!*h.parked.borrow());
+
+    set_park_duration(None);
     set_enabled(false);
 }

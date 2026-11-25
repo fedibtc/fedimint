@@ -289,20 +289,27 @@ impl ConsensusEngine {
             // has been observed to resolve stuck sessions. Since AlephBFT
             // persists its units to the database this is equivalent to a crash
             // and therefore safe.
-            let Ok(session) = tokio::time::timeout(
-                self.session_timeout,
-                self.run_session(self.connections.clone(), session_index),
-            )
-            .await
-            else {
-                warn!(
-                    target: LOG_CONSENSUS,
-                    safe_to_share = true,
-                    session_index,
-                    timeout_secs = self.session_timeout.as_secs(),
-                    "Consensus session timed out"
-                );
-                return Err(SessionTimedOut { session_index }.into());
+            //
+            // When quiescence is enabled with a park window longer than
+            // `session_timeout / 2`, wall-clock time spent cleanly parked in
+            // `DataProvider` does not count against `self.session_timeout`;
+            // unparked/active time (draining or awaiting batch ordering) still
+            // hits the same `self.session_timeout` watchdog.
+            let (parked_tx, parked_rx) = watch::channel(false);
+            let session = tokio::select! {
+                session = self.run_session(self.connections.clone(), session_index, parked_tx) => {
+                    session
+                }
+                () = active_timeout(self.session_timeout, parked_rx) => {
+                    warn!(
+                        target: LOG_CONSENSUS,
+                        safe_to_share = true,
+                        session_index,
+                        timeout_secs = self.session_timeout.as_secs(),
+                        "Consensus session timed out"
+                    );
+                    return Err(SessionTimedOut { session_index }.into());
+                }
             };
 
             if session.is_none() {
@@ -330,6 +337,7 @@ impl ConsensusEngine {
         &self,
         connections: DynP2PConnections<P2PMessage>,
         session_index: u64,
+        parked: watch::Sender<bool>,
     ) -> Option<()> {
         // In order to bound a sessions RAM consumption we need to bound its number of
         // units and therefore its number of rounds. Since we use a session to
@@ -408,16 +416,13 @@ impl ConsensusEngine {
         // order or a batch of its own awaits ordering, hence the broadcast is
         // quiescent on an idle federation. We never go quiescent in a session we
         // resumed from our backup after a restart, as it may hold batches of ours
-        // that we no longer count. Otherwise we go quiescent only until half of the
-        // session timeout has passed, which leaves the other half to complete the
-        // session's remaining rounds before the timeout above restarts us. Peers
-        // without quiescence restart on their own session timeout, so a park
-        // that outlasts theirs restarts them in every idle session: run all
-        // guardians of a federation with the same session timeout.
-        let park_deadline = if is_recovery {
+        // that we no longer count. Otherwise we park for the policy-configured
+        // park duration (defaulting to `session_timeout / 2` for mixed-version
+        // safety when unset).
+        let park_window = if is_recovery {
             None
         } else {
-            Instant::now().checked_add(self.session_timeout / 2)
+            Some((Instant::now(), self.session_timeout / 2))
         };
 
         let unordered_batches = UnorderedBatches::default();
@@ -435,7 +440,8 @@ impl ConsensusEngine {
                         is_recovery,
                         unordered_batches.clone(),
                         session_index,
-                        park_deadline,
+                        park_window,
+                        parked,
                         self.shutdown_receiver.clone(),
                         drain_receiver,
                     ),
@@ -1425,6 +1431,39 @@ pub async fn get_finished_session_count_static(dbtx: &mut DatabaseTransaction<'_
         .next()
         .await
         .map_or(0, |entry| (entry.0.0) + 1)
+}
+
+/// Resolves once the session has spent `budget` of *unparked* (active) time
+/// without completing. Time spent intentionally parked in a quiescent
+/// [`DataProvider`] pauses the countdown, so raising the park window does not
+/// weaken the stuck-session watchdog: any session that stalls while ordering a
+/// batch or draining still trips after `budget`.
+async fn active_timeout(budget: Duration, mut parked: watch::Receiver<bool>) {
+    let mut remaining = budget;
+    loop {
+        if *parked.borrow_and_update() {
+            if parked.changed().await.is_err() {
+                // Sender dropped; stay active until budget expires.
+                tokio::time::sleep(remaining).await;
+                return;
+            }
+            continue;
+        }
+        let started = tokio::time::Instant::now();
+        tokio::select! {
+            () = tokio::time::sleep(remaining) => return,
+            changed = parked.changed() => {
+                remaining = remaining.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return;
+                }
+                if changed.is_err() {
+                    tokio::time::sleep(remaining).await;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

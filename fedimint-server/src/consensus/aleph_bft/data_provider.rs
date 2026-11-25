@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fedimint_core::TransactionId;
 use fedimint_core::config::ALEPH_BFT_UNIT_BYTE_LIMIT;
@@ -67,6 +67,32 @@ impl UnorderedBatches {
     }
 }
 
+/// Marks the data provider as parked for the duration of a quiescent wait and
+/// clears the flag on exit (including cancellation), so the consensus engine's
+/// active-time watchdog counts only unparked time.
+struct ParkGuard<'a>(&'a watch::Sender<bool>);
+
+impl<'a> ParkGuard<'a> {
+    fn enter(parked: &'a watch::Sender<bool>) -> Self {
+        parked.send_if_modified(|state| {
+            let changed = !*state;
+            *state = true;
+            changed
+        });
+        Self(parked)
+    }
+}
+
+impl Drop for ParkGuard<'_> {
+    fn drop(&mut self) {
+        self.0.send_if_modified(|state| {
+            let changed = *state;
+            *state = false;
+            changed
+        });
+    }
+}
+
 pub struct DataProvider {
     mempool_item_receiver: async_channel::Receiver<ConsensusItem>,
     signature_receiver: watch::Receiver<Option<schnorr::Signature>>,
@@ -76,8 +102,12 @@ pub struct DataProvider {
     is_recovery: bool,
     unordered_batches: UnorderedBatches,
     session_index: u64,
-    park_deadline: Option<Instant>,
+    /// `(session_started, default_park_duration)` when parking is allowed in
+    /// this session, or `None` in a recovery session.
+    park_window: Option<(Instant, Duration)>,
     quiescence: watch::Receiver<bool>,
+    park_duration: watch::Receiver<Option<Duration>>,
+    parked: watch::Sender<bool>,
     shutdown: watch::Receiver<Option<ScheduledShutdown>>,
     drain: watch::Receiver<bool>,
 }
@@ -91,7 +121,8 @@ impl DataProvider {
         is_recovery: bool,
         unordered_batches: UnorderedBatches,
         session_index: u64,
-        park_deadline: Option<Instant>,
+        park_window: Option<(Instant, Duration)>,
+        parked: watch::Sender<bool>,
         shutdown: watch::Receiver<Option<ScheduledShutdown>>,
         drain: watch::Receiver<bool>,
     ) -> Self {
@@ -104,11 +135,22 @@ impl DataProvider {
             is_recovery,
             unordered_batches,
             session_index,
-            park_deadline,
+            park_window,
             quiescence: fedimint_server_core::quiescence::subscribe(),
+            park_duration: fedimint_server_core::quiescence::subscribe_park_duration(),
+            parked,
             shutdown,
             drain,
         }
+    }
+
+    fn current_park_deadline(&mut self) -> Option<Instant> {
+        let (session_started, default_duration) = self.park_window?;
+        let duration = self
+            .park_duration
+            .borrow_and_update()
+            .unwrap_or(default_duration);
+        session_started.checked_add(duration)
     }
 
     /// Whether an admin scheduled a shutdown at the end of this session. We
@@ -195,7 +237,7 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
             // passes, quiescence is turned off, a shutdown is scheduled at the end
             // of this session, or a peer asks us to drain this session for its own
             // shutdown.
-            let park_deadline = self.park_deadline?;
+            let park_deadline = self.current_park_deadline()?;
 
             if !*self.quiescence.borrow_and_update()
                 || Instant::now() >= park_deadline
@@ -206,37 +248,46 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
                 return None;
             }
 
-            tokio::select! {
-                item = self.mempool_item_receiver.recv() => {
-                    match item {
-                        Ok(item) => {
-                            if self.is_new(&item) {
-                                self.leftover_item = Some(item);
-                            }
+            let received_item = {
+                let _park_guard = ParkGuard::enter(&self.parked);
+
+                tokio::select! {
+                    item = self.mempool_item_receiver.recv() => {
+                        match item {
+                            Ok(item) => Some(item),
+                            // the sender is dropped as the server shuts down, in which case
+                            // we park instead of spinning on the closed channel
+                            Err(..) => std::future::pending::<Option<ConsensusItem>>().await,
                         }
-                        // the sender is dropped as the server shuts down, in which case
-                        // we park instead of spinning on the closed channel
-                        Err(..) => std::future::pending::<()>().await,
                     }
-                }
-                changed = self.signature_receiver.changed() => {
-                    if changed.is_err() {
-                        std::future::pending::<()>().await;
+                    changed = self.signature_receiver.changed() => {
+                        if changed.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                        None
                     }
-                }
-                // The switch lives as long as the process.
-                _ = self.quiescence.changed() => {}
-                changed = self.shutdown.changed() => {
-                    if changed.is_err() {
-                        std::future::pending::<()>().await;
+                    // The switch lives as long as the process.
+                    _ = self.quiescence.changed() => None,
+                    _ = self.park_duration.changed() => None,
+                    changed = self.shutdown.changed() => {
+                        if changed.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                        None
                     }
-                }
-                changed = self.drain.changed() => {
-                    if changed.is_err() {
-                        std::future::pending::<()>().await;
+                    changed = self.drain.changed() => {
+                        if changed.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                        None
                     }
+                    () = tokio::time::sleep_until(park_deadline.into()) => None,
                 }
-                () = tokio::time::sleep_until(park_deadline.into()) => {}
+            };
+            if let Some(item) = received_item
+                && self.is_new(&item)
+            {
+                self.leftover_item = Some(item);
             }
         }
     }
