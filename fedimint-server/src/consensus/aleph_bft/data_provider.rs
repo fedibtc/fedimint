@@ -79,6 +79,7 @@ pub struct DataProvider {
     park_deadline: Option<Instant>,
     quiescence: watch::Receiver<bool>,
     shutdown: watch::Receiver<Option<ScheduledShutdown>>,
+    drain: watch::Receiver<bool>,
 }
 
 impl DataProvider {
@@ -92,6 +93,7 @@ impl DataProvider {
         session_index: u64,
         park_deadline: Option<Instant>,
         shutdown: watch::Receiver<Option<ScheduledShutdown>>,
+        drain: watch::Receiver<bool>,
     ) -> Self {
         Self {
             mempool_item_receiver,
@@ -105,14 +107,13 @@ impl DataProvider {
             park_deadline,
             quiescence: fedimint_server_core::quiescence::subscribe(),
             shutdown,
+            drain,
         }
     }
 
     /// Whether an admin scheduled a shutdown at the end of this session. We
-    /// then stop parking, but a round needs units from 2f+1 guardians, so
-    /// this only shortens the session once 2f+1 guardians have a shutdown
-    /// due. A shutdown of one guardian, as in a guardian transfer, still
-    /// waits for its peers' park deadline.
+    /// then stop parking, and the engine asks our peers to drain the session
+    /// as well, since a round needs units from 2f+1 guardians.
     fn shutdown_due(&mut self) -> bool {
         self.shutdown
             .borrow_and_update()
@@ -191,14 +192,16 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
             // creating units without data such that the broadcast grows the dag and
             // orders it. Otherwise there is no work to be done and we go quiescent
             // until an item is submitted to us, the session ends, the park deadline
-            // passes, quiescence is turned off, or a shutdown is scheduled at the end
-            // of this session.
+            // passes, quiescence is turned off, a shutdown is scheduled at the end
+            // of this session, or a peer asks us to drain this session for its own
+            // shutdown.
             let park_deadline = self.park_deadline?;
 
             if !*self.quiescence.borrow_and_update()
                 || Instant::now() >= park_deadline
                 || !self.unordered_batches.is_empty()
                 || self.shutdown_due()
+                || *self.drain.borrow_and_update()
             {
                 return None;
             }
@@ -224,6 +227,11 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
                 // The switch lives as long as the process.
                 _ = self.quiescence.changed() => {}
                 changed = self.shutdown.changed() => {
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                changed = self.drain.changed() => {
                     if changed.is_err() {
                         std::future::pending::<()>().await;
                     }
@@ -270,6 +278,7 @@ mod tests {
         mempool: async_channel::Sender<ConsensusItem>,
         signature: watch::Sender<Option<schnorr::Signature>>,
         shutdown: watch::Sender<Option<ScheduledShutdown>>,
+        drain: watch::Sender<bool>,
         batches: UnorderedBatches,
         _timestamps: async_channel::Receiver<Instant>,
     }
@@ -279,6 +288,7 @@ mod tests {
         let (signature, signature_receiver) = watch::channel(None);
         let (timestamp_sender, timestamps) = async_channel::unbounded();
         let (shutdown, shutdown_receiver) = watch::channel(None);
+        let (drain, drain_receiver) = watch::channel(false);
         let batches = UnorderedBatches::default();
         Harness {
             provider: DataProvider::new(
@@ -290,10 +300,12 @@ mod tests {
                 SESSION,
                 park_deadline,
                 shutdown_receiver,
+                drain_receiver,
             ),
             mempool,
             signature,
             shutdown,
+            drain,
             batches,
             _timestamps: timestamps,
         }
@@ -432,6 +444,20 @@ mod tests {
                     session: SESSION,
                     request: ShutdownRequest::AfterCurrentSession,
                 }));
+            })
+            .await;
+        assert_eq!(data, None);
+        assert_eq!(h.returns().await, None);
+        assert_eq!(h.returns().await, None);
+
+        // A peer's request to drain this session wakes a parked provider, which
+        // then creates units without parking.
+        let mut h = harness(Some(far_deadline()));
+        assert!(h.parks().await);
+        let drain = h.drain.clone();
+        let data = h
+            .woken_by(move || {
+                drain.send_replace(true);
             })
             .await;
         assert_eq!(data, None);
