@@ -1688,6 +1688,7 @@ impl MintClientModule {
     async fn spend_notes_oob(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
+        operation_id: Option<OperationId>,
         notes_selector: &impl NotesSelector,
         amount: Amount,
         try_cancel_after: Option<Duration>,
@@ -1704,7 +1705,8 @@ impl MintClientModule {
         let selected_notes =
             Self::select_notes(dbtx, notes_selector, amount, FeeConsensus::zero()).await?;
 
-        let operation_id = spendable_notes_to_operation_id(&selected_notes);
+        let operation_id =
+            operation_id.unwrap_or_else(|| spendable_notes_to_operation_id(&selected_notes));
 
         for (amount, note) in selected_notes.iter_items() {
             debug!(target: LOG_CLIENT_MODULE_MINT, %amount, %note, "Spending note as oob");
@@ -2190,6 +2192,54 @@ impl MintClientModule {
         include_invite: bool,
         extra_meta: M,
     ) -> anyhow::Result<(OperationId, OOBNotes)> {
+        self.spend_notes_with_selector_inner(
+            None,
+            notes_selector,
+            requested_amount,
+            try_cancel_after,
+            include_invite,
+            extra_meta,
+        )
+        .await
+    }
+
+    /// Like [`Self::spend_notes_with_selector`], but the spend is recorded
+    /// under the caller's `operation_id` instead of one derived from the
+    /// selected notes. A caller that derives the id from its own durable
+    /// request can find the spend again after a crash with
+    /// [`fedimint_client_module::module::ClientContext::operation_exists`] or
+    /// the operation log, and a repeated call never spends twice: it fails
+    /// without touching any note when the operation already exists.
+    pub async fn spend_notes_with_selector_and_operation_id<M: Serialize + Send>(
+        &self,
+        operation_id: OperationId,
+        notes_selector: &impl NotesSelector,
+        requested_amount: Amount,
+        try_cancel_after: Option<Duration>,
+        include_invite: bool,
+        extra_meta: M,
+    ) -> anyhow::Result<OOBNotes> {
+        self.spend_notes_with_selector_inner(
+            Some(operation_id),
+            notes_selector,
+            requested_amount,
+            try_cancel_after,
+            include_invite,
+            extra_meta,
+        )
+        .await
+        .map(|(_, notes)| notes)
+    }
+
+    async fn spend_notes_with_selector_inner<M: Serialize + Send>(
+        &self,
+        operation_id: Option<OperationId>,
+        notes_selector: &impl NotesSelector,
+        requested_amount: Amount,
+        try_cancel_after: Option<Duration>,
+        include_invite: bool,
+        extra_meta: M,
+    ) -> anyhow::Result<(OperationId, OOBNotes)> {
         let federation_id_prefix = self.federation_id.to_prefix();
         let extra_meta = serde_json::to_value(extra_meta)
             .expect("MintClientModule::spend_notes extra_meta is serializable");
@@ -2201,9 +2251,20 @@ impl MintClientModule {
                     let extra_meta = extra_meta.clone();
                     Box::pin(async {
                         let no_timeout = try_cancel_after.is_none();
+                        if let Some(operation_id) = operation_id {
+                            ensure!(
+                                !self
+                                    .client_ctx
+                                    .operation_exists_dbtx(dbtx, operation_id)
+                                    .await,
+                                "Operation with id {} already exists",
+                                operation_id.fmt_short()
+                            );
+                        }
                         let (operation_id, states, notes) = self
                             .spend_notes_oob(
                                 dbtx,
+                                operation_id,
                                 notes_selector,
                                 requested_amount,
                                 try_cancel_after,

@@ -22,9 +22,10 @@ use fedimint_logging::LOG_TEST;
 use fedimint_mint_client::api::MintFederationApi;
 use fedimint_mint_client::client_db::{NextECashNoteIndexKey, NoteKey};
 use fedimint_mint_client::{
-    MintClientInit, MintClientModule, MintClientStateMachines, Note, OOBNotes,
-    ReissueExternalNotesState, SelectNotesWithAtleastAmount, SelectNotesWithExactAmount,
-    SpendOOBState, SpendableNoteUndecoded,
+    MintClientInit, MintClientModule, MintClientStateMachines, MintOperationMeta,
+    MintOperationMetaVariant, Note, OOBNotes, ReissueExternalNotesState,
+    SelectNotesWithAtleastAmount, SelectNotesWithExactAmount, SpendOOBState,
+    SpendableNoteUndecoded,
 };
 use fedimint_mint_common::{MintInput, MintInputV0, MintOutput, Nonce};
 use fedimint_mint_server::MintInit;
@@ -823,6 +824,70 @@ async fn ecash_backup_can_recover_metadata() -> anyhow::Result<()> {
         .await?
         .expect("could not download backup");
     assert_eq!(fetched_backup.metadata, metadata);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spend_with_operation_id_records_under_the_id_and_never_spends_twice() -> anyhow::Result<()>
+{
+    let fed = fixtures().new_fed_degraded().await;
+    let (client1, client2) = fed.two_clients().await;
+    issue_ecash(&client1, sats(1000)).await?;
+    let client1_mint = client1.get_first_module::<MintClientModule>()?;
+    let operation_id = OperationId([7; 32]);
+
+    let notes = client1_mint
+        .spend_notes_with_selector_and_operation_id(
+            operation_id,
+            &SelectNotesWithAtleastAmount,
+            sats(750),
+            None,
+            true,
+            serde_json::json!({ "request": 1 }),
+        )
+        .await?;
+    let operation = client1
+        .operation_log()
+        .get_operation(operation_id)
+        .await
+        .expect("the spend is recorded under the caller's id");
+    let MintOperationMetaVariant::SpendOOB { oob_notes, .. } =
+        operation.meta::<MintOperationMeta>().variant
+    else {
+        panic!("the caller's id names the out-of-band spend");
+    };
+    assert_eq!(oob_notes, notes);
+
+    // A repeat with the same id spends nothing.
+    let balance = client1.get_balance_for_btc().await?;
+    assert!(
+        client1_mint
+            .spend_notes_with_selector_and_operation_id(
+                operation_id,
+                &SelectNotesWithAtleastAmount,
+                sats(100),
+                None,
+                true,
+                (),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(client1.get_balance_for_btc().await?, balance);
+
+    // The notes are real ecash.
+    let client2_mint = client2.get_first_module::<MintClientModule>()?;
+    let reissue = client2_mint.reissue_external_notes(notes, ()).await?;
+    let mut updates = client2_mint
+        .subscribe_reissue_external_notes(reissue)
+        .await?
+        .into_stream();
+    let mut last = None;
+    while let Some(update) = updates.next().await {
+        last = Some(update);
+    }
+    assert_eq!(last, Some(ReissueExternalNotesState::Done));
 
     Ok(())
 }

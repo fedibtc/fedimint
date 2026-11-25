@@ -659,6 +659,24 @@ where
         Ok(())
     }
 
+    /// Whether an operation with this id exists, read inside the caller's
+    /// transaction so a check and a start with a caller-chosen id are atomic.
+    pub async fn operation_exists_dbtx(
+        &self,
+        dbtx: &mut DatabaseTransaction<'_>,
+        operation_id: OperationId,
+    ) -> bool {
+        self.client
+            .get()
+            .operation_log()
+            .get_operation_dbtx(
+                &mut dbtx.global_dbtx(self.global_dbtx_access_token),
+                operation_id,
+            )
+            .await
+            .is_some()
+    }
+
     pub async fn manual_operation_start_dbtx(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,

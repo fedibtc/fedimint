@@ -795,7 +795,9 @@ impl LightningClientModule {
         })
     }
 
-    fn get_payment_operation_id(payment_hash: &sha256::Hash, index: u16) -> OperationId {
+    /// The operation id of payment attempt `index` of `payment_hash`.
+    /// [`Self::pay_bolt11_invoice`] numbers the attempts of an invoice from 1.
+    pub fn get_payment_operation_id(payment_hash: &sha256::Hash, index: u16) -> OperationId {
         // Copy the 32 byte payment hash and a 2 byte index to make every payment
         // attempt have a unique `OperationId`
         let mut bytes = [0; 34];
