@@ -38,6 +38,9 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

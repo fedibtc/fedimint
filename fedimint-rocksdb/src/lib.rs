@@ -102,6 +102,9 @@ impl RocksDb {
         // same synced prefix as TolerateCorruptedTailRecords.
         opts.set_wal_recovery_mode(DBRecoveryMode::PointInTime);
         opts.set_recycle_log_file_num(4);
+        std::fs::create_dir_all(db_path)?;
+        #[cfg(target_os = "linux")]
+        try_enable_btrfs_nocow(db_path);
         let db: rocksdb::OptimisticTransactionDB =
             rocksdb::OptimisticTransactionDB::<rocksdb::SingleThreaded>::open(&opts, db_path)?;
         Ok(RocksDb(db))
@@ -111,6 +114,183 @@ impl RocksDb {
         &self.0
     }
 }
+
+/// On Linux btrfs, set `FS_NOCOW_FL` (`chattr +C`) on the `RocksDB` directory
+/// before `RocksDB` creates files in it so all newly created WAL and SST files
+/// inherit `NODATACOW`.
+///
+/// With WAL recycling (`recycle_log_file_num = 4`, `PointInTime` recovery) and
+/// `fdatasync()`, overwriting recycled WAL extents in place on a `NODATACOW`
+/// file avoids per-sync copy-on-write extent allocation, checksum updates, and
+/// `btrfs_sync_log()` metadata writes (~90 KB/sync on copy-on-write btrfs).
+///
+/// Trade-off: `FS_NOCOW_FL` disables btrfs data checksumming (`NODATASUM`) and
+/// btrfs compression for files created inside `db_path`. `RocksDB` already
+/// CRC32C-checksums every WAL record and SST block, btrfs metadata remains
+/// copy-on-write and checksummed, and btrfs snapshots stay safe (btrfs performs
+/// a one-time copy-on-write on the first overwrite of a shared extent).
+///
+/// Best-effort: no-ops immediately on non-btrfs filesystems and never fails
+/// database startup on error.
+#[cfg(target_os = "linux")]
+mod btrfs_nocow {
+    use std::fs::File;
+    use std::os::fd::AsRawFd as _;
+    use std::path::Path;
+
+    use tracing::{debug, warn};
+
+    /// `BTRFS_SUPER_MAGIC` from Linux `include/uapi/linux/magic.h`.
+    pub(super) const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
+
+    /// `FS_NOCOW_FL` from Linux `include/uapi/linux/fs.h` (`chattr +C`).
+    pub(super) const FS_NOCOW_FL: libc::c_int = 0x0080_0000;
+
+    // Linux ioctl number bitfield layout from `include/uapi/asm-generic/ioctl.h`
+    // (with the architecture override for mips/powerpc/sparc).
+    const IOC_NRSHIFT: u32 = 0;
+    const IOC_TYPESHIFT: u32 = 8;
+    const IOC_SIZESHIFT: u32 = 16;
+
+    #[cfg(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    ))]
+    const IOC_DIRSHIFT: u32 = 29;
+    #[cfg(not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    )))]
+    const IOC_DIRSHIFT: u32 = 30;
+
+    const IOC_READ: u32 = 2;
+
+    #[cfg(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    ))]
+    const IOC_WRITE: u32 = 4;
+    #[cfg(not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+    )))]
+    const IOC_WRITE: u32 = 1;
+
+    const fn ioc(dir: u32, ty: u8, nr: u8, size: usize) -> u32 {
+        #[allow(clippy::cast_possible_truncation)]
+        let size = size as u32;
+        (dir << IOC_DIRSHIFT)
+            | (size << IOC_SIZESHIFT)
+            | ((ty as u32) << IOC_TYPESHIFT)
+            | ((nr as u32) << IOC_NRSHIFT)
+    }
+
+    /// `FS_IOC_GETFLAGS = _IOR('f', 1, long)` from Linux `include/uapi/linux/fs.h`.
+    /// Note: the ioctl number encodes `sizeof(long)`, while the kernel's
+    /// `fs/ioctl.c` always reads and writes a `c_int` (`int __user *`).
+    pub(super) const FS_IOC_GETFLAGS: u32 =
+        ioc(IOC_READ, b'f', 1, std::mem::size_of::<libc::c_long>());
+
+    /// `FS_IOC_SETFLAGS = _IOW('f', 2, long)` from Linux `include/uapi/linux/fs.h`.
+    pub(super) const FS_IOC_SETFLAGS: u32 =
+        ioc(IOC_WRITE, b'f', 2, std::mem::size_of::<libc::c_long>());
+
+    fn is_btrfs(stat: &libc::statfs) -> bool {
+        fn eq<T: Eq + Copy>(a: T, b: T) -> bool {
+            a == b
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        eq(stat.f_type, u64::from(BTRFS_SUPER_MAGIC) as _)
+    }
+
+    pub(super) fn try_enable_btrfs_nocow(db_path: &Path) {
+        let dir = match File::open(db_path) {
+            Ok(dir) => dir,
+            Err(err) => {
+                debug!(
+                    path = %db_path.display(),
+                    %err,
+                    "Failed to open RocksDB directory for btrfs NOCOW check"
+                );
+                return;
+            }
+        };
+        let fd = dir.as_raw_fd();
+
+        // SAFETY: `libc::statfs` is a plain C struct; zero-initialization is valid
+        // and `fstatfs` overwrites it on success. `fd` is a valid open descriptor.
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(fd, &raw mut stat) } != 0 {
+            let err = std::io::Error::last_os_error();
+            debug!(
+                path = %db_path.display(),
+                %err,
+                "Failed to fstatfs RocksDB directory"
+            );
+            return;
+        }
+
+        if !is_btrfs(&stat) {
+            return;
+        }
+
+        let mut flags: libc::c_int = 0;
+        #[allow(clippy::cast_possible_wrap)]
+        let getflags_req = FS_IOC_GETFLAGS as libc::Ioctl;
+        // SAFETY: `FS_IOC_GETFLAGS` writes a single `c_int` to the provided pointer.
+        if unsafe { libc::ioctl(fd, getflags_req, &raw mut flags) } != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(
+                path = %db_path.display(),
+                %err,
+                "Failed to read inode flags (FS_IOC_GETFLAGS) on btrfs RocksDB directory"
+            );
+            return;
+        }
+
+        if (flags & FS_NOCOW_FL) != 0 {
+            return;
+        }
+
+        flags |= FS_NOCOW_FL;
+        #[allow(clippy::cast_possible_wrap)]
+        let setflags_req = FS_IOC_SETFLAGS as libc::Ioctl;
+        // SAFETY: `FS_IOC_SETFLAGS` reads a single `c_int` from the provided pointer.
+        if unsafe { libc::ioctl(fd, setflags_req, &raw const flags) } != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(
+                path = %db_path.display(),
+                %err,
+                "Failed to set FS_NOCOW_FL on btrfs RocksDB directory"
+            );
+            return;
+        }
+
+        debug!(
+            path = %db_path.display(),
+            "Enabled FS_NOCOW_FL on btrfs RocksDB directory"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+use btrfs_nocow::try_enable_btrfs_nocow;
 
 // TODO: Remove this and inline it in the places where it's used.
 fn is_power_of_two(num: usize) -> bool {
@@ -978,5 +1158,71 @@ mod fedimint_rocksdb_tests {
             matches!(result, Err(DatabaseError::WriteConflict)),
             "expected a write conflict, got {result:?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_btrfs_nocow_ioctl_constants() {
+        assert_eq!(btrfs_nocow::BTRFS_SUPER_MAGIC, 0x9123_683E);
+        assert_eq!(btrfs_nocow::FS_NOCOW_FL, 0x0080_0000);
+
+        #[cfg(not(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "powerpc",
+            target_arch = "powerpc64",
+            target_arch = "sparc",
+            target_arch = "sparc64",
+        )))]
+        {
+            if std::mem::size_of::<libc::c_long>() == 8 {
+                assert_eq!(btrfs_nocow::FS_IOC_GETFLAGS, 0x8008_6601);
+                assert_eq!(btrfs_nocow::FS_IOC_SETFLAGS, 0x4008_6602);
+            } else if std::mem::size_of::<libc::c_long>() == 4 {
+                assert_eq!(btrfs_nocow::FS_IOC_GETFLAGS, 0x8004_6601);
+                assert_eq!(btrfs_nocow::FS_IOC_SETFLAGS, 0x4004_6602);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_try_enable_btrfs_nocow_and_reopen() {
+        let root = tempfile::Builder::new()
+            .prefix("fcb-rocksdb-test-btrfs-nocow")
+            .tempdir()
+            .unwrap();
+
+        // Non-existent path must be handled best-effort without panicking.
+        let missing = root.path().join("does-not-exist");
+        try_enable_btrfs_nocow(&missing);
+
+        // Existing temporary directory must succeed/no-op cleanly.
+        try_enable_btrfs_nocow(root.path());
+
+        // Opening a not-yet-existing DB subdirectory exercises `create_dir_all`
+        // + `try_enable_btrfs_nocow`, write, close, and reopen on an existing dir.
+        let db_path = root.path().join("nested").join("database");
+        {
+            let db = Database::new(
+                RocksDb::build(&db_path).open().await.unwrap(),
+                ModuleDecoderRegistry::default(),
+            );
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_entry(&TestKey(vec![42]), &TestVal(vec![7, 8, 9]))
+                .await;
+            dbtx.commit_tx().await;
+        }
+        {
+            let db = Database::new(
+                RocksDb::build(&db_path).open().await.unwrap(),
+                ModuleDecoderRegistry::default(),
+            );
+            let mut dbtx = db.begin_transaction_nc().await;
+            assert_eq!(
+                dbtx.get_value(&TestKey(vec![42])).await,
+                Some(TestVal(vec![7, 8, 9]))
+            );
+        }
     }
 }

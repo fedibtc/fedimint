@@ -4682,6 +4682,7 @@ dependencies = [
  "fedimint-db-locked",
  "fedimint-logging",
  "futures",
+ "libc",
  "rocksdb",
  "tempfile",
  "tokio",
