@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fedimint_core::TransactionId;
 use fedimint_core::config::ALEPH_BFT_UNIT_BYTE_LIMIT;
@@ -37,12 +37,12 @@ impl UnitData {
 /// [`super::finalization_handler::FinalizationHandler`] which observes them
 /// being ordered.
 ///
-/// Only our own batches keep a quiescent provider creating units. A peer's
-/// batch or unit does not wake us: a guardian without quiescence re-proposes
-/// its votes every second and creates a unit every round, so such a wake would
-/// keep a federation awake while any of its guardians runs an older build. The
-/// cost: an item that only one guardian has waits until another guardian has
-/// work of its own, such as its next unix time vote.
+/// Only our own batches keep a quiescent provider creating units at the normal
+/// pace. A peer's batch or unit does not: a guardian without quiescence
+/// re-proposes its votes every second and creates a unit every round, so it
+/// would keep a federation at full speed while any of its guardians runs an
+/// older build. The cost: an item that only one guardian has is ordered at the
+/// idle pace of the others.
 #[derive(Clone, Default)]
 pub struct UnorderedBatches(Arc<AtomicUsize>);
 
@@ -76,8 +76,10 @@ pub struct DataProvider {
     is_recovery: bool,
     unordered_batches: UnorderedBatches,
     session_index: u64,
-    park_deadline: Option<Instant>,
-    quiescence: watch::Receiver<bool>,
+    /// When we last returned data or none, which the idle round delay counts
+    /// from.
+    last_unit: Instant,
+    quiescence: watch::Receiver<Option<Duration>>,
     shutdown: watch::Receiver<Option<ScheduledShutdown>>,
     drain: watch::Receiver<bool>,
 }
@@ -91,7 +93,6 @@ impl DataProvider {
         is_recovery: bool,
         unordered_batches: UnorderedBatches,
         session_index: u64,
-        park_deadline: Option<Instant>,
         shutdown: watch::Receiver<Option<ScheduledShutdown>>,
         drain: watch::Receiver<bool>,
     ) -> Self {
@@ -104,7 +105,7 @@ impl DataProvider {
             is_recovery,
             unordered_batches,
             session_index,
-            park_deadline,
+            last_unit: Instant::now(),
             quiescence: fedimint_server_core::quiescence::subscribe(),
             shutdown,
             drain,
@@ -112,12 +113,19 @@ impl DataProvider {
     }
 
     /// Whether an admin scheduled a shutdown at the end of this session. We
-    /// then stop parking, and the engine asks our peers to drain the session
-    /// as well, since a round needs units from 2f+1 guardians.
+    /// then stop slowing down, and the engine asks our peers to drain the
+    /// session as well, since a round needs units from 2f+1 guardians.
     fn shutdown_due(&mut self) -> bool {
         self.shutdown
             .borrow_and_update()
             .is_some_and(|scheduled| scheduled.session <= self.session_index)
+    }
+
+    /// Return the data of our next unit, from whose creation we count the idle
+    /// round delay.
+    fn unit(&mut self, data: Option<UnitData>) -> Option<UnitData> {
+        self.last_unit = Instant::now();
+        data
     }
 
     /// Whether the item is not a transaction we already attached to a unit.
@@ -136,8 +144,10 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
     async fn get_data(&mut self) -> Option<UnitData> {
         loop {
             // we only attach our signature as no more items can be ordered in this session
-            if let Some(signature) = *self.signature_receiver.borrow() {
-                return Some(UnitData::Signature(signature.serialize()));
+            let signature = *self.signature_receiver.borrow();
+
+            if let Some(signature) = signature {
+                return self.unit(Some(UnitData::Signature(signature.serialize())));
             }
 
             // the length of a vector is encoded in at most 9 bytes
@@ -184,26 +194,27 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
 
                 self.unordered_batches.created();
 
-                return Some(UnitData::Batch(bytes));
+                return self.unit(Some(UnitData::Batch(bytes)));
             }
 
-            // Without quiescence we create a unit every round, with or without data.
-            // With it, as long as a batch of ours still awaits ordering, we keep
-            // creating units without data such that the broadcast grows the dag and
-            // orders it. Otherwise there is no work to be done and we go quiescent
-            // until an item is submitted to us, the session ends, the park deadline
-            // passes, quiescence is turned off, a shutdown is scheduled at the end
-            // of this session, or a peer asks us to drain this session for its own
-            // shutdown.
-            let park_deadline = self.park_deadline?;
+            // Without quiescence we create a unit every round, with or without data,
+            // after AlephBFT's round delay. With it, as long as a batch of ours still
+            // awaits ordering we do the same, such that the broadcast grows the dag
+            // and orders it. Otherwise there is no work to be done and we create our
+            // unit only once the idle round delay has passed since our last one, or
+            // earlier once an item is submitted to us, quiescence is switched, a
+            // shutdown is scheduled at the end of this session, or a peer asks us to
+            // drain this session for its own shutdown. We never stop creating units,
+            // so a session still completes within rounds times the idle round delay.
+            let Some(idle_round_delay) = *self.quiescence.borrow_and_update() else {
+                return self.unit(None);
+            };
 
-            if !*self.quiescence.borrow_and_update()
-                || Instant::now() >= park_deadline
-                || !self.unordered_batches.is_empty()
+            if !self.unordered_batches.is_empty()
                 || self.shutdown_due()
                 || *self.drain.borrow_and_update()
             {
-                return None;
+                return self.unit(None);
             }
 
             tokio::select! {
@@ -215,7 +226,7 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
                             }
                         }
                         // the sender is dropped as the server shuts down, in which case
-                        // we park instead of spinning on the closed channel
+                        // we wait instead of spinning on the closed channel
                         Err(..) => std::future::pending::<()>().await,
                     }
                 }
@@ -236,7 +247,9 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
                         std::future::pending::<()>().await;
                     }
                 }
-                () = tokio::time::sleep_until(park_deadline.into()) => {}
+                () = tokio::time::sleep_until((self.last_unit + idle_round_delay).into()) => {
+                    return self.unit(None);
+                }
             }
         }
     }
@@ -254,7 +267,10 @@ mod tests {
     use super::*;
     use crate::consensus::engine::ShutdownRequest;
 
-    const PARKED: Duration = Duration::from_millis(300);
+    const WAITED: Duration = Duration::from_millis(300);
+
+    /// An idle round delay far beyond any test's duration.
+    const LONG: Option<Duration> = Some(Duration::from_secs(3600));
 
     fn transaction(nonce: u8) -> ConsensusItem {
         ConsensusItem::Transaction(Transaction {
@@ -283,7 +299,7 @@ mod tests {
         _timestamps: async_channel::Receiver<Instant>,
     }
 
-    fn harness(park_deadline: Option<Instant>) -> Harness {
+    fn harness() -> Harness {
         let (mempool, mempool_receiver) = async_channel::unbounded();
         let (signature, signature_receiver) = watch::channel(None);
         let (timestamp_sender, timestamps) = async_channel::unbounded();
@@ -298,7 +314,6 @@ mod tests {
                 false,
                 batches.clone(),
                 SESSION,
-                park_deadline,
                 shutdown_receiver,
                 drain_receiver,
             ),
@@ -311,10 +326,6 @@ mod tests {
         }
     }
 
-    fn far_deadline() -> Instant {
-        Instant::now() + Duration::from_secs(3600)
-    }
-
     impl Harness {
         async fn get_data_within(&mut self, limit: Duration) -> Option<Option<UnitData>> {
             tokio::time::timeout(limit, self.provider.get_data())
@@ -322,27 +333,27 @@ mod tests {
                 .ok()
         }
 
-        async fn parks(&mut self) -> bool {
-            self.get_data_within(PARKED).await.is_none()
+        async fn waits(&mut self) -> bool {
+            self.get_data_within(WAITED).await.is_none()
         }
 
         async fn returns(&mut self) -> Option<UnitData> {
-            self.get_data_within(PARKED)
+            self.get_data_within(WAITED)
                 .await
-                .expect("get_data returns without parking")
+                .expect("get_data returns without waiting")
         }
 
-        /// Run `wake` shortly after `get_data` has parked, and return its
-        /// result.
+        /// Run `wake` shortly after `get_data` has started to wait, and return
+        /// its result.
         async fn woken_by(&mut self, wake: impl FnOnce() + Send + 'static) -> Option<UnitData> {
             let waker = fedimint_core::runtime::spawn("data provider test waker", async move {
                 fedimint_core::runtime::sleep(Duration::from_millis(100)).await;
                 wake();
             });
             let data = self
-                .get_data_within(PARKED * 3)
+                .get_data_within(WAITED * 3)
                 .await
-                .expect("the wake-up ends the park");
+                .expect("the wake-up ends the wait");
             waker.await.expect("the waker does not panic");
             data
         }
@@ -370,22 +381,22 @@ mod tests {
 
     // A single test, since the switch is a process global.
     #[tokio::test]
-    async fn quiescence_parks_only_without_work_and_only_while_switched_on() {
-        use fedimint_server_core::quiescence::set_enabled;
+    async fn quiescence_slows_down_only_without_work_and_only_while_switched_on() {
+        use fedimint_server_core::quiescence::set_idle_round_delay;
 
-        set_enabled(false);
+        set_idle_round_delay(None);
 
         // Off: a unit every round, with or without data.
-        let mut h = harness(Some(far_deadline()));
+        let mut h = harness();
         assert_eq!(h.returns().await, None);
         assert_eq!(h.returns().await, None);
 
-        set_enabled(true);
+        set_idle_round_delay(LONG);
 
-        // On and idle: no unit until there is work.
-        assert!(h.parks().await);
+        // On and idle: no unit before the idle round delay.
+        assert!(h.waits().await);
 
-        // An item submitted while parked is attached at once.
+        // An item submitted while waiting is attached at once.
         let mempool = h.mempool.clone();
         let ours = h
             .woken_by(move || {
@@ -394,30 +405,53 @@ mod tests {
             .await;
         assert_eq!(batch_items(ours), vec![transaction(1)]);
 
-        // Units without data continue while our batch awaits ordering.
+        // Units without data continue at the normal pace while our batch awaits
+        // ordering.
         assert_eq!(h.returns().await, None);
         assert_eq!(h.returns().await, None);
 
-        // Once it is ordered, we park again.
+        // Once it is ordered, we wait again.
         h.batches.ordered();
-        assert!(h.parks().await);
+        assert!(h.waits().await);
 
-        // A transaction we already attached does not wake us.
+        // A transaction we already attached does not end the wait.
         h.mempool.try_send(transaction(1)).expect("unbounded");
-        assert!(h.parks().await);
+        assert!(h.waits().await);
 
-        // Turning the switch off wakes a parked provider.
+        // Turning the switch off ends the wait.
         let data = h
             .woken_by(|| {
-                set_enabled(false);
+                set_idle_round_delay(None);
             })
             .await;
         assert_eq!(data, None);
         assert_eq!(h.returns().await, None);
 
-        // The session's signature wakes a parked provider.
-        set_enabled(true);
-        assert!(h.parks().await);
+        // A shorter delay applies at once, counted from our last unit: the first
+        // unit after a long wait is due right away, the next one after the delay.
+        set_idle_round_delay(LONG);
+        assert!(h.waits().await);
+        let data = h
+            .woken_by(|| {
+                set_idle_round_delay(Some(Duration::from_millis(50)));
+            })
+            .await;
+        assert_eq!(data, None);
+        let start = Instant::now();
+        assert_eq!(h.returns().await, None);
+        assert!(Duration::from_millis(50) <= start.elapsed());
+        set_idle_round_delay(Some(Duration::from_millis(500)));
+        let start = Instant::now();
+        let data = h
+            .get_data_within(WAITED * 3)
+            .await
+            .expect("the idle round delay ends the wait");
+        assert_eq!(data, None);
+        assert!(Duration::from_millis(500) <= start.elapsed());
+
+        // The session's signature ends the wait.
+        set_idle_round_delay(LONG);
+        assert!(h.waits().await);
         let signature = schnorr::Signature::from_slice(&[7; 64]).expect("64 bytes");
         let signature_sender = h.signature.clone();
         let data = h
@@ -427,16 +461,16 @@ mod tests {
             .await;
         assert_eq!(data, Some(UnitData::Signature(signature.serialize())));
 
-        // A shutdown scheduled after a later session does not wake a parked
-        // provider, but one at the end of this session does, and it then creates
-        // units without parking so the session completes promptly.
-        let mut h = harness(Some(far_deadline()));
-        assert!(h.parks().await);
+        // A shutdown scheduled after a later session does not end the wait, but
+        // one at the end of this session does, and we then create units at the
+        // normal pace so the session completes promptly.
+        let mut h = harness();
+        assert!(h.waits().await);
         h.shutdown.send_replace(Some(ScheduledShutdown {
             session: SESSION + 1,
             request: ShutdownRequest::AtSession,
         }));
-        assert!(h.parks().await);
+        assert!(h.waits().await);
         let shutdown = h.shutdown.clone();
         let data = h
             .woken_by(move || {
@@ -450,10 +484,9 @@ mod tests {
         assert_eq!(h.returns().await, None);
         assert_eq!(h.returns().await, None);
 
-        // A peer's request to drain this session wakes a parked provider, which
-        // then creates units without parking.
-        let mut h = harness(Some(far_deadline()));
-        assert!(h.parks().await);
+        // So does a peer's request to drain this session.
+        let mut h = harness();
+        assert!(h.waits().await);
         let drain = h.drain.clone();
         let data = h
             .woken_by(move || {
@@ -464,23 +497,6 @@ mod tests {
         assert_eq!(h.returns().await, None);
         assert_eq!(h.returns().await, None);
 
-        // A parked provider resumes creating units at its park deadline.
-        let deadline = Instant::now() + Duration::from_millis(150);
-        let mut h = harness(Some(deadline));
-        let data = h
-            .get_data_within(PARKED * 3)
-            .await
-            .expect("the deadline ends the park");
-        assert_eq!(data, None);
-        assert!(deadline <= Instant::now());
-        assert_eq!(h.returns().await, None);
-
-        // Without a park deadline, as in a session resumed from the backup, the
-        // provider never parks.
-        let mut h = harness(None);
-        assert_eq!(h.returns().await, None);
-        assert_eq!(h.returns().await, None);
-
-        set_enabled(false);
+        set_idle_round_delay(None);
     }
 }

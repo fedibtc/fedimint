@@ -403,22 +403,13 @@ impl ConsensusEngine {
 
         let is_recovery = self.is_recovery().await;
 
-        // With quiescence on, a peer only creates units while it has items to
-        // order or a batch of its own awaits ordering, hence the broadcast is
-        // quiescent on an idle federation. We never go quiescent in a session we
-        // resumed from our backup after a restart, as it may hold batches of ours
-        // that we no longer count. Otherwise we go quiescent only until half of the
-        // session timeout has passed, which leaves the other half to complete the
-        // session's remaining rounds before the timeout above restarts us. Peers
-        // without quiescence restart on their own session timeout, so a park
-        // that outlasts theirs restarts them in every idle session: run all
-        // guardians of a federation with the same session timeout.
-        let park_deadline = if is_recovery {
-            None
-        } else {
-            Instant::now().checked_add(self.session_timeout / 2)
-        };
-
+        // With quiescence on, a peer without items to order and without a batch of
+        // its own awaiting ordering creates a unit only every idle round delay,
+        // hence an idle federation writes few units. This includes a session we
+        // resumed from our backup after a restart: batches of ours in it that we no
+        // longer count are still ordered, at the idle pace. The process driving us
+        // chooses the delay such that a session's rounds fit into the session
+        // timeout above.
         let unordered_batches = UnorderedBatches::default();
         let (drain_sender, drain_receiver) = watch::channel(false);
 
@@ -434,7 +425,6 @@ impl ConsensusEngine {
                         is_recovery,
                         unordered_batches.clone(),
                         session_index,
-                        park_deadline,
                         self.shutdown_receiver.clone(),
                         drain_receiver,
                     ),
@@ -1384,10 +1374,10 @@ fn due_shutdown(
 const DRAIN_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Once a shutdown is due at the end of `session_index`, and while Aleph
-/// quiescence is switched on, ask our peers to stop parking, until the session
-/// ends and this future is dropped. A round needs units from 2f+1 guardians, so
-/// without this our shutdown, such as for a guardian transfer, would wait for
-/// our peers' park deadline.
+/// quiescence is switched on, ask our peers to stop slowing down, until the
+/// session ends and this future is dropped. A round needs units from 2f+1
+/// guardians, so without this our shutdown, such as for a guardian transfer,
+/// would wait for the session's remaining rounds at our peers' idle pace.
 async fn request_drain(
     connections: DynP2PConnections<P2PMessage>,
     mut shutdown: watch::Receiver<Option<ScheduledShutdown>>,
@@ -1409,7 +1399,7 @@ async fn request_drain(
         interval.tick().await;
 
         // The switch follows the same feature policy on every guardian, so
-        // with it off our peers do not park and there is nothing to ask.
+        // with it off our peers do not slow down and there is nothing to ask.
         if fedimint_server_core::quiescence::is_enabled() {
             connections.send(Recipient::Everyone, drain_session_message(session_index));
         }

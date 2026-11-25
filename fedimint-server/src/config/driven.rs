@@ -33,6 +33,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use fedimint_core::base32::{FEDIMINT_PREFIX, decode_prefixed};
@@ -142,20 +143,22 @@ pub enum ParentMessage {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Features {
-    /// Create AlephBFT units only while there is something to order
+    /// While there is nothing to order, create an AlephBFT unit only every
+    /// this many milliseconds; missing means quiescence is off
     /// ([`fedimint_server_core::quiescence`]).
-    pub aleph_quiescence: bool,
+    pub aleph_idle_round_delay_ms: Option<u64>,
 }
 
 impl Features {
     /// Switch this process to these features.
     fn apply(&self) {
-        let previous = fedimint_server_core::quiescence::set_enabled(self.aleph_quiescence);
-        if previous != self.aleph_quiescence {
+        let idle_round_delay = self.aleph_idle_round_delay_ms.map(Duration::from_millis);
+        let previous = fedimint_server_core::quiescence::set_idle_round_delay(idle_round_delay);
+        if previous != idle_round_delay {
             tracing::info!(
                 target: fedimint_logging::LOG_CONSENSUS,
                 safe_to_share = true,
-                enabled = self.aleph_quiescence,
+                idle_round_delay_ms = self.aleph_idle_round_delay_ms,
                 "Aleph quiescence switched"
             );
         }
@@ -1057,12 +1060,12 @@ mod tests {
         let mut features = client.into_features().unwrap();
         features
             .set(&Features {
-                aleph_quiescence: true,
+                aleph_idle_round_delay_ms: Some(900),
             })
             .await
             .unwrap();
         let read: Features = read_frame(&mut child).await.unwrap();
-        assert!(read.aleph_quiescence);
+        assert_eq!(read.aleph_idle_round_delay_ms, Some(900));
     }
 
     #[tokio::test]
@@ -1071,7 +1074,7 @@ mod tests {
         struct Empty {}
         #[derive(Serialize)]
         struct Future {
-            aleph_quiescence: bool,
+            aleph_idle_round_delay_ms: u64,
             not_yet_known: u8,
         }
         let (mut parent, mut child) = tokio::io::duplex(1024);
@@ -1079,7 +1082,7 @@ mod tests {
         write_frame(
             &mut parent,
             &Future {
-                aleph_quiescence: true,
+                aleph_idle_round_delay_ms: 900,
                 not_yet_known: 1,
             },
         )
@@ -1089,11 +1092,12 @@ mod tests {
             read_frame::<_, Features>(&mut child).await.unwrap(),
             Features::default()
         );
-        assert!(
+        assert_eq!(
             read_frame::<_, Features>(&mut child)
                 .await
                 .unwrap()
-                .aleph_quiescence
+                .aleph_idle_round_delay_ms,
+            Some(900)
         );
     }
 

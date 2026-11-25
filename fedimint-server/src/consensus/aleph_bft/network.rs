@@ -41,9 +41,9 @@ pub type NetworkData = aleph_bft::NetworkData<
 >;
 
 /// The variant of [`P2PMessage::Default`] by which a guardian with a shutdown
-/// due at the end of a session asks its peers to stop parking under Aleph
-/// quiescence, so the session completes without waiting for their park
-/// deadline. P2P messages travel bincode-encoded, so a variant unknown to
+/// due at the end of a session asks its peers to stop slowing down under Aleph
+/// quiescence, so the session completes without the remaining rounds at their
+/// idle pace. P2P messages travel bincode-encoded, so a variant unknown to
 /// older peers would fail to decode; as `Default`, older peers decode and
 /// ignore it. The index is far above upstream's variants, so it does not
 /// collide with one they add.

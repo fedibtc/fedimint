@@ -2,9 +2,11 @@
 //!
 //! Upstream fedimint/fedimint#9043 stops a guardian from creating AlephBFT
 //! units while it has nothing to order, and stops modules from re-proposing
-//! votes that their peers already recorded. This fork ships both behind one
-//! switch that the process driving `fedimintd` flips at runtime through the
-//! driven control channel's features (`fedimint_server::config::driven`). It
+//! votes that their peers already recorded. This fork instead slows a guardian
+//! without work down to one unit per idle round delay, and ships both behind
+//! one switch that the process driving `fedimintd` sets at runtime through the
+//! driven control channel's features (`fedimint_server::config::driven`). The
+//! switch is the idle round delay, so quiescence cannot be on without one. It
 //! starts off on every process start and is not persisted, so a restarted
 //! guardian behaves exactly like one without the change until it is enabled
 //! again.
@@ -14,23 +16,25 @@
 //! test federations share it.
 
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use tokio::sync::watch;
 
-static SWITCH: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::channel(false).0);
+static SWITCH: LazyLock<watch::Sender<Option<Duration>>> = LazyLock::new(|| watch::channel(None).0);
 
-/// Whether this guardian creates units only when it has work and modules
-/// propose only votes their peers accept.
+/// Whether this guardian slows down while it has no work and modules propose
+/// only votes their peers accept.
 pub fn is_enabled() -> bool {
-    *SWITCH.borrow()
+    SWITCH.borrow().is_some()
 }
 
-/// Turn quiescence on or off; returns the previous setting.
-pub fn set_enabled(enabled: bool) -> bool {
-    SWITCH.send_replace(enabled)
+/// Turn quiescence on with the delay between our units while we have no
+/// work, or off; returns the previous setting.
+pub fn set_idle_round_delay(idle_round_delay: Option<Duration>) -> Option<Duration> {
+    SWITCH.send_replace(idle_round_delay)
 }
 
-/// Observe changes, so a parked data provider resumes when it is turned off.
-pub fn subscribe() -> watch::Receiver<bool> {
+/// Observe changes, so a waiting data provider follows a new delay at once.
+pub fn subscribe() -> watch::Receiver<Option<Duration>> {
     SWITCH.subscribe()
 }
