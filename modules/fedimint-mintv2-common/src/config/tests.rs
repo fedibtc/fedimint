@@ -62,8 +62,8 @@ fn decoded_fee_consensus_is_validated() {
 }
 
 /// Fedi federations formed before the 10 msat base fee keep their 100 msat one,
-/// so both bases must decode. Upstream 0.13 accepts any base fee up to 100 msat,
-/// which covers both, and nothing beyond the limits.
+/// so both bases must decode. Upstream 0.13 accepts any base fee up to 100
+/// msat, which covers both, and nothing beyond the limits.
 #[test]
 fn both_fedi_base_fees_decode() {
     use fedimint_core::encoding::Encodable as _;

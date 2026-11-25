@@ -103,9 +103,7 @@ async fn api_views_share_pools_without_sharing_peer_maps_or_authentication() {
 
     use super::{FederationApi, IRawFederationApi as _};
 
-    let connectors = ConnectorRegistry::build_from_server_defaults()
-        .bind()
-        .await;
+    let connectors = ConnectorRegistry::build_from_server_defaults().bind().await;
     let url: SafeUrl = "ws://guardian.example/".parse().unwrap();
     let first = FederationApi::new(
         connectors.clone(),
@@ -136,9 +134,7 @@ async fn api_views_share_pools_without_sharing_peer_maps_or_authentication() {
         pools.push(api.connection_pool);
     }
 
-    let other_registry = ConnectorRegistry::build_from_server_defaults()
-        .bind()
-        .await;
+    let other_registry = ConnectorRegistry::build_from_server_defaults().bind().await;
     let isolated = FederationApi::new(other_registry, [(PeerId::from(0), url)].into(), None, None);
     assert!(!Arc::ptr_eq(
         &first.connection_pool,

@@ -22,20 +22,14 @@ impl IConnection for TestConnection {
 
 #[apply(async_trait_maybe_send!)]
 impl IGuardianConnection for TestConnection {
-    async fn request(
-        &self,
-        _method: ApiMethod,
-        _request: ApiRequestErased,
-    ) -> ServerResult<Value> {
+    async fn request(&self, _method: ApiMethod, _request: ApiRequestErased) -> ServerResult<Value> {
         Ok(Value::Null)
     }
 }
 
 #[tokio::test]
 async fn shared_pool_single_flights_and_reconnects_by_full_url() {
-    let registry = ConnectorRegistry::build_from_server_defaults()
-        .bind()
-        .await;
+    let registry = ConnectorRegistry::build_from_server_defaults().bind().await;
     let first_pool = registry.guardian_connection_pool(None);
     let second_pool = registry.guardian_connection_pool(None);
     let connections = Arc::new(Mutex::new(Vec::<Arc<TestConnection>>::new()));
@@ -87,9 +81,7 @@ async fn shared_pool_single_flights_and_reconnects_by_full_url() {
 
 #[tokio::test]
 async fn guardian_pool_cache_is_weak_and_does_not_expose_secrets() {
-    let registry = ConnectorRegistry::build_from_server_defaults()
-        .bind()
-        .await;
+    let registry = ConnectorRegistry::build_from_server_defaults().bind().await;
     let pool = registry.guardian_connection_pool(Some("private-test-secret"));
     let weak_pool = Arc::downgrade(&pool);
     assert!(!format!("{registry:?} {pool:?}").contains("private-test-secret"));
