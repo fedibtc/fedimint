@@ -15,7 +15,6 @@ use fedimint_mintv2_common::endpoint_constants::{
 use fedimint_mintv2_common::{Denomination, RecoveryItem};
 use tbs::{BlindedMessage, BlindedSignatureShare, PublicKeyShare};
 
-use crate::NoteIssuanceRequest;
 use crate::output::verify_blind_shares;
 
 #[apply(async_trait_maybe_send!)]
@@ -23,13 +22,13 @@ pub trait MintV2ModuleApi {
     async fn fetch_signature_shares(
         &self,
         range: OutPointRange,
-        issuance_requests: Vec<NoteIssuanceRequest>,
+        outputs: Vec<(Denomination, BlindedMessage)>,
         tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, PublicKeyShare>>,
     ) -> BTreeMap<PeerId, Vec<BlindedSignatureShare>>;
 
     async fn fetch_signature_shares_recovery(
         &self,
-        issuance_requests: Vec<NoteIssuanceRequest>,
+        outputs: Vec<(Denomination, BlindedMessage)>,
         tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, PublicKeyShare>>,
     ) -> BTreeMap<PeerId, Vec<BlindedSignatureShare>>;
 
@@ -51,25 +50,24 @@ impl MintV2ModuleApi for DynModuleApi {
     async fn fetch_signature_shares(
         &self,
         range: OutPointRange,
-        issuance_requests: Vec<NoteIssuanceRequest>,
+        outputs: Vec<(Denomination, BlindedMessage)>,
         tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, PublicKeyShare>>,
     ) -> BTreeMap<PeerId, Vec<BlindedSignatureShare>> {
-        let issuance_requests = Arc::new(issuance_requests);
+        let outputs = Arc::new(outputs);
         let tbs_pks = Arc::new(tbs_pks);
 
         self.request_with_strategy_retry(
             // This query collects a threshold of 2f + 1 valid blind signature shares
             FilterMapThreshold::new(
                 move |peer, signature_shares: Vec<BlindedSignatureShare>| {
-                    let issuance_requests = issuance_requests.clone();
+                    let outputs = outputs.clone();
                     let tbs_pks = tbs_pks.clone();
 
                     // Two pairings per note; keep them off the async workers.
                     runtime::spawn_blocking(move || {
-                        verify_blind_shares(peer, signature_shares, &issuance_requests, &tbs_pks)
-                            .map_err(|err| {
-                                ServerError::InvalidResponse(err.fmt_compact().to_string())
-                            })
+                        verify_blind_shares(peer, signature_shares, &outputs, &tbs_pks).map_err(
+                            |err| ServerError::InvalidResponse(err.fmt_compact().to_string()),
+                        )
                     })
                 },
                 self.all_peers().to_num_peers(),
@@ -82,30 +80,29 @@ impl MintV2ModuleApi for DynModuleApi {
 
     async fn fetch_signature_shares_recovery(
         &self,
-        issuance_requests: Vec<NoteIssuanceRequest>,
+        outputs: Vec<(Denomination, BlindedMessage)>,
         tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, PublicKeyShare>>,
     ) -> BTreeMap<PeerId, Vec<BlindedSignatureShare>> {
-        let blinded_messages: Vec<BlindedMessage> = issuance_requests
+        let blinded_messages: Vec<BlindedMessage> = outputs
             .iter()
-            .map(NoteIssuanceRequest::blinded_message)
+            .map(|(_, blinded_message)| *blinded_message)
             .collect();
 
-        let issuance_requests = Arc::new(issuance_requests);
+        let outputs = Arc::new(outputs);
         let tbs_pks = Arc::new(tbs_pks);
 
         self.request_with_strategy_retry(
             // This query collects a threshold of 2f + 1 valid blind signature shares
             FilterMapThreshold::new(
                 move |peer, signature_shares: Vec<BlindedSignatureShare>| {
-                    let issuance_requests = issuance_requests.clone();
+                    let outputs = outputs.clone();
                     let tbs_pks = tbs_pks.clone();
 
                     // Two pairings per note; keep them off the async workers.
                     runtime::spawn_blocking(move || {
-                        verify_blind_shares(peer, signature_shares, &issuance_requests, &tbs_pks)
-                            .map_err(|err| {
-                                ServerError::InvalidResponse(err.fmt_compact().to_string())
-                            })
+                        verify_blind_shares(peer, signature_shares, &outputs, &tbs_pks).map_err(
+                            |err| ServerError::InvalidResponse(err.fmt_compact().to_string()),
+                        )
                     })
                 },
                 self.all_peers().to_num_peers(),

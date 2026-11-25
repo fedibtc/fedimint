@@ -65,12 +65,13 @@ use fedimint_derive_secret::DerivableSecret;
 use fedimint_mintv2_common::config::{FeeConsensus, MintClientConfig, client_denominations};
 use fedimint_mintv2_common::{
     Denomination, KIND, MintCommonInit, MintInput, MintModuleTypes, MintOutput, Note, RecoveryItem,
+    verify_note,
 };
 use futures::{StreamExt, pin_mut};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tbs::AggregatePublicKey;
+use tbs::{AggregatePublicKey, BlindedMessage, BlindedSignature, aggregate_signature_shares};
 use thiserror::Error;
 
 use crate::api::MintV2ModuleApi;
@@ -858,6 +859,108 @@ impl MintClientModule {
         stream.next_or_pending().await
     }
 
+    /// Await the mint's signatures for a transaction's mint outputs, given
+    /// as public (denomination, blinded message) pairs, and return one
+    /// aggregated blinded signature per output.
+    ///
+    /// The inputs are public, so any party can collect the signatures for
+    /// outputs it cannot unblind. This serves protocols where one party
+    /// funds a transaction whose mint outputs are issued to blinded messages
+    /// another party supplied (escrow, invoicing): the funder collects the
+    /// blinded signatures and relays them, and only the holder of the
+    /// issuance request secrets can unblind them into spendable notes with
+    /// [`NoteIssuanceRequest::finalize`]. It equally lets the holder of the
+    /// secrets finalize outputs of a transaction submitted outside this
+    /// client, where no output state machine exists. Notes finalized this
+    /// way live outside the module's balance; pass them through
+    /// [`Self::receive`] to make them part of the balance.
+    ///
+    /// Each peer's signature shares are verified against the blinded
+    /// messages before aggregation. `outputs` must match the transaction's
+    /// mint outputs at `range` in order. This only resolves once the
+    /// transaction is accepted, so callers that cannot assume acceptance
+    /// should apply a timeout.
+    pub async fn await_output_signatures(
+        &self,
+        range: OutPointRange,
+        outputs: Vec<(Denomination, BlindedMessage)>,
+    ) -> Result<Vec<BlindedSignature>, ExternalIssuanceError> {
+        if range.count() != outputs.len() {
+            return Err(ExternalIssuanceError::OutputCount);
+        }
+
+        if outputs
+            .iter()
+            .any(|(denomination, _)| !self.cfg.tbs_pks.contains_key(denomination))
+        {
+            return Err(ExternalIssuanceError::UnknownDenomination);
+        }
+
+        self.client_ctx
+            .global_api()
+            .await_transaction(range.txid())
+            .await;
+
+        let signature_shares = self
+            .client_ctx
+            .module_api()
+            .fetch_signature_shares(range, outputs.clone(), self.cfg.tbs_pks.clone())
+            .await;
+
+        Ok((0..outputs.len())
+            .map(|i| {
+                aggregate_signature_shares(
+                    &signature_shares
+                        .iter()
+                        .map(|(peer, shares)| (peer.to_usize() as u64, shares[i]))
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// Unblind externally collected blinded signatures for the given
+    /// issuance requests and return the spendable notes, verifying every
+    /// note against the mint's aggregate public keys.
+    ///
+    /// This is the local counterpart of [`Self::await_output_signatures`]:
+    /// the holder of the issuance request secrets finalizes signatures that
+    /// another party collected and relayed, without contacting the
+    /// federation. Notes finalized this way live outside the module's
+    /// balance; pass them through [`Self::receive`] to make them part of
+    /// the balance.
+    ///
+    /// `signatures` must match `requests` in order.
+    pub fn finalize_external_issuance(
+        &self,
+        requests: &[NoteIssuanceRequest],
+        signatures: &[BlindedSignature],
+    ) -> Result<Vec<SpendableNote>, ExternalIssuanceError> {
+        if requests.len() != signatures.len() {
+            return Err(ExternalIssuanceError::SignatureCount);
+        }
+
+        requests
+            .iter()
+            .zip(signatures)
+            .map(|(request, signature)| {
+                let spendable_note = request.finalize(*signature);
+
+                let agg_pk = self
+                    .cfg
+                    .tbs_agg_pks
+                    .get(&request.denomination)
+                    .ok_or(ExternalIssuanceError::UnknownDenomination)?;
+
+                if !verify_note(spendable_note.note(), *agg_pk) {
+                    return Err(ExternalIssuanceError::InvalidSignature);
+                }
+
+                Ok(spendable_note)
+            })
+            .collect()
+    }
+
     /// Count the `ECash` notes in the client's database by denomination.
     pub async fn get_count_by_denomination(&self) -> BTreeMap<Denomination, u64> {
         self.get_count_by_denomination_dbtx(
@@ -1420,6 +1523,27 @@ pub enum ReceiveECashError {
     /// to funding.
     #[error("The reissue transaction could not be submitted")]
     Failed(#[source] TransactionSubmitError),
+}
+
+/// Why externally issued notes could not be collected or finalized.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ExternalIssuanceError {
+    /// The outputs do not match the transaction's output range.
+    #[error("outputs do not match the transaction's output range")]
+    OutputCount,
+
+    /// The signatures do not match the issuance requests.
+    #[error("signatures do not match the issuance requests")]
+    SignatureCount,
+
+    /// The mint has no keys for a requested denomination.
+    #[error("the mint has no keys for a requested denomination")]
+    UnknownDenomination,
+
+    /// A finalized note does not verify against the mint's aggregate key.
+    #[error("invalid note signature")]
+    InvalidSignature,
 }
 
 /// Why an output's state machine did not issue its notes.

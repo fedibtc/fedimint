@@ -10,7 +10,7 @@ use fedimint_core::{PeerId, runtime};
 use fedimint_mintv2_common::{Denomination, verify_note};
 use serde::{Deserialize, Serialize};
 use tbs::{
-    AggregatePublicKey, BlindedSignature, BlindedSignatureShare, PublicKeyShare,
+    AggregatePublicKey, BlindedMessage, BlindedSignature, BlindedSignatureShare, PublicKeyShare,
     aggregate_signature_shares,
 };
 
@@ -113,6 +113,10 @@ impl MintOutputStateMachine {
         tbs_pks: BTreeMap<Denomination, BTreeMap<PeerId, PublicKeyShare>>,
         tbs_agg_pks: BTreeMap<Denomination, AggregatePublicKey>,
     ) -> IssuanceOutcome {
+        let outputs = issuance_requests
+            .iter()
+            .map(|request| (request.denomination, request.blinded_message()))
+            .collect();
         let signature_shares = if let Some(range) = range {
             if global_context.await_tx_accepted(range.txid).await.is_err() {
                 return IssuanceOutcome::Aborted;
@@ -120,12 +124,12 @@ impl MintOutputStateMachine {
 
             global_context
                 .module_api()
-                .fetch_signature_shares(range, issuance_requests.clone(), tbs_pks)
+                .fetch_signature_shares(range, outputs, tbs_pks)
                 .await
         } else {
             global_context
                 .module_api()
-                .fetch_signature_shares_recovery(issuance_requests.clone(), tbs_pks)
+                .fetch_signature_shares_recovery(outputs, tbs_pks)
                 .await
         };
 
@@ -204,21 +208,21 @@ impl MintOutputStateMachine {
 pub fn verify_blind_shares(
     peer: PeerId,
     signature_shares: Vec<BlindedSignatureShare>,
-    issuance_requests: &[NoteIssuanceRequest],
+    outputs: &[(Denomination, BlindedMessage)],
     tbs_pks: &BTreeMap<Denomination, BTreeMap<PeerId, PublicKeyShare>>,
 ) -> Result<Vec<BlindedSignatureShare>, VerifyBlindSharesError> {
-    if signature_shares.len() != issuance_requests.len() {
+    if signature_shares.len() != outputs.len() {
         return Err(VerifyBlindSharesError::ShareCount);
     }
 
-    for (request, share) in issuance_requests.iter().zip(signature_shares.iter()) {
+    for ((denomination, blinded_message), share) in outputs.iter().zip(signature_shares.iter()) {
         let amount_key = tbs_pks
-            .get(&request.denomination)
+            .get(denomination)
             .expect("No pk shares found for denomination")
             .get(&peer)
             .expect("No pk share found for peer");
 
-        if !tbs::verify_signature_share(request.blinded_message(), *share, *amount_key) {
+        if !tbs::verify_signature_share(*blinded_message, *share, *amount_key) {
             return Err(VerifyBlindSharesError::InvalidShare);
         }
     }
