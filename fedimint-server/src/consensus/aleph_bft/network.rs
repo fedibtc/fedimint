@@ -19,7 +19,7 @@ use tracing::{error, info, trace};
 
 use super::super::db::SignedSessionOutcomeKey;
 use super::super::peer_availability::PeerActivity;
-use super::data_provider::UnitData;
+use super::data_provider::{PendingBatches, UnitData};
 use super::keychain::Keychain;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -67,6 +67,7 @@ pub struct Network {
     peer_activity: Arc<Mutex<PeerActivity>>,
     signed_outcomes_sender: Sender<(PeerId, SignedSessionOutcome)>,
     signatures_sender: Sender<(PeerId, schnorr::Signature)>,
+    pending_batches: PendingBatches,
     db: Database,
     session_index: u64,
     drain_sender: watch::Sender<bool>,
@@ -78,6 +79,7 @@ impl Network {
         peer_activity: Arc<Mutex<PeerActivity>>,
         signed_outcomes_sender: Sender<(PeerId, SignedSessionOutcome)>,
         signatures_sender: Sender<(PeerId, schnorr::Signature)>,
+        pending_batches: PendingBatches,
         db: Database,
         session_index: u64,
         drain_sender: watch::Sender<bool>,
@@ -87,6 +89,7 @@ impl Network {
             peer_activity,
             signed_outcomes_sender,
             signatures_sender,
+            pending_batches,
             db,
             session_index,
             drain_sender,
@@ -134,9 +137,21 @@ impl aleph_bft::Network<NetworkData> for Network {
 
                     match NetworkData::decode(&mut IoReader(bytes.as_slice())) {
                         Ok(network_data) => {
+                            let units = network_data.carried_units();
+
                             // in order to bound the RAM consumption of a session we have to bound
                             // the size of an individual unit in memory
-                            if network_data.included_data().iter().all(UnitData::is_valid) {
+                            if units
+                                .iter()
+                                .filter_map(|unit| unit.data.as_ref())
+                                .all(UnitData::is_valid)
+                            {
+                                // a quiescent data provider wakes up for our peers' batches
+                                // with work
+                                for unit in &units {
+                                    self.pending_batches.heard(unit);
+                                }
+
                                 return Some(network_data);
                             }
 
