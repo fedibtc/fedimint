@@ -21,7 +21,6 @@ mod output;
 mod receive;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1004,15 +1003,46 @@ impl MintClientModule {
         custom_meta: Value,
         include_invite: bool,
     ) -> Result<(OperationId, ECash), SendECashError> {
+        self.send_inner(None, amount, custom_meta, include_invite)
+            .await
+    }
+
+    /// Like [`Self::send`], but the send operation is recorded under the
+    /// caller's `operation_id`. A caller that derives the id from its own
+    /// durable request can find the send again after a crash, and a repeated
+    /// call never spends twice: it fails with
+    /// [`SendECashError::OperationAlreadyExists`] without touching any note
+    /// when the operation already exists. A reissue that has to run first
+    /// keeps its own operation.
+    pub async fn send_with_operation_id(
+        &self,
+        operation_id: OperationId,
+        amount: Amount,
+        custom_meta: Value,
+        include_invite: bool,
+    ) -> Result<ECash, SendECashError> {
+        self.send_inner(Some(operation_id), amount, custom_meta, include_invite)
+            .await
+            .map(|(_, ecash)| ecash)
+    }
+
+    async fn send_inner(
+        &self,
+        send_operation_id: Option<OperationId>,
+        amount: Amount,
+        custom_meta: Value,
+        include_invite: bool,
+    ) -> Result<(OperationId, ECash), SendECashError> {
         let amount = round_to_multiple(amount, client_denominations().next().unwrap().amount());
 
-        if let Some((operation_id, ecash)) = self
+        let sent = self
             .client_ctx
             .module_db()
             .autocommit(
                 |dbtx, _| {
                     Box::pin(self.send_ecash_dbtx(
                         dbtx,
+                        send_operation_id,
                         amount,
                         custom_meta.clone(),
                         include_invite,
@@ -1021,8 +1051,14 @@ impl MintClientModule {
                 Some(100),
             )
             .await
-            .expect("Failed to commit dbtx after 100 retries")
-        {
+            .map_err(|error| match error {
+                fedimint_core::db::AutocommitError::ClosureError { error, .. } => error,
+                fedimint_core::db::AutocommitError::CommitFailed { .. } => {
+                    panic!("Failed to commit dbtx after 100 retries")
+                }
+            })?;
+
+        if let Some((operation_id, ecash)) = sent {
             return Ok((operation_id, ecash));
         }
 
@@ -1061,16 +1097,27 @@ impl MintClientModule {
                 .map_err(|_| SendECashError::Failure)?;
         }
 
-        Box::pin(self.send(amount, custom_meta, include_invite)).await
+        Box::pin(self.send_inner(send_operation_id, amount, custom_meta, include_invite)).await
     }
 
     async fn send_ecash_dbtx(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
+        send_operation_id: Option<OperationId>,
         remaining_amount: Amount,
         custom_meta: Value,
         include_invite: bool,
-    ) -> Result<Option<(OperationId, ECash)>, Infallible> {
+    ) -> Result<Option<(OperationId, ECash)>, SendECashError> {
+        if let Some(operation_id) = send_operation_id {
+            if self
+                .client_ctx
+                .operation_exists_dbtx(dbtx, operation_id)
+                .await
+            {
+                return Err(SendECashError::OperationAlreadyExists);
+            }
+        }
+
         let Some(notes) = Self::select_exact_change(&mut dbtx.to_ref_nc(), remaining_amount).await
         else {
             return Ok(None);
@@ -1087,7 +1134,7 @@ impl MintClientModule {
             ECash::new(self.federation_id, notes)
         };
         let amount = ecash.amount();
-        let operation_id = OperationId::new_random();
+        let operation_id = send_operation_id.unwrap_or_else(OperationId::new_random);
 
         self.client_ctx
             .add_operation_log_entry_dbtx(
@@ -1458,6 +1505,8 @@ pub enum SendECashError {
     InsufficientBalance,
     #[error("A non-recoverable error has occurred")]
     Failure,
+    #[error("An operation with the requested id already exists")]
+    OperationAlreadyExists,
 }
 
 #[derive(Error, Debug, Clone, Eq, PartialEq)]

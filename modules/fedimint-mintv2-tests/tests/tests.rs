@@ -636,6 +636,64 @@ async fn receiving_the_same_ecash_twice_is_rejected() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn send_with_operation_id_records_under_the_id_and_never_sends_twice() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed_not_degraded().await;
+    let client = fed.new_client().await;
+    let receiver = fed.new_client().await;
+
+    issue_ecash(&client, Amount::from_sats(10_000)).await?;
+    let mint = client.get_first_module::<MintClientModule>()?;
+    let operation_id = OperationId([7; 32]);
+
+    let ecash = mint
+        .send_with_operation_id(
+            operation_id,
+            Amount::from_sats(1_000),
+            serde_json::json!({ "request": 1 }),
+            true,
+        )
+        .await?;
+    assert!(Amount::from_sats(1_000) <= ecash.amount());
+
+    // The send is the operation under the caller's id, carrying the token.
+    let MintOperationMeta::Send { ecash: logged, .. } = client
+        .operation_log()
+        .get_operation(operation_id)
+        .await
+        .expect("the send is recorded under the caller's id")
+        .meta::<MintOperationMeta>()
+    else {
+        panic!("the caller's id names the send operation");
+    };
+    assert_eq!(logged, base32::encode_prefixed(FEDIMINT_PREFIX, &ecash));
+
+    // A repeat with the same id spends nothing.
+    let balance = client.get_balance_for_btc().await?;
+    assert!(matches!(
+        mint.send_with_operation_id(operation_id, Amount::from_sats(1_000), Value::Null, true)
+            .await,
+        Err(SendECashError::OperationAlreadyExists)
+    ));
+    assert_eq!(client.get_balance_for_btc().await?, balance);
+
+    // The token is real ecash.
+    let received = receiver
+        .get_first_module::<MintClientModule>()?
+        .receive(ecash, Value::Null)
+        .await?;
+    assert_eq!(
+        receiver
+            .get_first_module::<MintClientModule>()?
+            .await_final_receive_operation_state(received)
+            .await?,
+        FinalReceiveOperationState::Success,
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn receive_rejects_notes_below_the_base_fee() -> anyhow::Result<()> {
     let fixtures = fixtures();
     let fed = fixtures.new_fed_not_degraded().await;

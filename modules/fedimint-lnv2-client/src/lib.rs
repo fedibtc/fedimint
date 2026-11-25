@@ -519,6 +519,14 @@ impl LightningClientModule {
             .map_err(|_| RoutingInfoError::FailedToRequestRoutingInfo)
     }
 
+    /// The operation id [`Self::send`] records a payment of `invoice` under.
+    pub fn send_operation_id(invoice: &Bolt11Invoice) -> OperationId {
+        // The attempt index is fixed at `0` so the operation id matches the one
+        // older clients derived for the first payment attempt, ensuring an
+        // already-paid or in-flight invoice is still detected after an upgrade.
+        OperationId::from_encodable(&(invoice.clone(), 0u64))
+    }
+
     /// Pay an invoice. For testing you can optionally specify a gateway to
     /// route with, otherwise a gateway will be selected automatically. If the
     /// invoice was created by a gateway connected to our federation, the same
@@ -557,10 +565,7 @@ impl LightningClientModule {
             });
         }
 
-        // The attempt index is fixed at `0` so the operation id matches the one
-        // older clients derived for the first payment attempt, ensuring an
-        // already-paid or in-flight invoice is still detected after an upgrade.
-        let operation_id = OperationId::from_encodable(&(invoice.clone(), 0u64));
+        let operation_id = Self::send_operation_id(&invoice);
 
         if self.client_ctx.operation_exists(operation_id).await {
             return Err(SendPaymentError::DuplicatePaymentAttempt(operation_id));
