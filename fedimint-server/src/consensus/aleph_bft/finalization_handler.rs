@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn only_our_own_ordered_batch_counts_as_ours() {
         let (sender, receiver) = async_channel::unbounded();
-        let batches = PendingBatches::new(0, ModuleDecoderRegistry::default());
+        let batches = PendingBatches::new(0, 3600, ModuleDecoderRegistry::default());
         let mut handler = FinalizationHandler::new(sender, PeerId::from(1), batches.clone());
 
         batches.created();

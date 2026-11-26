@@ -65,6 +65,11 @@ pub struct PendingBatches {
     /// Peers keep rebroadcasting the last units of the session they just
     /// finished while we run the next one. Those units are no work of ours.
     session: u64,
+    /// The session outcome only takes items from units below this round, so a
+    /// unit at or above it carries no work. Bounding the rounds we record also
+    /// bounds the memory a peer can make us spend on units that AlephBFT has
+    /// not verified yet, to what the broadcast itself may hold.
+    rounds: Round,
     decoders: ModuleDecoderRegistry,
     state: Arc<watch::Sender<PendingBatchesState>>,
 }
@@ -107,9 +112,10 @@ impl PendingBatchesState {
 }
 
 impl PendingBatches {
-    pub fn new(session: u64, decoders: ModuleDecoderRegistry) -> Self {
+    pub fn new(session: u64, rounds: Round, decoders: ModuleDecoderRegistry) -> Self {
         Self {
             session,
+            rounds,
             decoders,
             state: Arc::new(watch::channel(PendingBatchesState::default()).0),
         }
@@ -143,7 +149,7 @@ impl PendingBatches {
             return;
         };
 
-        if unit.session != self.session {
+        if unit.session != self.session || unit.round >= self.rounds {
             return;
         }
 
@@ -477,7 +483,7 @@ mod tests {
         let (timestamp_sender, timestamps) = async_channel::unbounded();
         let (shutdown, shutdown_receiver) = watch::channel(None);
         let (drain, drain_receiver) = watch::channel(false);
-        let batches = PendingBatches::new(SESSION, ModuleDecoderRegistry::default());
+        let batches = PendingBatches::new(SESSION, ROUNDS, ModuleDecoderRegistry::default());
         Harness {
             provider: DataProvider::new(
                 mempool_receiver,
@@ -533,6 +539,9 @@ mod tests {
     /// The session the tests' providers run.
     const SESSION: u64 = 7;
 
+    /// The rounds of the tests' sessions.
+    const ROUNDS: Round = 3600;
+
     /// A vote as a guardian proposes it, `value` being what it votes for. Its
     /// variant is unknown, so it decodes without module decoders.
     fn vote(kind: u64, value: u8) -> ConsensusItem {
@@ -556,7 +565,7 @@ mod tests {
     }
 
     fn pending() -> (PendingBatches, watch::Receiver<PendingBatchesState>) {
-        let batches = PendingBatches::new(SESSION, ModuleDecoderRegistry::default());
+        let batches = PendingBatches::new(SESSION, ROUNDS, ModuleDecoderRegistry::default());
         let mut changes = batches.subscribe();
         assert!(changes.borrow_and_update().idle());
         (batches, changes)
@@ -676,6 +685,24 @@ mod tests {
         // An ordered repeat that we stopped waiting for is harmless.
         batches.ordered(old, 5, false, &batch(&votes));
         assert!(changes.borrow().idle());
+    }
+
+    #[test]
+    fn units_past_the_last_round_of_the_session_are_no_work() {
+        let (batches, mut changes) = pending();
+
+        // The session outcome takes no items from these rounds, and a peer
+        // could name any of them to make us hold its batches.
+        for round in [ROUNDS, ROUNDS + 1, Round::MAX] {
+            batches.heard(&unit(1, round, Some(batch(&[vote(1, 1)]))));
+        }
+        assert!(!changes.has_changed().expect("sender alive"));
+        assert!(changes.borrow().idle());
+
+        // The last round that is ordered still counts.
+        batches.heard(&unit(1, ROUNDS - 1, Some(batch(&[vote(1, 1)]))));
+        assert!(changes.has_changed().expect("sender alive"));
+        assert!(!changes.borrow_and_update().idle());
     }
 
     #[test]

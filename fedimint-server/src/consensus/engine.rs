@@ -410,7 +410,11 @@ impl ConsensusEngine {
         // longer count are still ordered, at the idle pace. The process driving us
         // chooses the delay such that a session's rounds fit into the session
         // timeout above.
-        let pending_batches = PendingBatches::new(session_index, self.decoders());
+        let pending_batches = PendingBatches::new(
+            session_index,
+            self.cfg.consensus.broadcast_rounds_per_session,
+            self.decoders(),
+        );
         let (drain_sender, drain_receiver) = watch::channel(false);
 
         let aleph_handle = spawn(
