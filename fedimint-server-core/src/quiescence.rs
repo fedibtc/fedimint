@@ -4,10 +4,12 @@
 //! units while it has nothing to order, and stops modules from re-proposing
 //! votes that their peers already recorded. This fork instead slows a guardian
 //! without work down to one unit per idle round delay, and ships both behind
-//! one switch that the process driving `fedimintd` sets at runtime through the
-//! driven control channel's features (`fedimint_server::config::driven`). The
-//! switch is the idle round delay, so quiescence cannot be on without one. It
-//! starts off on every process start and is not persisted, so a restarted
+//! one switch. The process driving `fedimintd` sets it at runtime through the
+//! driven control channel's features (`fedimint_server::config::driven`); a
+//! standalone `fedimintd` sets it once at start from
+//! `FM_ALEPH_IDLE_ROUND_DELAY_MS`. The switch is the idle round delay, so
+//! quiescence cannot be on without one. It is not persisted: without the
+//! environment variable it starts off on every process start, so a restarted
 //! guardian behaves exactly like one without the change until it is enabled
 //! again.
 //!

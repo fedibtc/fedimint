@@ -52,14 +52,15 @@ use fedimint_server_core::bitcoin_rpc::IServerBitcoinRpc;
 use fedimint_unknown_server::UnknownInit;
 use fedimint_wallet_server::WalletInit;
 use fedimintd_envs::{
-    FM_API_URL_ENV, FM_BIND_API_ENV, FM_BIND_API_NEXT_ENV, FM_BIND_METRICS_ENV, FM_BIND_P2P_ENV,
-    FM_BIND_TOKIO_CONSOLE_ENV, FM_BIND_UI_ENV, FM_BITCOIN_NETWORK_ENV, FM_BITCOIND_PASSWORD_ENV,
-    FM_BITCOIND_URL_ENV, FM_BITCOIND_URL_PASSWORD_FILE_ENV, FM_BITCOIND_USERNAME_ENV,
-    FM_DATA_DIR_ENV, FM_DB_CHECKPOINT_RETENTION_ENV, FM_DISABLE_META_MODULE_ENV,
-    FM_ENABLE_IROH_ENV, FM_ESPLORA_URL_ENV, FM_FORCE_API_SECRETS_ENV,
-    FM_IROH_API_MAX_CONNECTIONS_ENV, FM_IROH_API_MAX_REQUESTS_PER_CONNECTION_ENV,
-    FM_IROH_NEXT_ENABLE_ENV, FM_IROH_P2P_RELAY_ENV, FM_P2P_MAX_CONNECTION_AGE_SECS_ENV,
-    FM_P2P_URL_ENV, FM_PASSWORD_API_ENV, FM_PASSWORD_UI_ENV, FM_SESSION_TIMEOUT_SECS_ENV,
+    FM_ALEPH_IDLE_ROUND_DELAY_MS_ENV, FM_API_URL_ENV, FM_BIND_API_ENV, FM_BIND_API_NEXT_ENV,
+    FM_BIND_METRICS_ENV, FM_BIND_P2P_ENV, FM_BIND_TOKIO_CONSOLE_ENV, FM_BIND_UI_ENV,
+    FM_BITCOIN_NETWORK_ENV, FM_BITCOIND_PASSWORD_ENV, FM_BITCOIND_URL_ENV,
+    FM_BITCOIND_URL_PASSWORD_FILE_ENV, FM_BITCOIND_USERNAME_ENV, FM_DATA_DIR_ENV,
+    FM_DB_CHECKPOINT_RETENTION_ENV, FM_DISABLE_META_MODULE_ENV, FM_ENABLE_IROH_ENV,
+    FM_ESPLORA_URL_ENV, FM_FORCE_API_SECRETS_ENV, FM_IROH_API_MAX_CONNECTIONS_ENV,
+    FM_IROH_API_MAX_REQUESTS_PER_CONNECTION_ENV, FM_IROH_NEXT_ENABLE_ENV, FM_IROH_P2P_RELAY_ENV,
+    FM_P2P_MAX_CONNECTION_AGE_SECS_ENV, FM_P2P_URL_ENV, FM_PASSWORD_API_ENV, FM_PASSWORD_UI_ENV,
+    FM_SESSION_TIMEOUT_SECS_ENV,
 };
 use futures::FutureExt as _;
 #[cfg(all(
@@ -244,6 +245,13 @@ struct ServerOpts {
     /// default, in which case connections are never dropped due to their age.
     #[arg(long, env = FM_P2P_MAX_CONNECTION_AGE_SECS_ENV)]
     p2p_max_connection_age_secs: Option<u64>,
+
+    /// Turn on Aleph quiescence: while this guardian has nothing to order, it
+    /// creates an `AlephBFT` unit only every this many milliseconds. Unset by
+    /// default, which keeps the normal pace. In driven mode the parent's
+    /// features replace this setting with its first frame.
+    #[arg(long, env = FM_ALEPH_IDLE_ROUND_DELAY_MS_ENV)]
+    aleph_idle_round_delay_ms: Option<u64>,
 
     /// Enable tokio console logging
     #[arg(long, env = FM_BIND_TOKIO_CONSOLE_ENV)]
@@ -611,6 +619,17 @@ async fn run_inner(
 
     let auth_ui = server_opts.password_ui.or(password_file).map(ApiAuth::new);
     let auth_api = server_opts.password_api.map(ApiAuth::new);
+
+    if let Some(idle_round_delay_ms) = server_opts.aleph_idle_round_delay_ms {
+        fedimint_server_core::quiescence::set_idle_round_delay(Some(Duration::from_millis(
+            idle_round_delay_ms,
+        )));
+        info!(
+            target: LOG_SERVER,
+            idle_round_delay_ms,
+            "Aleph quiescence on from the command line"
+        );
+    }
 
     let task_group = root_task_group.clone();
     let code_version_hash = code_version_hash.to_string();
